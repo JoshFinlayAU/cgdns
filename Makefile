@@ -67,3 +67,22 @@ checkconfig: build
 .PHONY: clean
 clean:
 	rm -rf $(BIN) dist run
+
+# nfpm builds both formats in pure Go, so no dpkg-dev or rpmbuild is needed.
+# PKG_VERSION must not carry a leading "v" or a "-dirty" suffix: deb and rpm
+# both reject them.
+PKG_VERSION ?= $(shell v=$$(git describe --tags --abbrev=0 2>/dev/null); [ -n "$$v" ] && echo "$${v#v}" || echo 0.0.0)
+PKG_ARCH ?= amd64
+DIST := dist
+
+.PHONY: package
+package: build
+	@command -v nfpm >/dev/null || { echo "nfpm not found: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest"; exit 1; }
+	mkdir -p $(DIST)
+	PKG_VERSION=$(PKG_VERSION) PKG_ARCH=$(PKG_ARCH) nfpm package -f deploy/nfpm.yaml -p deb -t $(DIST)
+	PKG_VERSION=$(PKG_VERSION) PKG_ARCH=$(PKG_ARCH) nfpm package -f deploy/nfpm.yaml -p rpm -t $(DIST)
+	@ls -1 $(DIST)
+
+.PHONY: package-clean
+package-clean:
+	rm -rf $(DIST)

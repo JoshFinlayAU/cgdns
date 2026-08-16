@@ -1,0 +1,91 @@
+# cgdns node configuration.
+#
+# This file ships deliberately incomplete. Listen addresses and the query ACL
+# have no safe default -- a wildcard bind breaks anycast source selection, and a
+# default-allow ACL is an open resolver -- so the daemon refuses to start until
+# they are set. Validate with:
+#
+#   cgdns -config /etc/cgdns/cgdns.yaml -check
+#
+# Every setting is validated at startup and all problems are reported at once.
+
+node:
+  # Unique within the pair. It identifies this node on the pair link and breaks
+  # ties between concurrent control-plane writes.
+  id: ""
+  state_dir: /var/lib/cgdns
+
+listen:
+  # The anycast service addresses. Bind them explicitly: a wildcard bind loses
+  # the destination address, so replies would leave with the wrong source and
+  # anycast would break subtly, under load.
+  udp: []
+  tcp: []
+  # dot: ["<anycast-v4>:853", "[<anycast-v6>]:853"]
+  # doh: ["<anycast-v4>:443", "[<anycast-v6>]:443"]
+
+  # Default deny. List the subscriber prefixes this node answers recursion for;
+  # a resolver open to the internet is an amplification source.
+  allow_query: []
+
+  # tls:
+  #   cert_file: /etc/cgdns/tls/service.pem
+  #   key_file: /etc/cgdns/tls/service.key
+
+  # Only set this if DoH sits behind an L7 proxy. The client address selects
+  # subscriber policy, so believing a forwarding header from an untrusted peer
+  # lets any client claim another subscriber's filtering.
+  # doh_trusted_proxies: []
+
+resolver:
+  mode: recursive
+  dnssec: true
+  use_ipv4: true
+  use_ipv6: true
+
+cache:
+  max_entries: 1000000
+
+control:
+  store_file: /var/lib/cgdns/control.json
+
+# The link to the other node in this POP. Config replication is reliable;
+# cache sharing is best-effort and never blocks a query.
+peer:
+  enabled: false
+  # listen: "<this-node-pair-ip>:8853"
+  # remote: "<sibling-pair-ip>:8853"
+  # Mutual TLS is mandatory: the sibling may insert into this node's cache, so
+  # an unauthenticated peer could poison it.
+  # ca_file: /etc/cgdns/tls/pair-ca.pem
+  # tls:
+  #   cert_file: /etc/cgdns/tls/pair.pem
+  #   key_file: /etc/cgdns/tls/pair.key
+
+# Health drives anycast advertisement. gobgpd runs as its own unit; cgdns talks
+# to it over gRPC and never shells out to a routing CLI.
+health:
+  enabled: false
+  # anycast_prefixes: ["<anycast-v4>/32", "<anycast-v6>/128"]
+  # gobgp_target: "127.0.0.1:50051"
+
+# The operator API. Bind the management interface address, never a service or
+# anycast address -- the daemon refuses to start if they overlap. Off loopback,
+# TLS and allow_from both become mandatory.
+management:
+  enabled: true
+  listen:
+    - "127.0.0.1:8443"
+  # allow_from: ["<management-prefix>"]
+  # tls:
+  #   cert_file: /etc/cgdns/tls/mgmt.pem
+  #   key_file: /etc/cgdns/tls/mgmt.key
+  bootstrap_token_file: /var/lib/cgdns/bootstrap.token
+
+metrics:
+  listen: "127.0.0.1:9153"
+  path: /metrics
+
+log:
+  level: info
+  format: text

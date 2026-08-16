@@ -1,0 +1,86 @@
+name: cgdns
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: net
+priority: optional
+maintainer: Josh Finlay <josh@athenanetworks.com.au>
+description: |
+  Carrier-grade recursive DNS resolver.
+  Anycast-served, DNSSEC-validating, with per-subscriber policy. The recursion
+  engine walks the delegation chain from the root rather than wrapping another
+  resolver. Two nodes per POP replicate their control plane and share cache.
+vendor: Athena Networks
+homepage: https://github.com/JoshFinlayAU/cgdns
+license: Proprietary
+
+contents:
+  - src: ./bin/cgdns
+    dst: /usr/sbin/cgdns
+    file_info:
+      mode: 0755
+
+  - src: ./bin/cgdnsctl
+    dst: /usr/bin/cgdnsctl
+    file_info:
+      mode: 0755
+
+  - src: ./deploy/systemd/cgdns.service
+    dst: /usr/lib/systemd/system/cgdns.service
+    file_info:
+      mode: 0644
+
+  # Shipped as a config file so an upgrade never overwrites a node's tuned
+  # config. It is deliberately incomplete: listen addresses and the query ACL
+  # have no safe default, and the daemon refuses to start until they are set.
+  - src: ./deploy/package/cgdns.yaml
+    dst: /etc/cgdns/cgdns.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: cgdns
+
+  - dst: /etc/cgdns
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: cgdns
+
+  # TLS material for DoT/DoH, the management plane and the pair link. Readable
+  # by the daemon's group only; the private keys that land here are the node's.
+  - dst: /etc/cgdns/tls
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: cgdns
+
+  # systemd's StateDirectory creates and owns this at start, but the store and
+  # the bootstrap token live here and an operator will look for them before the
+  # first successful start.
+  - dst: /var/lib/cgdns
+    type: dir
+    file_info:
+      mode: 0750
+      owner: cgdns
+      group: cgdns
+
+scripts:
+  postinstall: ./deploy/package/postinstall.sh
+  preremove: ./deploy/package/preremove.sh
+  postremove: ./deploy/package/postremove.sh
+
+deb:
+  triggers:
+    interest_noawait:
+      - /usr/lib/systemd/system
+
+overrides:
+  rpm:
+    depends:
+      - systemd
+  deb:
+    depends:
+      - systemd

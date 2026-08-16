@@ -494,7 +494,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.Node.ID == "" {
-		bad("node.id is required and must be unique across the cluster")
+		bad("node.id is required and must differ from the sibling's: it identifies this node on the pair link and breaks ties between concurrent control-plane writes")
 	}
 	if c.Node.StateDir == "" {
 		bad("node.state_dir is required")
