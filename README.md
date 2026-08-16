@@ -4,6 +4,8 @@ Carrier-grade recursive DNS resolver. Anycast-served, DNSSEC-validating, with pe
 
 The recursion engine is its own - it walks the delegation chain from the root rather than wrapping Unbound, BIND or PowerDNS.
 
+..before you say it, I know per-subscriber policy doesn't sound very carrier, and it isn't until some sales guy somewhere sells someone that "filter DNS product" that we have.. now its just an ACL. You don't have to use it, and you probably won't... until you do.
+
 ## Deployment model
 
 Two resolvers per POP, each announce their anycast IP.
