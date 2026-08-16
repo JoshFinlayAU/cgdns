@@ -55,15 +55,23 @@ The anycast0 dummy interface was a trial by fire decision that was settled on to
 **Anycast health** - the node owns the decision on whether it belongs in the anycast set, and drives GoBGP (it just made sense.. go project.. gRPC..) over its gRPC API. `gobgpd` runs as a separate unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a resolver restart does not drop the session. Checks run through the real serving path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays on stable serving time rather than on recovery. SIGTERM withdraws before the
 listeners stop, so a planned restart moves traffic away first.
 
+**Pair link** - one mutually authenticated TLS connection between the two nodes in a POP, carrying two payloads with deliberately different guarantees. Config replication is reliable and converging: writes are acknowledged and any gap is repaired by an anti-entropy exchange when the link returns, so a change made while the sibling was down lands when it rejoins. Cache sharing is best-effort, because losing a push is a cache miss the sibling resolves for itself and that is never worth blocking a query for. There is no quorum and nothing to lose: a partitioned pair keeps resolving on both sides, and the link reconnects on its own.
+
+**Config replication** - write to either node and both converge. Last-write-wins ordered by a Lamport counter with the node ID as tiebreak, so the two agree without depending on synchronised clocks. Deletes are tombstones held for seven days - without them, a node that was down during a delete resurrects the record on rejoin, because from its side the record simply still exists. `cgdnsctl drift` compares the store hash across the pair; that hash is the only drift detector a pair has, so it is the thing to alert on.
+
+**Cache sharing** - push on fill to keep the sibling hot, pull on miss before going upstream, TTLs decremented in transit so a shared entry never outlives its own expiry. The pull is bounded by `peer.fetch_timeout` (150 ms by default): going upstream costs tens of milliseconds, so waiting longer than that for a sibling makes the pair link a pessimisation. A peer that is slow, gone or wrong is indistinguishable from a cache miss - the resolver just proceeds upstream, which is what it would have done without a pair at all. Entries arriving *from* the peer are never offered back, which is what stops a push loop. POP-local only, for the reason above.
+
+**Management API** - REST, bound only to the management addresses, behind a default-deny source ACL enforced at accept, TLS mandatory unless every listener is loopback. Tokens carry read/write/admin scopes and are stored as a hash, so replicating them to the sibling - which is what lets you manage the pair from either node - never moves a secret. A node holding no token at all mints one to a root-only file; a node that already has one, including one adopted from its sibling, never does. Records are canonicalised on write, so what the API returns is what the resolver is actually enforcing.
+
+**`cgdnsctl`** - operator CLI, and a plain client of that API with no privileged state of its own, so anything it does your provisioning system can do over HTTP. Because the pair replicates its control plane, pointing it at either node is equivalent - that is the "manage from any node" behaviour, achieved by replication rather than by a cluster-wide API.
+
 ## Not yet implemented
 
 | | Status |
 |---|---|
-| **Pair link** | Config replication semantics exist (`internal/control`: last-write-wins with Lamport ordering, tombstones, anti-entropy digests, drift hash). The wire protocol does not. |
-| **Cache synchronisation** | Designed, not built. Push on fill to keep the sibling hot, pull on miss before going upstream, TTL decremented in transit. POP-local only. |
-| `cgdnsctl` | Operator CLI. |
-| Management API / WebUI | Operator-only, manageable from either node in a pair. |
+| WebUI | The API it sits on is done. The UI is not, and it needs local users and TOTP - unlike API tokens, human passwords want a slow KDF. |
 | Packaging | `.deb` / `.rpm` via nfpm. |
+| `resolver.outbound_source` | Egress source address is currently whatever the route picks. |
 | DoQ | RFC 9250. |
 | Serve-stale, aggressive NSEC, prefetch, RRL | RFC 8767 / RFC 8198. RRL matters most - random-subdomain floods are what carriers actually get hit with. |
 
@@ -108,6 +116,10 @@ validator enforces rather than documents:
   listener - those are anycast, and the admin plane must not follow an anycast
   route to an arbitrary node.
 - Management off loopback requires both TLS and a source ACL.
+- The pair link requires mutual TLS with a CA - the sibling is trusted to insert
+  into this node's cache, so an unauthenticated peer could poison it.
+- `peer.fetch_timeout` may not exceed `resolver.query_timeout`, because asking
+  the sibling would then cost more than just resolving upstream.
 
 See `deploy/dev/` for worked examples.
 
@@ -116,7 +128,7 @@ See `deploy/dev/` for worked examples.
 Go 1.26 or newer.
 
 ```sh
-make build                                              # ./bin/cgdns
+make build                                              # ./bin/cgdns, ./bin/cgdnsctl
 make check                                              # fmt, vet, tests
 make race                                               # tests under -race
 make bench                                              # hot-path benchmarks
@@ -132,6 +144,26 @@ replacing the binary on upgrade, so deployment needs no `setcap` step.
 `StartLimitBurst` caps restart flapping - health dampening lives in process
 memory, so a crash loop would otherwise flap the anycast prefix.
 
+## Operating a pair
+
+`cgdnsctl` reads its token from `-token`, `CGDNS_TOKEN`, or `-token-file`
+(default `/var/lib/cgdns/bootstrap.token`), so on the node itself it needs no
+configuration. A bare `host:port` is HTTPS - defaulting to plaintext would put
+the token on the wire in the clear the first time someone left the scheme off.
+
+```sh
+cgdnsctl status                                  # health, pair link, store hash
+cgdnsctl subscriber set '{"prefix":"203.0.113.0/24","id":"acme","class":"filtered"}'
+cgdnsctl allow acme example.com                  # per-subscriber whitelist
+cgdnsctl token create provisioning write         # shown once, never recoverable
+cgdnsctl drift ns1.pop:8443 ns2.pop:8443         # do the two nodes agree?
+```
+
+Write to either node; the sibling converges. `drift` exits non-zero when the
+nodes disagree, so it drives monitoring directly - and it refuses to report "in
+step" when fewer than two nodes answered, because one node agreeing with itself
+proves nothing during exactly the outage you built the check for.
+
 ## Observability
 
 Prometheus metrics on a separate management address, behind a source ACL. The
@@ -144,6 +176,12 @@ series worth alerting on:
 | `cgdns_dnssec_bogus_total` | broken zone, or an attack |
 | `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
+| `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
+| `cgdns_peer_cache_fetch_hits_total` | work the sibling saved this node |
+
+The store hash is not a metric - compare it with `cgdnsctl drift`, and alert on
+a disagreement that persists past a sync interval. A brief difference just means
+a write has not propagated yet.
 
 ## Licence
 
