@@ -1,80 +1,178 @@
 # cgdns
 
-A carrier-grade recursive DNS resolver in Go, with per-subscriber policy and
-anycast health management.
+Carrier-grade recursive DNS resolver. Anycast-served, DNSSEC-validating, with
+per-subscriber policy.
 
 The recursion engine is its own — it walks the delegation chain from the root
 rather than wrapping Unbound, BIND or PowerDNS.
 
-## What it does
+## Deployment model
 
-- **Recursion** — delegation walk from the root, QNAME minimisation (RFC 9156),
-  0x20 mixed-case encoding, strict bailiwick checking. Forwarding mode is also
-  available.
-- **DNSSEC validation** — full chain of trust, NSEC and NSEC3 denial of
-  existence, IANA root anchors embedded. A broken chain is SERVFAIL with an
-  RFC 8914 extended error, never a silent downgrade. `AD` is set only on a chain
-  this resolver verified itself.
-- **Transports** — UDP, TCP, DoT (RFC 7858) and DoH (RFC 8484 over HTTP/2), all
-  dual-stack.
-- **Subscriber policy** — RPZ and domain-list feed ingest, per-class rule sets,
-  and per-subscriber allow/block overrides that take precedence over shared
-  feeds.
-- **Anycast health** — the node decides whether it belongs in the anycast set
-  and drives GoBGP over gRPC. Withdrawal is fast, re-advertisement is dampened.
+Two resolvers per POP, announcing a shared anycast address to the local router.
+No consensus, no VIP, no shared state between POPs.
+
+```
+POP (per state / region)
+
+  ns1 ──────── pair link ──────── ns2        config replication + cache sync
+   │                               │
+   └── eBGP /30 ── router ── eBGP ─┘         each announces the anycast /32 + /128
+
+Between POPs: nothing. Failover is BGP's job.
+```
+
+Subscribers are handed the anycast address; BGP routes them to the nearest POP.
+A node that fails withdraws its prefix and traffic moves to its pair, or to the
+next POP if both are gone. That is a graceful degradation, not an outage.
+
+**Cache is shared only within a POP, never between them.** CDN and cloud
+resolvers return geographically specific answers based on where the *resolver*
+sits, so replicating a Sydney cache entry to Perth would hand Perth subscribers
+Sydney endpoints. This is a correctness constraint, not a performance choice.
+
+### Interfaces per node
+
+| Interface | Carries |
+|---|---|
+| management | operator API, metrics, SSH |
+| pair link | config replication and cache sharing to the sibling node |
+| p2p /30 | eBGP session to the local router |
+| `anycast0` | the shared service address — DNS listeners bind here |
+| `loopback0` | unique per node — outbound recursion sources from this |
+
+The two loopbacks are distinct on purpose. Sourcing recursion from the *anycast*
+address lets an authoritative's reply route to the sibling node, which has no
+matching outstanding query. That fails intermittently and only in production.
+
+Nodes speak **BGP only**. Running an IGP on a resolver makes it a routing
+participant, where a sick node perturbs SPF; BGP is also what carries the health
+signal. Redistributing the anycast prefix into IS-IS is the router's job.
+
+## Implemented
+
+**Recursion** — delegation walk from the root. QNAME minimisation (RFC 9156) and
+0x20 mixed-case encoding on by default, both with config escape hatches. Strict
+bailiwick checking: out-of-bailiwick glue is discarded, and a referral must stay
+inside the referring zone *and* move toward the QNAME. Forwarding mode is
+available behind the same interface. Per-nameserver RTT and health drive server
+selection.
+
+**DNSSEC validation** — full chain of trust with IANA root anchors embedded.
+NSEC and NSEC3 denial of existence, NSEC3 iteration limits per RFC 9276. A
+broken chain is SERVFAIL with an RFC 8914 extended error; there is no silent
+downgrade. A stripped DS is *bogus*, not insecure — an unproven insecure
+delegation is a downgrade attack. `AD` is set only on a chain verified locally.
+
+**Transports** — UDP, TCP, DoT (RFC 7858), DoH (RFC 8484 over HTTP/2). All
+dual-stack. UDP uses `SO_REUSEPORT` per-address sockets so replies leave with
+the correct anycast source. DoH ignores forwarding headers unless the peer is a
+configured trusted proxy, because the client address selects subscriber policy.
+
+**Subscriber policy** — RPZ zones and plain domain lists, compiled per
+subscriber class with specificity-ordered matching. Per-subscriber allow and
+block overrides take precedence over shared class feeds, so one customer can be
+unblocked without editing a feed you may not own. Blocked answers carry EDE 15
+so clients can distinguish policy from a genuine NXDOMAIN. A feed that fails to
+load leaves the previous rules serving — filtering goes stale, resolution does
+not.
+
+**Anycast health** — the node owns the decision on whether it belongs in the
+anycast set, and drives GoBGP over its gRPC API. `gobgpd` runs as a separate
+unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a
+resolver restart does not drop the session. Checks run through the real serving
+path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays
+on stable serving time rather than on recovery. SIGTERM withdraws before the
+listeners stop, so a planned restart moves traffic away first.
+
+## Not yet implemented
+
+| | Status |
+|---|---|
+| **Pair link** | Config replication semantics exist (`internal/control`: last-write-wins with Lamport ordering, tombstones, anti-entropy digests, drift hash). The wire protocol does not. |
+| **Cache synchronisation** | Designed, not built. Push on fill to keep the sibling hot, pull on miss before going upstream, TTL decremented in transit. POP-local only. |
+| `cgdnsctl` | Operator CLI. |
+| Management API / WebUI | Operator-only, manageable from either node in a pair. |
+| Packaging | `.deb` / `.rpm` via nfpm. |
+| DoQ | RFC 9250. |
+| Serve-stale, aggressive NSEC, prefetch, RRL | RFC 8767 / RFC 8198. RRL matters most — random-subdomain floods are what carriers actually get hit with. |
 
 ## Design constraints
 
-A few rules the code holds to, because they are the ones that bite in
-production:
-
 - **The query path does no I/O beyond resolution.** Policy and subscriber
-  lookups are lock-free reads of atomically swapped structures.
-- **Nothing trusts a server beyond its authority.** Out-of-bailiwick glue is
-  discarded rather than distrusted; a referral must move toward the QNAME and
-  stay inside the referring zone.
-- **Budgets are load-bearing.** A wall-clock budget, a delegation depth cap and
-  an outbound query cap bound every client query — the last is what stops one
-  query becoming an amplification lever.
-- **IPv6 is not optional.** Every listener and every outbound path is
-  dual-stack, and the test suite runs both families.
-- **Subscriber privacy.** Full QNAMEs are never logged or used as metric labels
-  above debug level.
+  lookups are lock-free reads of atomically swapped structures. A policy push
+  never pauses resolution.
+- **Budgets bound every query.** Wall clock, delegation depth, and a total
+  outbound query cap — the last is what stops one client query becoming an
+  amplification lever.
+- **Nothing trusts a server beyond its authority.** See bailiwick handling.
+- **IPv6 is not optional.** Every listener and outbound path is dual-stack, and
+  the test suite runs both families with no skips.
+- **Subscriber privacy.** Full QNAMEs never appear in logs or metric labels
+  above debug level; log lines carry the registrable domain.
+- **Fail loudly at startup.** Config is validated in full and every socket bound
+  before the daemon reports ready. A resolver that starts half-configured is
+  worse than one that does not start, because anycast routes traffic to it
+  regardless.
 
-## Building
+## Performance
 
-```sh
-make build          # ./bin/cgdns
-make check          # gofmt + vet + tests
-make race           # tests under -race
-make bench          # hot-path benchmarks
-```
+Measured on a Xeon Gold 6140, hot path, zero allocations:
+
+| | |
+|---|---|
+| Subscriber prefix lookup (v4 / v6) | 3.6 ns / 7.0 ns |
+| Cache hit | 344 ns |
+| Cache miss | 262 ns |
+
+## Configuration
+
+One struct, one YAML file, validated in full at startup. Notable rules the
+validator enforces rather than documents:
+
+- Listen addresses must be explicit. A wildcard bind loses the destination
+  address and breaks anycast source selection.
+- `listen.allow_query` is default-deny and required. An open recursive resolver
+  is an amplification source.
+- The management plane may not share a non-loopback address with a DNS
+  listener — those are anycast, and the admin plane must not follow an anycast
+  route to an arbitrary node.
+- Management off loopback requires both TLS and a source ACL.
+
+See `deploy/dev/` for worked examples.
+
+## Building and running
 
 Go 1.26 or newer.
 
-## Running
-
 ```sh
-./bin/cgdns -config deploy/dev/cgdns-recursive.yaml -check   # validate config
-./bin/cgdns -config deploy/dev/cgdns-recursive.yaml
+make build                                              # ./bin/cgdns
+make check                                              # fmt, vet, tests
+make race                                               # tests under -race
+make bench                                              # hot-path benchmarks
+
+./bin/cgdns -config /etc/cgdns/cgdns.yaml -check        # validate and exit
+./bin/cgdns -config /etc/cgdns/cgdns.yaml
 ```
 
-Configuration is a single YAML file, validated in full at startup: a bad config
-fails the boot rather than starting a resolver that behaves differently to the
-one the operator described.
+`deploy/systemd/cgdns.service` is a hardened unit. It grants
+`CAP_NET_BIND_SERVICE` as an ambient capability rather than via `setcap`:
+`NoNewPrivileges` strips file capabilities, and ambient capabilities survive
+replacing the binary on upgrade, so deployment needs no `setcap` step.
+`StartLimitBurst` caps restart flapping — health dampening lives in process
+memory, so a crash loop would otherwise flap the anycast prefix.
 
-See `deploy/systemd/cgdns.service` for a hardened unit. It uses ambient
-capabilities rather than `setcap`, so binding port 53 survives an upgrade
-replacing the binary.
+## Observability
 
-## Status
+Prometheus metrics on a separate management address, behind a source ACL. The
+series worth alerting on:
 
-Working and deployed in a lab: recursion, DNSSEC, all four transports, policy,
-and health-driven anycast with BGP failover.
-
-Not yet built: the node-pair link (config replication and cache sharing between
-the two resolvers in a POP), the operator CLI, the management API and WebUI,
-packaging, and DoQ.
+| Metric | Meaning |
+|---|---|
+| `cgdns_anycast_advertised` | 1 when this node is taking traffic |
+| `cgdns_anycast_flaps_total` | rising means dampening is escalating |
+| `cgdns_dnssec_bogus_total` | broken zone, or an attack |
+| `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
+| `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
 
 ## Licence
 

@@ -15,6 +15,7 @@
 /deploy/lab/
 
 # workspace scaffolding, not part of the product
+/CLAUDE.md
 /memory/
 /.claude/
 /.agents/
