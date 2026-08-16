@@ -169,7 +169,7 @@ func (a *API) handleRecords(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, rec)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"records": out, "hash": a.store.Hash()})
+	writeJSON(w, http.StatusOK, RecordsResponse{Records: out, Hash: a.store.Hash()})
 }
 
 func (a *API) listRecords(kind control.RecordKind) http.HandlerFunc {
@@ -180,7 +180,7 @@ func (a *API) listRecords(kind control.RecordKind) http.HandlerFunc {
 				out = append(out, rec.Payload)
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out)})
+		writeJSON(w, http.StatusOK, ListResponse{Items: out, Count: len(out)})
 	}
 }
 
@@ -251,8 +251,8 @@ func (a *API) writeRecord(w http.ResponseWriter, r *http.Request, kind control.R
 	a.log.Info("control record written",
 		slog.String("kind", kind.String()), slog.String("key", key),
 		slog.Uint64("lamport", rec.Lamport), slog.String("remote", r.RemoteAddr))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"kind": kind.String(), "key": key, "lamport": rec.Lamport, "hash": a.store.Hash(),
+	writeJSON(w, http.StatusOK, WriteResponse{
+		Kind: kind.String(), Key: key, Lamport: rec.Lamport, Hash: a.store.Hash(),
 	})
 }
 
@@ -277,7 +277,7 @@ func (a *API) deleteRecord(kind control.RecordKind) http.HandlerFunc {
 		a.log.Info("control record deleted",
 			slog.String("kind", kind.String()), slog.String("key", key),
 			slog.String("remote", r.RemoteAddr))
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": key, "hash": a.store.Hash()})
+		writeJSON(w, http.StatusOK, DeleteResponse{Deleted: key, Hash: a.store.Hash()})
 	}
 }
 
@@ -313,7 +313,7 @@ func (a *API) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	if tokens == nil {
 		tokens = []Token{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tokens": tokens, "count": len(tokens)})
+	writeJSON(w, http.StatusOK, TokenListResponse{Tokens: tokens, Count: len(tokens)})
 }
 
 func (a *API) handleCreateToken(w http.ResponseWriter, r *http.Request) {
@@ -355,18 +355,12 @@ func (a *API) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		slog.String("remote", r.RemoteAddr))
 
 	// The secret appears here and nowhere else, ever.
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id": t.ID, "name": t.Name, "scopes": t.Scopes,
-		"token":   secret,
-		"expires": expiryOrNil(t),
-	})
-}
-
-func expiryOrNil(t Token) any {
-	if t.Expires.IsZero() {
-		return nil
+	minted := MintedToken{ID: t.ID, Name: t.Name, Scopes: t.Scopes, Token: secret}
+	if !t.Expires.IsZero() {
+		expires := t.Expires
+		minted.Expires = &expires
 	}
-	return t.Expires
+	writeJSON(w, http.StatusCreated, minted)
 }
 
 func (a *API) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +374,7 @@ func (a *API) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.log.Info("api token revoked", slog.String("id", id), slog.String("remote", r.RemoteAddr))
-	writeJSON(w, http.StatusOK, map[string]any{"revoked": id})
+	writeJSON(w, http.StatusOK, RevokeResponse{Revoked: id})
 }
 
 // maxBody caps a request body. The admin plane handles small records, so this
@@ -418,5 +412,5 @@ func writeRaw(w http.ResponseWriter, code int, payload json.RawMessage) {
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	writeJSON(w, code, ErrorResponse{Error: msg})
 }
