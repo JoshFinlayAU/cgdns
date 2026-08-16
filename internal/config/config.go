@@ -170,6 +170,26 @@ type Cache struct {
 	// Infra sizes the infrastructure cache: what we know about authoritative
 	// servers themselves (RTT, health, EDNS quirks) as opposed to their data.
 	Infra InfraCache `yaml:"infra"`
+
+	// ServeStale answers from expired data when the authoritative cannot be
+	// reached (RFC 8767).
+	ServeStale ServeStale `yaml:"serve_stale"`
+}
+
+// ServeStale configures RFC 8767 stale answers.
+type ServeStale struct {
+	Enabled bool `yaml:"enabled"`
+
+	// MaxStale is how long past expiry an entry is kept for this purpose. It
+	// trades staleness for reachability: longer keeps subscribers online
+	// through a longer outage, at the cost of answering with data that may
+	// have moved. RFC 8767 recommends capping it at a day or so.
+	MaxStale time.Duration `yaml:"max_stale"`
+
+	// AnswerTTL is stamped on a stale answer. Short on purpose: the client
+	// should come back soon, because by then the authoritative may have
+	// recovered.
+	AnswerTTL time.Duration `yaml:"answer_ttl"`
 }
 
 // InfraCache configures the per-nameserver infrastructure cache.
@@ -460,6 +480,11 @@ func Default() Config {
 				Shards:     64,
 				InitialRTT: 100 * time.Millisecond,
 				MaxBackoff: 30 * time.Second,
+			},
+			ServeStale: ServeStale{
+				Enabled:   true,
+				MaxStale:  time.Hour,
+				AnswerTTL: 30 * time.Second,
 			},
 		},
 		Subscriber: Subscriber{
@@ -844,6 +869,19 @@ func (c *Config) Validate() error {
 
 		if c.Management.SessionTimeout <= 0 {
 			bad("management.session_timeout must be > 0")
+		}
+	}
+
+	if c.Cache.ServeStale.Enabled {
+		if c.Cache.ServeStale.MaxStale <= 0 {
+			bad("cache.serve_stale.max_stale must be > 0 when serve-stale is enabled")
+		}
+		if c.Cache.ServeStale.AnswerTTL <= 0 {
+			bad("cache.serve_stale.answer_ttl must be > 0")
+		}
+		if c.Cache.ServeStale.AnswerTTL >= c.Cache.ServeStale.MaxStale {
+			bad("cache.serve_stale.answer_ttl (%s) must be shorter than max_stale (%s): a client told to cache a stale answer for longer than we are willing to keep it would outlast our own copy",
+				c.Cache.ServeStale.AnswerTTL, c.Cache.ServeStale.MaxStale)
 		}
 	}
 

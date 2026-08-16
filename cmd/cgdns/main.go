@@ -38,6 +38,7 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/ratelimit"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver/roothints"
+	"github.com/JoshFinlayAU/cgdns/internal/servestale"
 	"github.com/JoshFinlayAU/cgdns/internal/subscriber"
 	"github.com/JoshFinlayAU/cgdns/internal/transport"
 )
@@ -106,6 +107,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		MinTTL:         cfg.Cache.MinTTL,
 		MaxTTL:         cfg.Cache.MaxTTL,
 		MaxNegativeTTL: cfg.Cache.MaxNegativeTTL,
+		MaxStale:       staleWindow(cfg),
 	})
 	if err != nil {
 		return fmt.Errorf("building cache: %w", err)
@@ -182,6 +184,23 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	handler, err := buildHandler(cfg, resolverCache, infraCache, resMetrics, recMetrics, log)
 	if err != nil {
 		return fmt.Errorf("building resolver: %w", err)
+	}
+
+	// Serve-stale sits directly around the resolver, inside policy: a name the
+	// operator blocks stays blocked even when the answer came from expired
+	// data.
+	staleMetrics := &servestale.Metrics{}
+	if cfg.Cache.ServeStale.Enabled {
+		handler = servestale.New(servestale.Options{
+			Next:      handler,
+			Cache:     rrCache,
+			AnswerTTL: cfg.Cache.ServeStale.AnswerTTL,
+			Log:       log,
+			Metrics:   staleMetrics,
+		})
+		log.Info("serve-stale enabled",
+			slog.Duration("max_stale", cfg.Cache.ServeStale.MaxStale),
+			slog.Duration("answer_ttl", cfg.Cache.ServeStale.AnswerTTL))
 	}
 
 	polMetrics := &policy.Metrics{}
@@ -392,6 +411,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	}
 	if limiter != nil {
 		registerRateLimitMetrics(reg, rlMetrics)
+	}
+	if cfg.Cache.ServeStale.Enabled {
+		registerServeStaleMetrics(reg, staleMetrics)
 	}
 
 	var mgmt *management.Server
@@ -1044,5 +1066,27 @@ func registerRateLimitMetrics(reg *metrics.Registry, m *ratelimit.Metrics) {
 		// Sustained evictions mean max_buckets is too small for the client
 		// population, so buckets are being forgotten while still in use.
 		metrics.Source{Name: "cgdns_ratelimit_evictions_total", Help: "Buckets evicted to stay within max_buckets.", Kind: metrics.Counter, Read: u64(m.Evictions.Load)},
+	)
+}
+
+// staleWindow is how long the cache keeps expired entries, which is zero unless
+// serve-stale is on: without it, retaining them would only waste memory.
+func staleWindow(cfg config.Config) time.Duration {
+	if !cfg.Cache.ServeStale.Enabled {
+		return 0
+	}
+	return cfg.Cache.ServeStale.MaxStale
+}
+
+func registerServeStaleMetrics(reg *metrics.Registry, m *servestale.Metrics) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	reg.Register(
+		// Rising means authoritatives are failing and subscribers are being
+		// kept online by expired data. It is a good outcome and a bad sign.
+		metrics.Source{Name: "cgdns_serve_stale_served_total", Help: "Responses answered from expired cache data.", Kind: metrics.Counter, Read: u64(m.Served.Load)},
+		metrics.Source{Name: "cgdns_serve_stale_eligible_total", Help: "Resolution failures where stale data was consulted.", Kind: metrics.Counter, Read: u64(m.Eligible.Load)},
+		metrics.Source{Name: "cgdns_serve_stale_unavailable_total", Help: "Resolution failures with nothing stale to fall back to.", Kind: metrics.Counter, Read: u64(m.Unavailable.Load)},
 	)
 }

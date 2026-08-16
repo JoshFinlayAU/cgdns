@@ -94,6 +94,17 @@ type Options struct {
 	// MaxNegativeTTL caps RFC 2308 negative caching.
 	MaxNegativeTTL time.Duration
 
+	// MaxStale is how long an expired entry is kept so it can still answer
+	// when the authoritative cannot be reached (RFC 8767). Zero drops entries
+	// at expiry, which is the behaviour without serve-stale.
+	//
+	// It trades staleness for reachability: a longer window keeps subscribers
+	// online through a longer outage, at the cost of answering with data that
+	// may have moved. It never affects a normal lookup — Get still treats an
+	// expired entry as a miss, so a reachable authoritative is always
+	// preferred.
+	MaxStale time.Duration
+
 	// Now is injectable for tests. Defaults to time.Now.
 	Now func() time.Time
 }
@@ -205,7 +216,12 @@ func (c *Cache) Get(k Key) (Entry, bool) {
 		return Entry{}, false
 	}
 	if !now.Before(n.entry.Expiry) {
-		s.remove(n)
+		// Expired. Keep it only while it could still answer under serve-stale;
+		// either way this is a miss, so a reachable authoritative always wins
+		// over stale data.
+		if c.opts.MaxStale <= 0 || !now.Before(n.entry.Expiry.Add(c.opts.MaxStale)) {
+			s.remove(n)
+		}
 		s.expired++
 		s.misses++
 		return Entry{}, false
@@ -213,6 +229,59 @@ func (c *Cache) Get(k Key) (Entry, bool) {
 	s.moveToFront(n)
 	s.hits++
 	return n.entry, true
+}
+
+// GetStale returns an entry that has expired but is still within the stale
+// window, for use only when resolution has failed (RFC 8767).
+//
+// It deliberately does not consult live entries: the caller has already tried
+// a normal lookup and gone upstream, so anything live would have been served
+// there. It counts neither a hit nor a miss — serving stale is a failure
+// signal, not cache performance, and it has its own metrics.
+func (c *Cache) GetStale(k Key) (Entry, bool) {
+	if c.opts.MaxStale <= 0 {
+		return Entry{}, false
+	}
+	now := c.now()
+	s := c.shardFor(k)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, ok := s.m[k]
+	if !ok {
+		return Entry{}, false
+	}
+	if now.Before(n.entry.Expiry) {
+		return Entry{}, false
+	}
+	if !now.Before(n.entry.Expiry.Add(c.opts.MaxStale)) {
+		s.remove(n)
+		return Entry{}, false
+	}
+	return n.entry, true
+}
+
+// StaleRRs returns the records of a stale entry stamped with ttl.
+//
+// A stale entry's own TTL is zero by definition, and a zero TTL tells a client
+// never to cache the answer, which would send every one of them straight back
+// to a resolver that is already failing to resolve.
+func StaleRRs(e Entry, ttl time.Duration) []dns.RR {
+	if len(e.RRs) == 0 {
+		return nil
+	}
+	secs := uint32(ttl / time.Second)
+	if secs == 0 {
+		secs = 1
+	}
+	out := make([]dns.RR, len(e.RRs))
+	for i, rr := range e.RRs {
+		c := dns.Copy(rr)
+		c.Header().Ttl = secs
+		out[i] = c
+	}
+	return out
 }
 
 // Peek returns the live entry for k without counting a hit or a miss, and

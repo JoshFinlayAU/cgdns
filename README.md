@@ -71,6 +71,10 @@ Every Nth over-limit response is sent truncated instead of dropped, so a legitim
 
 Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collapsed to a single bucket, 1,547 answered (the configured rate), and the node stayed healthy and in the anycast set throughout. A resolver that limits itself out of the anycast set has turned an attack into an outage.
 
+**Serve-stale** - when an authoritative has gone away, answering slightly old data beats answering nothing (RFC 8767). Expired entries are kept for `max_stale` and used *only* after resolution has already failed, so a working authoritative is always preferred and a live entry is served by the normal path. Answers carry EDE 3 so a client can tell, and never set `AD`: the signatures are as old as the data and may have expired, so claiming the chain validated would be a claim we cannot stand behind. NXDOMAIN and NODATA are never overridden - those are answers, and replacing them would resurrect names their owner deliberately removed.
+
+The interaction that matters: **health checks do not accept a stale answer.** Serve-stale exists to keep answering when a node cannot resolve, so a probe that accepted it would let a node cut off from the internet pass its checks forever on cached root data, holding an anycast prefix it can no longer serve while a working POP sits idle. Verified on the lab by cutting both address families: subscribers kept getting answers for cached names, and the node withdrew from the anycast set with `. NS was answered from expired cache, so this node is not resolving`.
+
 **`cgdnsctl`** - operator CLI, and a plain client of that API with no privileged state of its own, so anything it does your provisioning system can do over HTTP. Because the pair replicates its control plane, pointing it at either node is equivalent - that is the "manage from any node" behaviour, achieved by replication rather than by a cluster-wide API.
 
 ## Not yet implemented
@@ -81,7 +85,7 @@ Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collaps
 | Packaging | `.deb` / `.rpm` via nfpm. |
 | `resolver.outbound_source` | Egress source address is currently whatever the route picks. |
 | DoQ | RFC 9250. |
-| Serve-stale, aggressive NSEC, prefetch | RFC 8767 / RFC 8198. |
+| Aggressive NSEC, prefetch | RFC 8198. |
 
 ## Design constraints
 
@@ -208,6 +212,7 @@ series worth alerting on:
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
 | `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
 | `cgdns_ratelimit_evictions_total` | sustained means `max_buckets` is too small for the client population |
+| `cgdns_serve_stale_served_total` | rising means authoritatives are failing and expired data is keeping subscribers online |
 | `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
 | `cgdns_peer_cache_fetch_hits_total` | work the sibling saved this node |
 

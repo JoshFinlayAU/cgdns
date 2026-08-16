@@ -54,6 +54,11 @@ resolver:
   case_randomisation: true
 
 cache:
+  # Answer from expired data when the authoritative cannot be reached.
+  serve_stale:
+    enabled: true
+    max_stale: 1h
+    answer_ttl: 30s
   max_entries: 100000
   shards: 64
   min_ttl: 5s

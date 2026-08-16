@@ -52,6 +52,20 @@ resolver:
 cache:
   max_entries: 1000000
 
+  # Answer from expired data when the authoritative cannot be reached
+  # (RFC 8767). It never competes with a working authoritative: a live entry is
+  # served normally, and stale data is consulted only after resolution fails.
+  # Health checks deliberately do not accept a stale answer, so a node that has
+  # lost the internet still withdraws from the anycast set.
+  serve_stale:
+    enabled: true
+    # Longer keeps subscribers online through a longer outage, at the cost of
+    # answering with data that may have moved.
+    max_stale: 1h
+    # Short on purpose: the client should come back soon, because by then the
+    # authoritative may have recovered.
+    answer_ttl: 30s
+
 # Response rate limiting, on UDP only. TCP, DoT and DoH complete a handshake,
 # so there is nothing to spoof and nothing to reflect.
 rate_limit:
