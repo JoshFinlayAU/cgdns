@@ -1,0 +1,6 @@
+# <subscriber-id>  allow|block  <domain>
+# acme-corp's supplier is false-positived by the curated feed; unblock it for
+# them alone, without touching the shared feed.
+acme-corp          allow        supplier.example.com
+# A subscriber may also add blocks the class feeds do not carry.
+acme-corp          block        social-test.example

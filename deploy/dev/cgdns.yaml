@@ -1,0 +1,82 @@
+# cgdns development configuration.
+#
+# Runs a single node on loopback with unprivileged ports, forwarding to public
+# resolvers. Nothing here is suitable for production: see the comments marked
+# PRODUCTION for what must change.
+
+node:
+  id: cgdns-dev-01
+  state_dir: ./run/state
+
+listen:
+  # Explicit addresses only — a wildcard bind is rejected at startup because it
+  # loses the destination address and breaks anycast source selection.
+  # Both families, always: an IPv4-only lab hides IPv6 delegation bugs.
+  udp:
+    - "127.0.0.1:5353"
+    - "[::1]:5353"
+  tcp:
+    - "127.0.0.1:5353"
+    - "[::1]:5353"
+
+  # 0 = one SO_REUSEPORT socket per CPU.
+  udp_sockets_per_addr: 0
+  max_tcp_conns: 1024
+  tcp_idle_timeout: 10s
+
+  # Default deny. PRODUCTION: list the subscriber ranges permitted to query.
+  # A default route here makes this an open resolver and the daemon will warn
+  # loudly at startup.
+  allow_query:
+    - "127.0.0.0/8"
+    - "::1/128"
+
+resolver:
+  # PRODUCTION: "recursive" once the recursion engine lands. Forward mode does
+  # not validate DNSSEC and therefore never sets AD.
+  mode: forward
+  upstreams:
+    - "1.1.1.1:53"
+    - "9.9.9.9:53"
+    - "[2606:4700:4700::1111]:53"
+    - "[2620:fe::fe]:53"
+
+  client_budget: 5s
+  query_timeout: 2s
+  max_delegation_depth: 16
+  max_outbound_per_query: 32
+  udp_buffer_size: 1232
+  qname_minimisation: true
+  case_randomisation: true
+
+cache:
+  max_entries: 100000
+  shards: 64
+  min_ttl: 5s
+  max_ttl: 24h
+  max_negative_ttl: 1h
+
+subscriber:
+  default_class: default
+
+management:
+  enabled: true
+  # PRODUCTION: bind the management interface address, never a service or
+  # anycast address — the daemon refuses to start if this overlaps a DNS
+  # listener. Off loopback, allow_from and TLS both become mandatory.
+  listen:
+    - "127.0.0.1:8443"
+  ui: true
+  session_timeout: 8h
+  tls:
+    min_version: "1.3"
+  # allow_from: ["10.20.0.0/24"]   # required once listen is not loopback-only
+
+metrics:
+  listen: "127.0.0.1:9153"
+  path: /metrics
+  # allow_from: ["10.20.0.0/24"]   # required once listen is not loopback
+
+log:
+  level: debug
+  format: text

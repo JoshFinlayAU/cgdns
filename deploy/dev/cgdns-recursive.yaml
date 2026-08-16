@@ -1,0 +1,153 @@
+# cgdns development configuration — full recursion.
+#
+# This is the mode the product actually ships in: the delegation chain is walked
+# from the root by this node, with no upstream resolver involved. Compare with
+# cgdns.yaml, which forwards and therefore cannot validate DNSSEC.
+#
+# Single node, loopback, unprivileged ports. See PRODUCTION notes for what must
+# change before this goes anywhere real.
+
+node:
+  id: cgdns-dev-rec-01
+  state_dir: ./run/state
+
+listen:
+  # Explicit addresses only; a wildcard bind is rejected at startup because it
+  # loses the destination address and breaks anycast source selection.
+  udp:
+    - "127.0.0.1:5353"
+    - "[::1]:5353"
+  tcp:
+    - "127.0.0.1:5353"
+    - "[::1]:5353"
+
+  # DNS over TLS (RFC 7858) and DNS over HTTPS (RFC 8484). Production ports are
+  # 853 and 443; these are unprivileged so dev needs no capabilities.
+  dot:
+    - "127.0.0.1:8853"
+    - "[::1]:8853"
+  doh:
+    - "127.0.0.1:8444"
+  doh_path: /dns-query
+
+  tls:
+    cert_file: deploy/dev/tls/cert.pem
+    key_file: deploy/dev/tls/key.pem
+    min_version: "1.3"
+
+  # Behind an L7 proxy the TCP peer is the proxy, not the subscriber. Only the
+  # sources listed here may assert a client address via forwarding headers;
+  # trusting anyone else would let a client spoof another subscriber's policy.
+  doh_trusted_proxies: []
+
+  udp_sockets_per_addr: 0 # 0 = one per CPU
+  max_tcp_conns: 1024
+  tcp_idle_timeout: 10s
+
+  # Default deny. PRODUCTION: list the subscriber ranges permitted to query.
+  allow_query:
+    - "127.0.0.0/8"
+    - "::1/128"
+
+resolver:
+  mode: recursive
+  # upstreams must be empty in recursive mode — the daemon refuses to start
+  # otherwise, rather than let you believe traffic is being forwarded.
+
+  client_budget: 5s
+  query_timeout: 2s
+
+  # Loop and amplification bounds. max_outbound_per_query is the one that stops
+  # a single client query becoming a lever against third parties.
+  max_delegation_depth: 16
+  max_outbound_per_query: 32
+  max_cname_chain: 8
+
+  udp_buffer_size: 1232
+
+  # Privacy and anti-spoofing, both on by default.
+  qname_minimisation: true # RFC 9156 — the root never sees the full QNAME
+  case_randomisation: true # 0x20 — extra entropy against off-path spoofing
+
+  # Both families. Disabling IPv6 means IPv6-only zones become unresolvable;
+  # the daemon warns loudly at startup if you do.
+  use_ipv4: true
+  use_ipv6: true
+
+  # Empty uses the root hints shipped in the package. A node that has been down
+  # for months should be given a fresh copy from
+  # https://www.internic.net/domain/named.root
+  root_hints_file: ""
+
+  # DNSSEC validation. A broken chain becomes SERVFAIL with an RFC 8914
+  # extended error — there is no downgrade to an unvalidated answer, and AD is
+  # set only on a chain this node verified itself.
+  dnssec: true
+  # Empty uses the trust anchors shipped in the package. Refresh from
+  # https://data.iana.org/root-anchors/root-anchors.xml after a KSK rollover.
+  trust_anchor_file: ""
+  # SHA-1 is not collision resistant. Leave this false.
+  accept_sha1: false
+
+cache:
+  max_entries: 100000
+  shards: 64
+  min_ttl: 5s
+  max_ttl: 24h
+  max_negative_ttl: 1h
+
+  # What we learn about the authoritative servers themselves — RTT, health,
+  # EDNS quirks. Node-local by definition: RTT is a property of the path from
+  # THIS node, so it is never shared across the cluster.
+  infra:
+    max_entries: 100000
+    shards: 64
+    initial_rtt: 100ms
+    max_backoff: 30s
+
+subscriber:
+  default_class: default
+  # Maps client prefixes to a subscriber and their class. Pushed via raft in
+  # production; a file is the dev path in.
+  prefix_file: deploy/dev/subscribers.txt
+
+policy:
+  enabled: true
+
+  # Feed content is fetched out-of-band and hash-verified in production, never
+  # carried in raft — these run to millions of rows and would stall snapshots.
+  feeds:
+    - name: curated-rbl
+      format: domain-list
+      file: testdata/rpz/blocklist.txt
+
+  classes:
+    - name: secure
+      feeds: [curated-rbl]
+      action: nxdomain
+    - name: default
+      feeds: []
+
+  # Per-subscriber allow and block rules. An allow beats every class feed, so a
+  # customer can be unblocked without editing a shared list.
+  overrides_file: deploy/dev/overrides.txt
+
+management:
+  enabled: true
+  # PRODUCTION: bind the management interface address. The daemon refuses to
+  # start if this shares a non-loopback address with a DNS listener, and
+  # off loopback both allow_from and TLS become mandatory.
+  listen:
+    - "127.0.0.1:8443"
+  ui: true
+  session_timeout: 8h
+  tls:
+    min_version: "1.3"
+
+metrics:
+  listen: "127.0.0.1:9153"
+  path: /metrics
+
+log:
+  level: info
+  format: text

@@ -1,0 +1,7 @@
+# Curated security feed (dev fixture).
+# One domain per line; each blocks the name and everything below it.
+malware-test.example
+tracker-test.example
+# A legitimate business that a curated feed has false-positived on.
+# This is the case per-subscriber whitelists exist for.
+supplier.example.com

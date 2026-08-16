@@ -1,0 +1,4 @@
+# prefix            class      subscriber-id
+# Longest prefix wins, so a specific customer overrides their wholesale range.
+127.0.0.0/8         secure     acme-corp
+::1/128             secure     other-corp

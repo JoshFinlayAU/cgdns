@@ -1,0 +1,39 @@
+[Unit]
+Description=cgdns carrier recursive DNS resolver
+Documentation=https://github.com/JoshFinlayAU/cgdns
+After=network-online.target
+Wants=network-online.target
+
+# Cap restart flapping. The health monitor dampens re-advertisement within a
+# process, but its state is in memory, so a crash loop would start fresh each
+# time and flap the anycast prefix. After this many failures systemd gives up
+# and leaves the node withdrawn, which is the correct outcome.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=cgdns
+Group=cgdns
+ExecStart=/usr/local/sbin/cgdns -config /etc/cgdns/cgdns.yaml
+Restart=on-failure
+RestartSec=5s
+StateDirectory=cgdns
+RuntimeDirectory=cgdns
+
+# Ambient capabilities rather than setcap on the binary: NoNewPrivileges strips
+# file capabilities, and ambient caps survive replacing the binary on upgrade.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

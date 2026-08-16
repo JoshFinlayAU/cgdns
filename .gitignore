@@ -1,0 +1,22 @@
+# build output
+/bin/
+/dist/
+/run/
+*.test
+*.out
+*.prof
+
+# secrets: never tracked
+*.pem
+*.key
+/deploy/dev/tls/
+
+# real deployment addressing stays out of the public repo
+/deploy/lab/
+
+# workspace scaffolding, not part of the product
+/memory/
+/.claude/
+/.agents/
+/.sandbox.toml
+/skills-lock.json
