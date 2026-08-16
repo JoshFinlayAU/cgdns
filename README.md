@@ -81,6 +81,16 @@ Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collaps
 
 The interaction that matters: **health checks do not accept a stale answer.** Serve-stale exists to keep answering when a node cannot resolve, so a probe that accepted it would let a node cut off from the internet pass its checks forever on cached root data, holding an anycast prefix it can no longer serve while a working POP sits idle. Verified on the lab by cutting both address families: subscribers kept getting answers for cached names, and the node withdrew from the anycast set with `. NS was answered from expired cache, so this node is not resolving`.
 
+**Operator accounts** - the WebUI logs in humans, which is a different problem from an API token. A token is 256 bits of randomness, so a plain hash is enough; a password is whatever someone chose, so it gets argon2id and a TOTP second factor (RFC 6238, verified against the published test vectors). Enrolment only takes effect once the operator proves they can generate a code, so a half-finished setup cannot lock them out. Sessions are node-local and their cookie is `__Host-` prefixed, `Secure`, `HttpOnly` and `SameSite=Strict`, with a CSRF token that a cross-origin request cannot produce whatever the cookie policy does. Changing a password ends every other session for that account, and deleting one ends its sessions immediately rather than at the next expiry.
+
+The first account is created with the bootstrap token, so there is no default password anywhere:
+
+```sh
+cgdnsctl user create josh admin      # prompts for the password, never an argument
+```
+
+**The WebUI binds to localhost by default**, on HTTPS. Put a tunnel or reverse proxy in front and let it terminate the real TLS. If no certificate is configured the daemon generates a self-signed one into `node.state_dir` - nobody is meant to trust it, it exists so the browser will store a `Secure` session cookie. Enabling the UI adds no listener of its own.
+
 **`cgdnsctl`** - operator CLI, and a plain client of that API with no privileged state of its own, so anything it does your provisioning system can do over HTTP. Because the pair replicates its control plane, pointing it at either node is equivalent - that is the "manage from any node" behaviour, achieved by replication rather than by a cluster-wide API.
 
 ## Not yet implemented

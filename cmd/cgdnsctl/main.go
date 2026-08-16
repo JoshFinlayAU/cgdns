@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/JoshFinlayAU/cgdns/internal/control"
 	"github.com/JoshFinlayAU/cgdns/internal/management"
@@ -88,6 +91,8 @@ func run(args []string) error {
 		return cmdRecords(g, rest[1:])
 	case "token":
 		return cmdToken(g, rest[1:])
+	case "user":
+		return cmdUser(g, rest[1:])
 	case "allow", "block":
 		return cmdOverrideList(g, rest[0], rest[1:])
 	case "help":
@@ -120,6 +125,9 @@ Commands:
   token list                      list API tokens
   token create <name> <scopes>    mint a token (scopes: read,write,admin)
   token revoke <id>               revoke a token
+  user list                       list operator accounts (WebUI logins)
+  user create <name> <scopes>     add one; the password is prompted for
+  user delete <name>              remove one
 
   <noun> list                     list records        (nouns: %s)
   <noun> get <key>                show one record
@@ -504,6 +512,110 @@ func cmdToken(g globals, args []string) error {
 	default:
 		return fmt.Errorf("unknown token subcommand %q", args[0])
 	}
+}
+
+func cmdUser(g globals, args []string) error {
+	if len(args) == 0 {
+		return errors.New("user needs a subcommand: list, create or delete")
+	}
+	c, err := g.client()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "list":
+		users, err := c.Users()
+		if err != nil {
+			return err
+		}
+		if g.jsonOut {
+			return emitJSON(users)
+		}
+		fmt.Printf("%-16s %-18s %-6s %s\n", "NAME", "SCOPES", "TOTP", "LAST LOGIN")
+		for _, u := range users {
+			last := "never"
+			if !u.LastLogin.IsZero() {
+				last = u.LastLogin.Format(time.RFC3339)
+			}
+			state := "no"
+			if u.TOTPConfirmed {
+				state = "yes"
+			}
+			if u.Disabled {
+				state += " (disabled)"
+			}
+			fmt.Printf("%-16s %-18s %-6s %s\n", u.Name, joinScopes(u.Scopes), state, last)
+		}
+		return nil
+
+	case "create":
+		if len(args) < 2 {
+			return errors.New("user create needs a name, and optionally scopes (default: read)")
+		}
+		scopes := []management.Scope{management.ScopeRead}
+		if len(args) >= 3 {
+			scopes = parseScopes(args[2])
+		}
+		// Read the password from the terminal rather than take it as an
+		// argument: an argument lands in the shell history and in ps output.
+		password, err := readPassword("password for " + args[1] + ": ")
+		if err != nil {
+			return err
+		}
+		again, err := readPassword("repeat: ")
+		if err != nil {
+			return err
+		}
+		if password != again {
+			return errors.New("the two passwords do not match")
+		}
+		if err := c.CreateUser(args[1], password, scopes); err != nil {
+			return err
+		}
+		fmt.Printf("created %s with scopes %s\n", args[1], joinScopes(scopes))
+		fmt.Fprintln(os.Stderr, "they should enrol a second factor from the WebUI at first login")
+		return nil
+
+	case "delete":
+		if len(args) != 2 {
+			return errors.New("user delete needs a name")
+		}
+		if err := c.DeleteUser(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("deleted %s\n", args[1])
+		return nil
+
+	default:
+		return fmt.Errorf("unknown user subcommand %q", args[0])
+	}
+}
+
+// stdin is buffered once, so successive prompts read successive lines.
+var stdin = bufio.NewReader(os.Stdin)
+
+// readPassword reads without echoing when stdin is a terminal, so a password
+// does not end up on screen or in a scrollback buffer.
+func readPassword(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	defer fmt.Fprintln(os.Stderr)
+
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			return "", err
+		}
+		return string(raw), nil
+	}
+	// Not a terminal: read a line, which is what a scripted invocation feeds.
+	// The reader is shared across calls, because a fresh one would buffer every
+	// line piped in and leave the next call with nothing.
+	line, err := stdin.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func parseScopes(csv string) []management.Scope {

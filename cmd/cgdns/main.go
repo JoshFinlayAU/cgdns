@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -469,7 +470,10 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		registerAggressiveMetrics(reg, nsecMetrics)
 	}
 
-	var mgmt *management.Server
+	var (
+		mgmt     *management.Server
+		sessions *management.SessionStore
+	)
 	if cfg.Management.Enabled {
 		if store == nil {
 			return errors.New("management is enabled but there is no control store to manage")
@@ -479,8 +483,10 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		}
 
 		api, err := management.NewAPI(management.APIOptions{
-			Store: store,
-			Log:   log,
+			Store:      store,
+			Log:        log,
+			SessionTTL: cfg.Management.SessionTimeout,
+			Issuer:     "cgdns " + cfg.Node.ID,
 			Status: func() management.Status {
 				s := management.Status{
 					NodeID:  cfg.Node.ID,
@@ -504,11 +510,26 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			return err
 		}
 
-		var mgmtTLS *tls.Config
-		if cfg.Management.TLS.CertFile != "" {
-			if mgmtTLS, err = loadTLS(cfg.Management.TLS); err != nil {
-				return fmt.Errorf("loading management TLS: %w", err)
+		mgmtTLSCfg := cfg.Management.TLS
+		if mgmtTLSCfg.CertFile == "" || mgmtTLSCfg.KeyFile == "" {
+			// The WebUI's session cookie is Secure, so a browser will not store
+			// it over plain HTTP. Generating a certificate keeps a fresh node
+			// usable without the operator producing one by hand; real TLS is
+			// expected to be terminated in front of this.
+			hosts := make([]string, 0, len(cfg.Management.Listen))
+			for _, a := range cfg.ManagementAddrs() {
+				hosts = append(hosts, a.Addr().String())
 			}
+			certFile, keyFile, err := management.EnsureSelfSigned(
+				filepath.Join(cfg.Node.StateDir, "tls"), cfg.Node.ID, hosts, log)
+			if err != nil {
+				return err
+			}
+			mgmtTLSCfg.CertFile, mgmtTLSCfg.KeyFile = certFile, keyFile
+		}
+		mgmtTLS, err := loadTLS(mgmtTLSCfg)
+		if err != nil {
+			return fmt.Errorf("loading management TLS: %w", err)
 		}
 
 		mgmt, err = management.NewServer(management.ServerOptions{
@@ -522,6 +543,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			return err
 		}
 		defer func() { _ = mgmt.Close() }()
+		sessions = api.Sessions()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -550,6 +572,22 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if mgmt != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); errCh <- mgmt.Serve(ctx) }()
+	}
+	if sessions != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					sessions.Sweep()
+				}
+			}
+		}()
 	}
 	if cfg.Control.StoreFile != "" {
 		wg.Add(1)

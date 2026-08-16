@@ -449,6 +449,12 @@ type Management struct {
 	// UI serves the embedded WebUI in addition to the API.
 	UI bool `yaml:"ui"`
 
+	// The WebUI is served here and nowhere else, and it needs HTTPS even on
+	// loopback: its session cookie is Secure, so a browser will not store it
+	// over plain HTTP. When no certificate is configured the daemon generates a
+	// self-signed one into node.state_dir, which is enough for the browser and
+	// expects real TLS to be terminated in front — a tunnel, or a reverse proxy.
+	//
 	// BootstrapTokenFile receives an admin token when the node starts with no
 	// token at all. The alternatives are worse: a default credential is a
 	// permanent hole, and a manual out-of-band step gets skipped. A node that
@@ -926,6 +932,7 @@ func (c *Config) Validate() error {
 		if c.Management.SessionTimeout <= 0 {
 			bad("management.session_timeout must be > 0")
 		}
+
 	}
 
 	for _, f := range []struct {

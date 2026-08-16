@@ -227,6 +227,31 @@ func (c *Client) CreateToken(req TokenRequest) (MintedToken, error) {
 	return out, err
 }
 
+// Users lists operator accounts.
+func (c *Client) Users() ([]User, error) {
+	var resp struct {
+		Users []User `json:"users"`
+	}
+	if err := c.do(http.MethodGet, "/api/v1/users", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Users, nil
+}
+
+// CreateUser adds an operator account.
+func (c *Client) CreateUser(name, password string, scopes []Scope) error {
+	body, err := json.Marshal(map[string]any{"name": name, "password": password, "scopes": scopes})
+	if err != nil {
+		return err
+	}
+	return c.do(http.MethodPost, "/api/v1/users", body, nil)
+}
+
+// DeleteUser removes an operator account.
+func (c *Client) DeleteUser(name string) error {
+	return c.do(http.MethodDelete, "/api/v1/users/"+name, nil, nil)
+}
+
 // RevokeToken deletes a token.
 func (c *Client) RevokeToken(id string) error {
 	return c.do(http.MethodDelete, "/api/v1/tokens/"+id, nil, nil)

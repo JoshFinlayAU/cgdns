@@ -40,10 +40,12 @@ type StatusFunc func() Status
 
 // API routes the operator interface.
 type API struct {
-	store  *control.Store
-	status StatusFunc
-	log    *slog.Logger
-	now    func() time.Time
+	store    *control.Store
+	status   StatusFunc
+	log      *slog.Logger
+	now      func() time.Time
+	sessions *SessionStore
+	issuer   string
 }
 
 // APIOptions configures the API.
@@ -53,6 +55,10 @@ type APIOptions struct {
 	Log    *slog.Logger
 	// Now is injectable so token expiry is testable.
 	Now func() time.Time
+	// SessionTTL bounds a WebUI login.
+	SessionTTL time.Duration
+	// Issuer names this node in an authenticator app.
+	Issuer string
 }
 
 // NewAPI builds the operator API.
@@ -69,8 +75,21 @@ func NewAPI(opts APIOptions) (*API, error) {
 	if opts.Status == nil {
 		opts.Status = func() Status { return Status{} }
 	}
-	return &API{store: opts.Store, status: opts.Status, log: opts.Log, now: opts.Now}, nil
+	if opts.Issuer == "" {
+		opts.Issuer = "cgdns"
+	}
+	return &API{
+		store:    opts.Store,
+		status:   opts.Status,
+		log:      opts.Log,
+		now:      opts.Now,
+		sessions: NewSessionStore(opts.SessionTTL, opts.Now),
+		issuer:   opts.Issuer,
+	}, nil
 }
+
+// Sessions exposes the session store, for the metrics endpoint and for sweeping.
+func (a *API) Sessions() *SessionStore { return a.sessions }
 
 // kindPaths maps the URL segment to the record kind it manages.
 var kindPaths = map[string]control.RecordKind{
@@ -95,6 +114,19 @@ func (a *API) Handler() http.Handler {
 		mux.Handle("DELETE /api/v1/"+path+"/{key...}", a.guard(ScopeWrite, a.deleteRecord(kind)))
 	}
 
+	// Login is the only unauthenticated endpoint. Everything else needs either
+	// an API token or a session.
+	mux.HandleFunc("POST /api/v1/login", a.handleLogin)
+	mux.Handle("POST /api/v1/logout", a.guard(ScopeRead, a.handleLogout))
+	mux.Handle("GET /api/v1/me", a.guard(ScopeRead, a.handleMe))
+	mux.Handle("POST /api/v1/me/totp", a.guard(ScopeRead, a.handleTOTPEnrol))
+	mux.Handle("POST /api/v1/me/totp/confirm", a.guard(ScopeRead, a.handleTOTPConfirm))
+	mux.Handle("POST /api/v1/me/password", a.guard(ScopeRead, a.handleChangePassword))
+
+	mux.Handle("GET /api/v1/users", a.guard(ScopeAdmin, a.handleListUsers))
+	mux.Handle("POST /api/v1/users", a.guard(ScopeAdmin, a.handleCreateUser))
+	mux.Handle("DELETE /api/v1/users/{name}", a.guard(ScopeAdmin, a.handleDeleteUser))
+
 	mux.Handle("GET /api/v1/tokens", a.guard(ScopeAdmin, a.handleListTokens))
 	mux.Handle("POST /api/v1/tokens", a.guard(ScopeAdmin, a.handleCreateToken))
 	mux.Handle("DELETE /api/v1/tokens/{id}", a.guard(ScopeAdmin, a.handleRevokeToken))
@@ -108,10 +140,27 @@ func (a *API) Handler() http.Handler {
 // guard authenticates and authorises before running h.
 func (a *API) guard(want Scope, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A browser session is the other way in. It is checked first only
+		// because a WebUI request carries no Authorization header.
+		if sess, id, ok := a.sessionFrom(r); ok {
+			if !csrfOK(r, sess) {
+				a.log.Warn("management CSRF check failed",
+					slog.String("user", sess.user), slog.String("path", r.URL.Path))
+				writeError(w, http.StatusForbidden, "missing or invalid CSRF token")
+				return
+			}
+			if !scopesAllow(sess.scopes, want) {
+				writeError(w, http.StatusForbidden, "session lacks the "+string(want)+" scope")
+				return
+			}
+			h(w, r.WithContext(withSession(r.Context(), sess, id)))
+			return
+		}
+
 		presented, ok := bearer(r)
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="cgdns"`)
-			writeError(w, http.StatusUnauthorized, "an API token is required")
+			writeError(w, http.StatusUnauthorized, "an API token or a session is required")
 			return
 		}
 		t, err := Verify(a.store, presented, a.now())

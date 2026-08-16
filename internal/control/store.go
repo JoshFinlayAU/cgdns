@@ -30,6 +30,13 @@ const (
 	// so replicating it to the sibling — which is what lets an operator manage
 	// the pair from either node — never moves the secret itself.
 	KindToken RecordKind = 5
+	// KindUser holds an operator's WebUI login: password hash, scopes and
+	// second factor.
+	//
+	// These values are persisted and replicated, so they are fixed: renumbering
+	// one would make a node read every existing record of that kind as
+	// something else.
+	KindUser RecordKind = 6
 )
 
 // String implements fmt.Stringer.
@@ -45,6 +52,8 @@ func (k RecordKind) String() string {
 		return "class"
 	case KindToken:
 		return "token"
+	case KindUser:
+		return "user"
 	default:
 		return "unknown"
 	}
