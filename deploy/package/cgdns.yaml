@@ -24,6 +24,12 @@ listen:
   # dot: ["<anycast-v4>:853", "[<anycast-v6>]:853"]
   # doh: ["<anycast-v4>:443", "[<anycast-v6>]:443"]
 
+  # SO_REUSEPORT sockets per UDP address, and handler goroutines per socket.
+  # Together they bound in-flight queries. 0 means one socket per CPU and the
+  # built-in worker default.
+  udp_sockets_per_addr: 0
+  udp_workers_per_socket: 0
+
   # Default deny. List the subscriber prefixes this node answers recursion for;
   # a resolver open to the internet is an amplification source.
   allow_query: []

@@ -21,6 +21,10 @@ listen:
 
   # 0 = one SO_REUSEPORT socket per CPU.
   udp_sockets_per_addr: 0
+  # Handler goroutines per socket. Bounds in-flight queries: too few and the
+  # receive queue backs up under load, too many and a slow upstream becomes a
+  # pile of goroutines waiting on it. 0 uses the default.
+  udp_workers_per_socket: 0
   max_tcp_conns: 1024
   tcp_idle_timeout: 10s
 

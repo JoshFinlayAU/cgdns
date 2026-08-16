@@ -150,6 +150,22 @@ type Options struct {
 	Now func() time.Time
 }
 
+// Eviction tuning. These bound the work done while holding a shard lock on the
+// hot path, so they are deliberately small and deliberately not configurable:
+// an operator tunes rates and table size, not how long a lock is held.
+const (
+	// idleWindows is how many windows a bucket may go unseen before it is
+	// forgotten. Beyond one window a bucket has recovered its full allowance,
+	// so remembering it changes nothing.
+	idleWindows = 2
+	// sweepBatch caps how many idle buckets one eviction pass frees.
+	sweepBatch = 64
+	// evictSample is how many buckets are examined to find something to evict
+	// when none are idle. Sampling keeps eviction O(1) rather than scanning a
+	// full shard while holding its lock.
+	evictSample = 8
+)
+
 type bucket struct {
 	credit float64
 	last   time.Time
@@ -307,13 +323,13 @@ func (l *Limiter) newBucketLocked(s *shard, key Key, now time.Time, rate float64
 // to create the bucket instead would be worse: an attacker who fills the table
 // would then have found a way to switch limiting off.
 func (l *Limiter) evictLocked(s *shard, now time.Time) {
-	idle := now.Add(-2 * l.opts.Window)
+	idle := now.Add(-idleWindows * l.opts.Window)
 	freed := 0
 	for k, b := range s.buckets {
 		if b.last.Before(idle) {
 			delete(s.buckets, k)
 			freed++
-			if freed >= 64 {
+			if freed >= sweepBatch {
 				break
 			}
 		}
@@ -332,7 +348,7 @@ func (l *Limiter) evictLocked(s *shard, now time.Time) {
 			oldestKey, oldest = k, b.last
 		}
 		sampled++
-		if sampled >= 8 {
+		if sampled >= evictSample {
 			break
 		}
 	}
@@ -346,7 +362,7 @@ func (l *Limiter) evictLocked(s *shard, now time.Time) {
 // Sweep drops idle buckets. It is cheap enough to run on a timer and keeps the
 // table proportional to active clients rather than to everything ever seen.
 func (l *Limiter) Sweep(now time.Time) int {
-	idle := now.Add(-2 * l.opts.Window)
+	idle := now.Add(-idleWindows * l.opts.Window)
 	removed := 0
 	for _, s := range l.shards {
 		s.mu.Lock()

@@ -124,6 +124,9 @@ validator enforces rather than documents:
   listener - those are anycast, and the admin plane must not follow an anycast
   route to an arbitrary node.
 - Management off loopback requires both TLS and a source ACL.
+- Every rate-limit knob is configurable under `rate_limit` - the three per-class
+  rates, the window, the slip ratio, the prefix lengths a bucket covers, the
+  table bound, and an exemption list. A rate of 0 means that class is unlimited.
 - The pair link requires mutual TLS with a CA - the sibling is trusted to insert
   into this node's cache, so an unauthenticated peer could poison it.
 - `peer.fetch_timeout` may not exceed `resolver.query_timeout`, because asking

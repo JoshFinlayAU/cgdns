@@ -253,6 +253,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	udp, err := transport.NewUDP(transport.UDPOptions{
 		Addrs:          cfg.UDPAddrs(),
 		SocketsPerAddr: cfg.Listen.UDPSocketsPerAddr,
+		Workers:        cfg.Listen.UDPWorkersPerSocket,
 		UDPSize:        cfg.Resolver.UDPBufferSize,
 		ClientBudget:   cfg.Resolver.ClientBudget,
 		AllowQuery:     queryACL,

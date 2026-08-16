@@ -61,6 +61,11 @@ type Listen struct {
 	// address. The kernel load-balances across them, which lets us scale past
 	// the single-socket receive-queue ceiling. 0 means one per GOMAXPROCS CPU.
 	UDPSocketsPerAddr int `yaml:"udp_sockets_per_addr"`
+	// UDPWorkersPerSocket is how many handler goroutines drain each socket.
+	// It bounds in-flight queries per socket: too few and the receive queue
+	// backs up under load, too many and a slow upstream turns into a pile of
+	// goroutines all waiting on it. 0 uses the built-in default.
+	UDPWorkersPerSocket int `yaml:"udp_workers_per_socket"`
 
 	MaxTCPConns    int           `yaml:"max_tcp_conns"`
 	TCPIdleTimeout time.Duration `yaml:"tcp_idle_timeout"`
@@ -597,6 +602,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Listen.UDPSocketsPerAddr < 0 {
 		bad("listen.udp_sockets_per_addr must be >= 0 (0 means one per CPU)")
+	}
+	if c.Listen.UDPWorkersPerSocket < 0 {
+		bad("listen.udp_workers_per_socket must be >= 0 (0 uses the default)")
 	}
 	if c.Listen.MaxTCPConns <= 0 {
 		bad("listen.max_tcp_conns must be > 0")
