@@ -329,7 +329,11 @@ func (r *Recursive) failure(req *dns.Msg, q dns.Question, err error) *dns.Msg {
 // resolve answers one name/type, consulting cache first and walking the
 // delegation chain when it misses.
 func (r *Recursive) resolve(ctx context.Context, qname string, qtype uint16, st *queryState) (*result, error) {
-	if entry, ok := r.opts.Cache.Get(cache.NewKey(qname, qtype, dns.ClassINET)); ok {
+	// A refresh deliberately ignores the cached copy: it exists to replace it,
+	// and reading it here would answer from the very entry being renewed.
+	skipCache := isRefresh(ctx) && st.outbound == 0
+
+	if entry, ok := r.opts.Cache.Get(cache.NewKey(qname, qtype, dns.ClassINET)); ok && !skipCache {
 		now := time.Now()
 		res := &result{rcode: entry.Rcode}
 		if entry.Authenticated {

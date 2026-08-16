@@ -25,6 +25,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miekg/dns"
+
 	"github.com/JoshFinlayAU/cgdns/internal/cache"
 	"github.com/JoshFinlayAU/cgdns/internal/config"
 	"github.com/JoshFinlayAU/cgdns/internal/control"
@@ -35,6 +37,7 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/netacl"
 	"github.com/JoshFinlayAU/cgdns/internal/peer"
 	"github.com/JoshFinlayAU/cgdns/internal/policy"
+	"github.com/JoshFinlayAU/cgdns/internal/prefetch"
 	"github.com/JoshFinlayAU/cgdns/internal/ratelimit"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver/roothints"
@@ -178,12 +181,55 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			slog.Duration("fetch_timeout", cfg.Peer.FetchTimeout))
 	}
 
+	var prefetcher *prefetch.Cache
+	prefetchMetrics := &prefetch.Metrics{}
+	if cfg.Cache.Prefetch.Enabled {
+		prefetcher = prefetch.New(resolverCache, prefetch.Options{
+			Threshold:     cfg.Cache.Prefetch.Threshold,
+			MinTTL:        cfg.Cache.Prefetch.MinTTL,
+			MaxConcurrent: cfg.Cache.Prefetch.MaxConcurrent,
+			Timeout:       cfg.Cache.Prefetch.Timeout,
+			Log:           log,
+			Metrics:       prefetchMetrics,
+		})
+		defer func() { _ = prefetcher.Close() }()
+		resolverCache = prefetcher
+	}
+
 	resMetrics := &resolver.Metrics{}
 	recMetrics := &resolver.RecursiveMetrics{}
 
 	handler, err := buildHandler(cfg, resolverCache, infraCache, resMetrics, recMetrics, log)
 	if err != nil {
 		return fmt.Errorf("building resolver: %w", err)
+	}
+
+	if prefetcher != nil {
+		// The refresh runs against the resolver alone, before policy and rate
+		// limiting: it belongs to no subscriber, so there is no class to filter
+		// it into and no client to limit.
+		resolveOnly := handler
+		probeClient := netip.MustParseAddrPort("127.0.0.1:0")
+		prefetcher.SetRefresh(func(ctx context.Context, k cache.Key) {
+			m := new(dns.Msg)
+			m.SetQuestion(k.Name, k.Type)
+			m.Question[0].Qclass = k.Class
+			m.RecursionDesired = true
+			// The answer is discarded: the cache fills as a side effect, which
+			// is the whole point.
+			_ = resolveOnly.ServeDNS(resolver.WithRefresh(ctx), &transport.Request{
+				Msg:             m,
+				Client:          probeClient,
+				Local:           probeClient.Addr(),
+				Proto:           transport.ProtoUDP,
+				Received:        time.Now(),
+				MaxResponseSize: dns.MaxMsgSize,
+			})
+		})
+		log.Info("prefetch enabled",
+			slog.Float64("threshold", cfg.Cache.Prefetch.Threshold),
+			slog.Duration("min_ttl", cfg.Cache.Prefetch.MinTTL),
+			slog.Int("max_concurrent", cfg.Cache.Prefetch.MaxConcurrent))
 	}
 
 	// Serve-stale sits directly around the resolver, inside policy: a name the
@@ -414,6 +460,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	}
 	if cfg.Cache.ServeStale.Enabled {
 		registerServeStaleMetrics(reg, staleMetrics)
+	}
+	if prefetcher != nil {
+		registerPrefetchMetrics(reg, prefetchMetrics)
 	}
 
 	var mgmt *management.Server
@@ -1092,5 +1141,20 @@ func registerServeStaleMetrics(reg *metrics.Registry, m *servestale.Metrics) {
 		metrics.Source{Name: "cgdns_serve_stale_served_total", Help: "Responses answered from expired cache data.", Kind: metrics.Counter, Read: u64(m.Served.Load)},
 		metrics.Source{Name: "cgdns_serve_stale_eligible_total", Help: "Resolution failures where stale data was consulted.", Kind: metrics.Counter, Read: u64(m.Eligible.Load)},
 		metrics.Source{Name: "cgdns_serve_stale_unavailable_total", Help: "Resolution failures with nothing stale to fall back to.", Kind: metrics.Counter, Read: u64(m.Unavailable.Load)},
+	)
+}
+
+func registerPrefetchMetrics(reg *metrics.Registry, m *prefetch.Metrics) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	reg.Register(
+		metrics.Source{Name: "cgdns_prefetch_triggered_total", Help: "Entries refreshed because a read found them close to expiry.", Kind: metrics.Counter, Read: u64(m.Triggered.Load)},
+		metrics.Source{Name: "cgdns_prefetch_completed_total", Help: "Refreshes that ran to completion.", Kind: metrics.Counter, Read: u64(m.Completed.Load)},
+		metrics.Source{Name: "cgdns_prefetch_suppressed_total", Help: "Refreshes skipped because one was already in flight for that name.", Kind: metrics.Counter, Read: u64(m.Suppressed.Load)},
+		// Sustained drops mean max_concurrent is too small for the working set,
+		// so popular names are expiring before their refresh gets a slot.
+		metrics.Source{Name: "cgdns_prefetch_dropped_total", Help: "Refreshes skipped because the concurrency cap was full.", Kind: metrics.Counter, Read: u64(m.Dropped.Load)},
+		metrics.Source{Name: "cgdns_prefetch_in_flight", Help: "Refreshes running now.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.InFlight.Load()) }},
 	)
 }

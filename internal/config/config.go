@@ -185,6 +185,29 @@ type Cache struct {
 	// ServeStale answers from expired data when the authoritative cannot be
 	// reached (RFC 8767).
 	ServeStale ServeStale `yaml:"serve_stale"`
+
+	// Prefetch refreshes popular entries shortly before they expire.
+	Prefetch Prefetch `yaml:"prefetch"`
+}
+
+// Prefetch configures refreshing entries that are close to expiry.
+type Prefetch struct {
+	Enabled bool `yaml:"enabled"`
+
+	// Threshold is the fraction of an entry's original TTL that must remain
+	// before a read triggers a refresh. 0.1 refreshes in the last tenth.
+	Threshold float64 `yaml:"threshold"`
+
+	// MinTTL skips records too short-lived to be worth chasing: refreshing
+	// them would cost more upstream traffic than it saves.
+	MinTTL time.Duration `yaml:"min_ttl"`
+
+	// MaxConcurrent caps refreshes in flight, so an optimisation can never
+	// crowd out the client queries it exists to speed up.
+	MaxConcurrent int `yaml:"max_concurrent"`
+
+	// Timeout bounds one refresh.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // ServeStale configures RFC 8767 stale answers.
@@ -496,6 +519,13 @@ func Default() Config {
 				Enabled:   true,
 				MaxStale:  time.Hour,
 				AnswerTTL: 30 * time.Second,
+			},
+			Prefetch: Prefetch{
+				Enabled:       true,
+				Threshold:     0.1,
+				MinTTL:        30 * time.Second,
+				MaxConcurrent: 64,
+				Timeout:       5 * time.Second,
 			},
 		},
 		Subscriber: Subscriber{
@@ -912,6 +942,21 @@ func (c *Config) Validate() error {
 		if anyPrefix, covered := anycastCovers(c.Health.AnycastPrefixes, addr); covered {
 			bad("%s: %q is inside the anycast prefix %s; sourcing outbound queries from a shared address invites replies back to whichever node the return path picks, so use an address unique to this node",
 				f.name, f.val, anyPrefix)
+		}
+	}
+
+	if c.Cache.Prefetch.Enabled {
+		if c.Cache.Prefetch.Threshold <= 0 || c.Cache.Prefetch.Threshold >= 1 {
+			bad("cache.prefetch.threshold must be between 0 and 1 exclusive (it is a fraction of the original TTL), got %v", c.Cache.Prefetch.Threshold)
+		}
+		if c.Cache.Prefetch.MinTTL <= 0 {
+			bad("cache.prefetch.min_ttl must be > 0")
+		}
+		if c.Cache.Prefetch.MaxConcurrent <= 0 {
+			bad("cache.prefetch.max_concurrent must be > 0: unbounded prefetching would let an optimisation crowd out client queries")
+		}
+		if c.Cache.Prefetch.Timeout <= 0 {
+			bad("cache.prefetch.timeout must be > 0")
 		}
 	}
 

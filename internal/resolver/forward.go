@@ -146,7 +146,8 @@ func (f *Forwarder) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 	key := cache.NewKey(q.Name, q.Qtype, q.Qclass)
 	now := time.Now()
 
-	if entry, ok := f.opts.Cache.Get(key); ok {
+	// A refresh deliberately ignores the cached copy: it exists to replace it.
+	if entry, ok := f.opts.Cache.Get(key); ok && !isRefresh(ctx) {
 		f.opts.Metrics.CacheHits.Add(1)
 		return f.fromCache(req.Msg, entry, now)
 	}

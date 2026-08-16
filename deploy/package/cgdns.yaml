@@ -64,6 +64,20 @@ cache:
   # served normally, and stale data is consulted only after resolution fails.
   # Health checks deliberately do not accept a stale answer, so a node that has
   # lost the internet still withdraws from the anycast set.
+  # Refresh popular entries shortly before they expire, so no client pays for
+  # the upstream round trip. Only names actually being asked for are refreshed,
+  # so an idle entry expires normally rather than the cache becoming a crawler.
+  # Denials are never refreshed.
+  prefetch:
+    enabled: true
+    # Fraction of the original TTL that must remain to trigger a refresh.
+    threshold: 0.1
+    # Records shorter than this are meant to be re-fetched often; chasing them
+    # would cost more upstream traffic than it saves.
+    min_ttl: 30s
+    max_concurrent: 64
+    timeout: 5s
+
   serve_stale:
     enabled: true
     # Longer keeps subscribers online through a longer outage, at the cost of

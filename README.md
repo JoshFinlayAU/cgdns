@@ -71,6 +71,8 @@ Every Nth over-limit response is sent truncated instead of dropped, so a legitim
 
 Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collapsed to a single bucket, 1,547 answered (the configured rate), and the node stayed healthy and in the anycast set throughout. A resolver that limits itself out of the anycast set has turned an attack into an outage.
 
+**Prefetch** - a busy resolver spends much of its latency budget on the unlucky client whose query arrives the moment a popular entry expires; everyone behind them waits on one upstream round trip. Entries close to expiry are refreshed in the background as they are read, so a name asked for constantly is answered from cache constantly. Only names actually being asked for are refreshed, so an idle entry expires normally rather than the cache turning into a crawler. Refreshes are deduplicated per name and capped, so the thing preventing a stampede cannot cause one, and denials are never refreshed - a name that does not exist is not made more available by asking again, and a random-subdomain flood would otherwise become outbound traffic of our own.
+
 **Serve-stale** - when an authoritative has gone away, answering slightly old data beats answering nothing (RFC 8767). Expired entries are kept for `max_stale` and used *only* after resolution has already failed, so a working authoritative is always preferred and a live entry is served by the normal path. Answers carry EDE 3 so a client can tell, and never set `AD`: the signatures are as old as the data and may have expired, so claiming the chain validated would be a claim we cannot stand behind. NXDOMAIN and NODATA are never overridden - those are answers, and replacing them would resurrect names their owner deliberately removed.
 
 The interaction that matters: **health checks do not accept a stale answer.** Serve-stale exists to keep answering when a node cannot resolve, so a probe that accepted it would let a node cut off from the internet pass its checks forever on cached root data, holding an anycast prefix it can no longer serve while a working POP sits idle. Verified on the lab by cutting both address families: subscribers kept getting answers for cached names, and the node withdrew from the anycast set with `. NS was answered from expired cache, so this node is not resolving`.
@@ -85,7 +87,7 @@ The interaction that matters: **health checks do not accept a stale answer.** Se
 | Packaging | `.deb` / `.rpm` via nfpm. |
 | `resolver.outbound_source` | Egress source address is currently whatever the route picks. |
 | DoQ | RFC 9250. |
-| Aggressive NSEC, prefetch | RFC 8198. |
+| Aggressive NSEC | RFC 8198. |
 
 ## Design constraints
 
@@ -221,6 +223,7 @@ series worth alerting on:
 | `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
 | `cgdns_ratelimit_evictions_total` | sustained means `max_buckets` is too small for the client population |
 | `cgdns_serve_stale_served_total` | rising means authoritatives are failing and expired data is keeping subscribers online |
+| `cgdns_prefetch_dropped_total` | sustained means `max_concurrent` is too small, so popular names expire before their refresh gets a slot |
 | `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
 | `cgdns_peer_cache_fetch_hits_total` | work the sibling saved this node |
 
