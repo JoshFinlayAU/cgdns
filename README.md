@@ -137,6 +137,25 @@ make bench                                              # hot-path benchmarks
 ./bin/cgdns -config /etc/cgdns/cgdns.yaml
 ```
 
+`make package` produces a `.deb` and an `.rpm` in `dist/` (nfpm, pure Go - no
+dpkg-dev or rpmbuild needed). Binaries land in `/usr/sbin` and `/usr/bin`, the
+unit in `/usr/lib/systemd/system`.
+
+A first install does not enable or start anything. The shipped
+`/etc/cgdns/cgdns.yaml` has no listen addresses and no query ACL, so the daemon
+refuses to start until you have configured it - anycast would route production
+traffic at a node the moment it came up, and a node nobody has configured is not
+one you want taking queries. Upgrades restart a node that was already running
+and never overwrite its config.
+
+If you are migrating a node that was deployed by hand, check for a unit in
+`/etc/systemd/system/cgdns.service` - it shadows the packaged one, so the node
+keeps running whatever that file points at and the install looks like it took
+when it did not. The postinstall warns about this. Remove it, then
+`systemctl reenable cgdns`: the old enable symlink points at the file you just
+deleted, and a dangling one still reports `enabled` while quietly not coming
+back after a reboot.
+
 `deploy/systemd/cgdns.service` is a hardened unit. It grants
 `CAP_NET_BIND_SERVICE` as an ambient capability rather than via `setcap`:
 `NoNewPrivileges` strips file capabilities, and ambient capabilities survive
