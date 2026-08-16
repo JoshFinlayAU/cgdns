@@ -10,6 +10,10 @@ The recursion engine is its own - it walks the delegation chain from the root ra
 
 I don't want this to be a repo/product that gets lots of feature ideas from the home labbers, its recursive DNS at carrier scale.. lets just make it fast as f*ck, simple to spin up, easy to pull telemetry out of and bug free?
 
+## LOUIS
+
+Louis read this before you comment. [[docs/LOUIS.md]]
+
 ## Deployment model
 
 Two resolvers per POP, each announce their anycast IP.
