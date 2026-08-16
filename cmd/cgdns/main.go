@@ -35,6 +35,7 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/netacl"
 	"github.com/JoshFinlayAU/cgdns/internal/peer"
 	"github.com/JoshFinlayAU/cgdns/internal/policy"
+	"github.com/JoshFinlayAU/cgdns/internal/ratelimit"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver/roothints"
 	"github.com/JoshFinlayAU/cgdns/internal/subscriber"
@@ -205,6 +206,46 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		})
 	}
 
+	// Rate limiting wraps everything else, so it sees the response actually
+	// bound for the client — including one policy rewrote. A device hammering a
+	// blocked name is still a device hammering us.
+	var limiter *ratelimit.Limiter
+	rlMetrics := &ratelimit.Metrics{}
+	if cfg.RateLimit.Enabled {
+		limiter, err = ratelimit.New(ratelimit.Options{
+			ResponsesPerSecond: cfg.RateLimit.ResponsesPerSecond,
+			DenialsPerSecond:   cfg.RateLimit.DenialsPerSecond,
+			ErrorsPerSecond:    cfg.RateLimit.ErrorsPerSecond,
+			Window:             cfg.RateLimit.Window,
+			SlipRatio:          cfg.RateLimit.SlipRatio,
+			IPv4PrefixLen:      cfg.RateLimit.IPv4PrefixLen,
+			IPv6PrefixLen:      cfg.RateLimit.IPv6PrefixLen,
+			MaxBuckets:         cfg.RateLimit.MaxBuckets,
+			Shards:             cfg.RateLimit.Shards,
+			Metrics:            rlMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("building the rate limiter: %w", err)
+		}
+
+		var exempt *netacl.ACL
+		if len(cfg.RateLimit.ExemptClients) > 0 {
+			exempt = netacl.New(cfg.RateLimitExempt(), false)
+		}
+		handler = ratelimit.NewHandler(ratelimit.HandlerOptions{
+			Limiter: limiter,
+			Next:    handler,
+			Exempt:  exempt,
+			Log:     log,
+			Metrics: rlMetrics,
+		})
+		log.Info("response rate limiting enabled",
+			slog.Float64("denials_per_second", cfg.RateLimit.DenialsPerSecond),
+			slog.Float64("errors_per_second", cfg.RateLimit.ErrorsPerSecond),
+			slog.Float64("responses_per_second", cfg.RateLimit.ResponsesPerSecond),
+			slog.Int("slip_ratio", int(cfg.RateLimit.SlipRatio)))
+	}
+
 	queryACL := netacl.New(cfg.AllowQueryPrefixes(), false)
 
 	txMetrics := &transport.Metrics{}
@@ -348,6 +389,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if cfg.Resolver.Mode == config.ModeRecursive {
 		registerRecursiveMetrics(reg, recMetrics, infraCache)
 	}
+	if limiter != nil {
+		registerRateLimitMetrics(reg, rlMetrics)
+	}
 
 	var mgmt *management.Server
 	if cfg.Management.Enabled {
@@ -434,6 +478,25 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if cfg.Control.StoreFile != "" {
 		wg.Add(1)
 		go func() { defer wg.Done(); errCh <- store.RunFlusher(ctx, time.Second) }()
+	}
+	if limiter != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Buckets are also evicted under pressure, but a flood leaves a
+			// table full of sources that will never be seen again; sweeping
+			// keeps it proportional to active clients.
+			t := time.NewTicker(cfg.RateLimit.Window)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					limiter.Sweep(now)
+				}
+			}
+		}()
 	}
 
 	wg.Add(1)
@@ -962,4 +1025,23 @@ func newLogger(cfg config.Log) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+}
+
+func registerRateLimitMetrics(reg *metrics.Registry, m *ratelimit.Metrics) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	reg.Register(
+		metrics.Source{Name: "cgdns_ratelimit_evaluated_total", Help: "Responses considered for rate limiting.", Kind: metrics.Counter, Read: u64(m.Evaluated.Load)},
+		metrics.Source{Name: "cgdns_ratelimit_allowed_total", Help: "Responses that were within their bucket's allowance.", Kind: metrics.Counter, Read: u64(m.Allowed.Load)},
+		// Rising means something is being limited: either an attack, or a rate
+		// set below what a legitimate client needs.
+		metrics.Source{Name: "cgdns_ratelimit_dropped_total", Help: "Responses dropped by rate limiting.", Kind: metrics.Counter, Read: u64(m.Dropped.Load)},
+		metrics.Source{Name: "cgdns_ratelimit_slipped_total", Help: "Over-limit responses sent truncated so a real client retries over TCP.", Kind: metrics.Counter, Read: u64(m.Slipped.Load)},
+		metrics.Source{Name: "cgdns_ratelimit_exempted_total", Help: "Responses skipped because the client is exempt.", Kind: metrics.Counter, Read: u64(m.Exempted.Load)},
+		metrics.Source{Name: "cgdns_ratelimit_buckets", Help: "Rate-limit buckets currently held.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.Buckets.Load()) }},
+		// Sustained evictions mean max_buckets is too small for the client
+		// population, so buckets are being forgotten while still in use.
+		metrics.Source{Name: "cgdns_ratelimit_evictions_total", Help: "Buckets evicted to stay within max_buckets.", Kind: metrics.Counter, Read: u64(m.Evictions.Load)},
+	)
 }

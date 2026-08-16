@@ -63,6 +63,14 @@ listeners stop, so a planned restart moves traffic away first.
 
 **Management API** - REST, bound only to the management addresses, behind a default-deny source ACL enforced at accept, TLS mandatory unless every listener is loopback. Tokens carry read/write/admin scopes and are stored as a hash, so replicating them to the sibling - which is what lets you manage the pair from either node - never moves a secret. A node holding no token at all mints one to a root-only file; a node that already has one, including one adopted from its sibling, never does. Records are canonicalised on write, so what the API returns is what the resolver is actually enforcing.
 
+**Response rate limiting** - UDP only, because TCP, DoT and DoH complete a handshake and there is nothing there to spoof or reflect. It limits *responses* rather than queries, since the victim of a spoofed query never sent it and the only thing that helps them is us not sending the answer.
+
+What makes it work against water-torture is the grouping. A flood of `random1.victim.com`, `random2.victim.com` and so on has a different QNAME every time, so a bucket keyed on the QNAME gives every query its own bucket and limits precisely nothing. Denials are grouped by the *zone* that denied them - the SOA owner - so the whole flood collapses into one bucket. Answers are unlimited by default and denials are not: a real client asks for names that exist.
+
+Every Nth over-limit response is sent truncated instead of dropped, so a legitimate client discovers TCP and carries on, while a spoofed victim gets a small packet rather than a large one. A source seen for the first time starts with one second of allowance rather than a full window - the window is there so a client that has behaved can burst, and a source we have never seen has earned nothing.
+
+Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collapsed to a single bucket, 1,547 answered (the configured rate), and the node stayed healthy and in the anycast set throughout. A resolver that limits itself out of the anycast set has turned an attack into an outage.
+
 **`cgdnsctl`** - operator CLI, and a plain client of that API with no privileged state of its own, so anything it does your provisioning system can do over HTTP. Because the pair replicates its control plane, pointing it at either node is equivalent - that is the "manage from any node" behaviour, achieved by replication rather than by a cluster-wide API.
 
 ## Not yet implemented
@@ -73,7 +81,7 @@ listeners stop, so a planned restart moves traffic away first.
 | Packaging | `.deb` / `.rpm` via nfpm. |
 | `resolver.outbound_source` | Egress source address is currently whatever the route picks. |
 | DoQ | RFC 9250. |
-| Serve-stale, aggressive NSEC, prefetch, RRL | RFC 8767 / RFC 8198. RRL matters most - random-subdomain floods are what carriers actually get hit with. |
+| Serve-stale, aggressive NSEC, prefetch | RFC 8767 / RFC 8198. |
 
 ## Design constraints
 
@@ -195,6 +203,8 @@ series worth alerting on:
 | `cgdns_dnssec_bogus_total` | broken zone, or an attack |
 | `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
+| `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
+| `cgdns_ratelimit_evictions_total` | sustained means `max_buckets` is too small for the client population |
 | `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
 | `cgdns_peer_cache_fetch_hits_total` | work the sibling saved this node |
 

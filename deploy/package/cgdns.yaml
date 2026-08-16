@@ -46,6 +46,29 @@ resolver:
 cache:
   max_entries: 1000000
 
+# Response rate limiting, on UDP only. TCP, DoT and DoH complete a handshake,
+# so there is nothing to spoof and nothing to reflect.
+rate_limit:
+  enabled: true
+  # Answers are left unlimited: a subscriber legitimately asks for names that
+  # exist, and limiting that class is how you break your own customers.
+  responses_per_second: 0
+  # Denials are grouped by the zone that denied them, so a random-subdomain
+  # flood collapses into one bucket instead of one per made-up name. This is
+  # the limit that stops water-torture.
+  denials_per_second: 50
+  errors_per_second: 20
+  # How much unused allowance a client may bank. A source seen for the first
+  # time starts with one second's worth, not a full window.
+  window: 15s
+  # Every 2nd over-limit response is sent truncated so a real client retries
+  # over TCP. 0 always drops.
+  slip_ratio: 2
+  ipv4_prefix_len: 24
+  ipv6_prefix_len: 56
+  max_buckets: 100000
+  # exempt_clients: ["<monitoring-prefix>"]
+
 control:
   store_file: /var/lib/cgdns/control.json
 

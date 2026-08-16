@@ -29,6 +29,7 @@ type Config struct {
 	Subscriber Subscriber `yaml:"subscriber"`
 	Policy     Policy     `yaml:"policy"`
 	Control    Control    `yaml:"control"`
+	RateLimit  RateLimit  `yaml:"rate_limit"`
 	Peer       Peer       `yaml:"peer"`
 	Health     Health     `yaml:"health"`
 	Management Management `yaml:"management"`
@@ -220,6 +221,46 @@ type PolicyClass struct {
 	Action string `yaml:"action"`
 	// RedirectTo is the walled-garden address set for the redirect action.
 	RedirectTo []string `yaml:"redirect_to"`
+}
+
+// RateLimit configures response rate limiting on UDP.
+type RateLimit struct {
+	Enabled bool `yaml:"enabled"`
+
+	// ResponsesPerSecond limits positive answers per client prefix. Zero
+	// leaves that class unlimited.
+	ResponsesPerSecond float64 `yaml:"responses_per_second"`
+	// DenialsPerSecond limits NXDOMAIN and NODATA, grouped by the zone that
+	// denied them. This is the one that stops a random-subdomain flood, and it
+	// belongs well below the answer rate: a real client asks for names that
+	// exist.
+	DenialsPerSecond float64 `yaml:"denials_per_second"`
+	// ErrorsPerSecond limits SERVFAIL and friends.
+	ErrorsPerSecond float64 `yaml:"errors_per_second"`
+
+	// Window is how much unused allowance a client may bank, so a quiet client
+	// can burst without raising its sustained rate.
+	Window time.Duration `yaml:"window"`
+
+	// SlipRatio sends every Nth over-limit response truncated rather than
+	// dropping it, so a real client retries over TCP where it is not limited.
+	// 0 always drops, 1 always slips.
+	SlipRatio uint32 `yaml:"slip_ratio"`
+
+	// IPv4PrefixLen and IPv6PrefixLen decide how much of a client address a
+	// bucket covers. Limiting single addresses would be useless: an attacker
+	// spoofs across a range, and real subscribers share one behind CGNAT.
+	IPv4PrefixLen int `yaml:"ipv4_prefix_len"`
+	IPv6PrefixLen int `yaml:"ipv6_prefix_len"`
+
+	// MaxBuckets bounds the table, so an attacker spoofing across many
+	// prefixes cannot make the limiter itself the attack.
+	MaxBuckets int `yaml:"max_buckets"`
+	Shards     int `yaml:"shards"`
+
+	// ExemptClients are never limited. Default deny applies here in reverse:
+	// an empty list exempts nobody.
+	ExemptClients []string `yaml:"exempt_clients"`
 }
 
 // Control configures the local control-plane store.
@@ -421,6 +462,21 @@ func Default() Config {
 		},
 		Control: Control{
 			StoreFile: "/var/lib/cgdns/control.json",
+		},
+		RateLimit: RateLimit{
+			Enabled: true,
+			// Answers are left unlimited by default. A subscriber legitimately
+			// asks for names that exist, and limiting that class is how an
+			// operator breaks their own customers.
+			ResponsesPerSecond: 0,
+			DenialsPerSecond:   50,
+			ErrorsPerSecond:    20,
+			Window:             15 * time.Second,
+			SlipRatio:          2,
+			IPv4PrefixLen:      24,
+			IPv6PrefixLen:      56,
+			MaxBuckets:         100000,
+			Shards:             16,
 		},
 		Peer: Peer{
 			FetchTimeout: 150 * time.Millisecond,
@@ -783,6 +839,40 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.RateLimit.Enabled {
+		for _, f := range []struct {
+			name string
+			val  float64
+		}{
+			{"rate_limit.responses_per_second", c.RateLimit.ResponsesPerSecond},
+			{"rate_limit.denials_per_second", c.RateLimit.DenialsPerSecond},
+			{"rate_limit.errors_per_second", c.RateLimit.ErrorsPerSecond},
+		} {
+			if f.val < 0 {
+				bad("%s must not be negative (0 means unlimited)", f.name)
+			}
+		}
+		if c.RateLimit.ResponsesPerSecond == 0 && c.RateLimit.DenialsPerSecond == 0 && c.RateLimit.ErrorsPerSecond == 0 {
+			bad("rate_limit.enabled is true but every rate is 0, which limits nothing; set at least one rate or set rate_limit.enabled to false")
+		}
+		if c.RateLimit.Window <= 0 {
+			bad("rate_limit.window must be > 0")
+		}
+		if c.RateLimit.IPv4PrefixLen < 1 || c.RateLimit.IPv4PrefixLen > 32 {
+			bad("rate_limit.ipv4_prefix_len must be between 1 and 32, got %d", c.RateLimit.IPv4PrefixLen)
+		}
+		if c.RateLimit.IPv6PrefixLen < 1 || c.RateLimit.IPv6PrefixLen > 128 {
+			bad("rate_limit.ipv6_prefix_len must be between 1 and 128, got %d", c.RateLimit.IPv6PrefixLen)
+		}
+		if c.RateLimit.MaxBuckets < 1 {
+			bad("rate_limit.max_buckets must be > 0: the table has to be bounded or an attacker spoofing across many prefixes makes the limiter itself the attack")
+		}
+		if c.RateLimit.Shards < 1 {
+			bad("rate_limit.shards must be > 0")
+		}
+		checkPrefixes(bad, "rate_limit.exempt_clients", c.RateLimit.ExemptClients)
+	}
+
 	if c.Peer.Enabled {
 		for _, f := range []struct {
 			name, val string
@@ -970,6 +1060,11 @@ func (c *Config) IsValidationDisabled() bool {
 
 // ManagementAddrs returns the parsed management listen addresses.
 func (c *Config) ManagementAddrs() []netip.AddrPort { return mustParseAll(c.Management.Listen) }
+
+// RateLimitExempt returns the parsed rate-limit exemption prefixes.
+func (c *Config) RateLimitExempt() []netip.Prefix {
+	return mustParsePrefixes(c.RateLimit.ExemptClients)
+}
 
 // ManagementAllowFrom returns the parsed management source ACL.
 func (c *Config) ManagementAllowFrom() []netip.Prefix {
