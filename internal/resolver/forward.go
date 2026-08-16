@@ -47,6 +47,8 @@ type Metrics struct {
 type ForwardOptions struct {
 	// Upstreams must be non-empty.
 	Upstreams []netip.AddrPort
+	// OutboundSource pins the local address queries leave from, per family.
+	OutboundSource OutboundSource
 	// Cache is required.
 	Cache Cache
 	// QueryTimeout bounds a single outbound exchange.
@@ -63,14 +65,17 @@ type ForwardOptions struct {
 type Forwarder struct {
 	opts      ForwardOptions
 	upstreams []*upstream
-	udp       *dns.Client
-	tcp       *dns.Client
+	udp       clientSet
+	tcp       clientSet
 	rr        atomic.Uint64
 }
 
 // upstream tracks one forwarder target and how well it is behaving.
 type upstream struct {
 	addr string
+	// family is the upstream's address, used to pick the client whose outbound
+	// source matches it.
+	family netip.Addr
 
 	mu sync.Mutex
 	// srtt is an exponentially weighted moving average of round-trip time.
@@ -107,15 +112,20 @@ func NewForwarder(opts ForwardOptions) (*Forwarder, error) {
 		opts.UDPSize = 1232
 	}
 
+	if err := opts.OutboundSource.Verify(); err != nil {
+		return nil, err
+	}
+
 	f := &Forwarder{
 		opts: opts,
-		udp:  &dns.Client{Net: "udp", Timeout: opts.QueryTimeout, UDPSize: opts.UDPSize},
-		tcp:  &dns.Client{Net: "tcp", Timeout: opts.QueryTimeout},
+		udp:  newClientSet("udp", opts.QueryTimeout, opts.UDPSize, opts.OutboundSource),
+		tcp:  newClientSet("tcp", opts.QueryTimeout, 0, opts.OutboundSource),
 	}
 	for _, u := range opts.Upstreams {
 		f.upstreams = append(f.upstreams, &upstream{
-			addr: u.String(),
-			srtt: 50 * time.Millisecond,
+			addr:   u.String(),
+			family: u.Addr(),
+			srtt:   50 * time.Millisecond,
 		})
 	}
 	return f, nil
@@ -247,10 +257,10 @@ func (f *Forwarder) exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error
 		}
 
 		start := time.Now()
-		resp, _, err := f.udp.ExchangeContext(ctx, q, u.addr)
+		resp, _, err := f.udp.forAddr(u.family).ExchangeContext(ctx, q, u.addr)
 		if err == nil && resp != nil && resp.Truncated {
 			f.opts.Metrics.TCPFallback.Add(1)
-			resp, _, err = f.tcp.ExchangeContext(ctx, q, u.addr)
+			resp, _, err = f.tcp.forAddr(u.family).ExchangeContext(ctx, q, u.addr)
 		}
 
 		f.opts.Metrics.Upstream.Add(1)

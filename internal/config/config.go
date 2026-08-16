@@ -124,6 +124,17 @@ type Resolver struct {
 	// down for months may need a fresher one.
 	RootHintsFile string `yaml:"root_hints_file"`
 
+	// OutboundSourceV4 and OutboundSourceV6 pin the local address outbound
+	// queries leave from.
+	//
+	// Under anycast this matters: the service address is shared with the
+	// sibling node, so a query sourced from it invites the reply back to
+	// whichever node the return path picks. Pin these to an address unique to
+	// this node — its loopback — so replies come home, and so upstream filters
+	// have one address to permit. Empty keeps the kernel's choice.
+	OutboundSourceV4 string `yaml:"outbound_source_v4"`
+	OutboundSourceV6 string `yaml:"outbound_source_v6"`
+
 	// UseIPv4 and UseIPv6 select the outbound families for recursion. Both
 	// default true and disabling IPv6 should be a temporary workaround, not a
 	// deployment choice: v6-only authoritatives exist and a v4-only resolver
@@ -875,6 +886,35 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	for _, f := range []struct {
+		name, val string
+		want4     bool
+	}{
+		{"resolver.outbound_source_v4", c.Resolver.OutboundSourceV4, true},
+		{"resolver.outbound_source_v6", c.Resolver.OutboundSourceV6, false},
+	} {
+		if f.val == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(f.val)
+		switch {
+		case err != nil:
+			bad("%s: %q is not a valid IP address: %v", f.name, f.val, err)
+			continue
+		case addr.Is4() != f.want4 && !(f.want4 && addr.Is4In6()):
+			bad("%s: %q is not an IPv%d address", f.name, f.val, map[bool]int{true: 4, false: 6}[f.want4])
+			continue
+		case addr.IsUnspecified():
+			bad("%s: %q is the unspecified address, which is the same as leaving it empty", f.name, f.val)
+		case addr.IsMulticast():
+			bad("%s: %q is a multicast address and cannot source a query", f.name, f.val)
+		}
+		if anyPrefix, covered := anycastCovers(c.Health.AnycastPrefixes, addr); covered {
+			bad("%s: %q is inside the anycast prefix %s; sourcing outbound queries from a shared address invites replies back to whichever node the return path picks, so use an address unique to this node",
+				f.name, f.val, anyPrefix)
+		}
+	}
+
 	if c.Cache.ServeStale.Enabled {
 		if c.Cache.ServeStale.MaxStale <= 0 {
 			bad("cache.serve_stale.max_stale must be > 0 when serve-stale is enabled")
@@ -1112,6 +1152,18 @@ func (c *Config) IsValidationDisabled() bool {
 
 // ManagementAddrs returns the parsed management listen addresses.
 func (c *Config) ManagementAddrs() []netip.AddrPort { return mustParseAll(c.Management.Listen) }
+
+// OutboundSources returns the parsed egress source addresses. An unset family
+// yields the zero Addr, which means "let the kernel choose".
+func (c *Config) OutboundSources() (v4, v6 netip.Addr) {
+	if c.Resolver.OutboundSourceV4 != "" {
+		v4, _ = netip.ParseAddr(c.Resolver.OutboundSourceV4)
+	}
+	if c.Resolver.OutboundSourceV6 != "" {
+		v6, _ = netip.ParseAddr(c.Resolver.OutboundSourceV6)
+	}
+	return v4, v6
+}
 
 // RateLimitExempt returns the parsed rate-limit exemption prefixes.
 func (c *Config) RateLimitExempt() []netip.Prefix {

@@ -132,6 +132,10 @@ validator enforces rather than documents:
 - **The WebUI is served by the management listener and nowhere else.** Enabling
   it adds no listener of its own, so it inherits the bind address, the TLS
   requirement and the source ACL rather than needing its own.
+- `resolver.outbound_source_v4` / `_v6` pin egress per family, and may not be
+  an anycast address: a query sourced from an address the sibling also holds
+  invites the reply back to whichever node the return path picks. A source this
+  node cannot bind is refused at startup rather than failing every query later.
 - Every rate-limit knob is configurable under `rate_limit` - the three per-class
   rates, the window, the slip ratio, the prefix lengths a bucket covers, the
   table bound, and an exemption list. A rate of 0 means that class is unlimited.

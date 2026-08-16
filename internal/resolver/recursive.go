@@ -89,6 +89,9 @@ type RecursiveOptions struct {
 	// AD clear and no chain is built.
 	Validator *dnssec.Validator
 
+	// OutboundSource pins the local address queries leave from, per family.
+	OutboundSource OutboundSource
+
 	// UseIPv4 and UseIPv6 select the outbound families; both must not be
 	// false. Disabling IPv6 makes v6-only authoritatives unreachable.
 	UseIPv4 bool
@@ -101,8 +104,8 @@ type RecursiveOptions struct {
 // Recursive resolves by walking the delegation chain itself.
 type Recursive struct {
 	opts RecursiveOptions
-	udp  *dns.Client
-	tcp  *dns.Client
+	udp  clientSet
+	tcp  clientSet
 }
 
 // stateKey carries the per-query budget through the dnssec.Fetcher interface,
@@ -169,10 +172,14 @@ func NewRecursive(opts RecursiveOptions) (*Recursive, error) {
 		opts.ServerPort = 53
 	}
 
+	if err := opts.OutboundSource.Verify(); err != nil {
+		return nil, err
+	}
+
 	return &Recursive{
 		opts: opts,
-		udp:  &dns.Client{Net: "udp", Timeout: opts.QueryTimeout, UDPSize: opts.UDPSize},
-		tcp:  &dns.Client{Net: "tcp", Timeout: opts.QueryTimeout},
+		udp:  newClientSet("udp", opts.QueryTimeout, opts.UDPSize, opts.OutboundSource),
+		tcp:  newClientSet("tcp", opts.QueryTimeout, 0, opts.OutboundSource),
 	}, nil
 }
 
@@ -787,7 +794,7 @@ func (r *Recursive) exchange(ctx context.Context, server netip.Addr, qname strin
 	start := time.Now()
 	r.opts.Metrics.OutboundQueries.Add(1)
 
-	resp, _, err := r.udp.ExchangeContext(ctx, m, addr)
+	resp, _, err := r.udp.forAddr(server).ExchangeContext(ctx, m, addr)
 	if err != nil {
 		return nil, fmt.Errorf("querying %s: %w", server, err)
 	}
@@ -799,7 +806,7 @@ func (r *Recursive) exchange(ctx context.Context, server netip.Addr, qname strin
 		plain.SetQuestion(sent, qtype)
 		plain.Id = dns.Id()
 		plain.RecursionDesired = false
-		resp, _, err = r.udp.ExchangeContext(ctx, plain, addr)
+		resp, _, err = r.udp.forAddr(server).ExchangeContext(ctx, plain, addr)
 		if err != nil {
 			return nil, fmt.Errorf("querying %s without EDNS: %w", server, err)
 		}
@@ -808,7 +815,7 @@ func (r *Recursive) exchange(ctx context.Context, server netip.Addr, qname strin
 
 	if resp.Truncated {
 		r.opts.Metrics.TCPFallbacks.Add(1)
-		resp, _, err = r.tcp.ExchangeContext(ctx, m, addr)
+		resp, _, err = r.tcp.forAddr(server).ExchangeContext(ctx, m, addr)
 		if err != nil {
 			return nil, fmt.Errorf("querying %s over tcp: %w", server, err)
 		}

@@ -36,6 +36,13 @@ listen:
     - "::1/128"
 
 resolver:
+  # Pin the local address outbound queries leave from. Under anycast the
+  # service address is shared with the sibling, so a query sourced from it
+  # invites the reply back to whichever node the return path picks. Use an
+  # address unique to this node -- its loopback. Empty keeps the kernel's
+  # choice. The daemon refuses to start if it cannot bind what you name here.
+  # outbound_source_v4: "<this-node-loopback-v4>"
+  # outbound_source_v6: "<this-node-loopback-v6>"
   # PRODUCTION: "recursive" once the recursion engine lands. Forward mode does
   # not validate DNSSEC and therefore never sets AD.
   mode: forward

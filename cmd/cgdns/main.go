@@ -714,13 +714,15 @@ func buildHandler(
 ) (transport.Handler, error) {
 	switch cfg.Resolver.Mode {
 	case config.ModeForward:
+		srcV4, srcV6 := cfg.OutboundSources()
 		return resolver.NewForwarder(resolver.ForwardOptions{
-			Upstreams:    cfg.UpstreamAddrs(),
-			Cache:        rrCache,
-			QueryTimeout: cfg.Resolver.QueryTimeout,
-			UDPSize:      cfg.Resolver.UDPBufferSize,
-			Log:          log,
-			Metrics:      fwdMetrics,
+			OutboundSource: resolver.OutboundSource{V4: srcV4, V6: srcV6},
+			Upstreams:      cfg.UpstreamAddrs(),
+			Cache:          rrCache,
+			QueryTimeout:   cfg.Resolver.QueryTimeout,
+			UDPSize:        cfg.Resolver.UDPBufferSize,
+			Log:            log,
+			Metrics:        fwdMetrics,
 		})
 
 	case config.ModeRecursive:
@@ -755,7 +757,9 @@ func buildHandler(
 				slog.String("source", rootHintsSource(cfg.Resolver.TrustAnchorFile)))
 		}
 
+		srcV4, srcV6 := cfg.OutboundSources()
 		rec, err := resolver.NewRecursive(resolver.RecursiveOptions{
+			OutboundSource:    resolver.OutboundSource{V4: srcV4, V6: srcV6},
 			Cache:             rrCache,
 			Infra:             infra,
 			RootHints:         hints,
