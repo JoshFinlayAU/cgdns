@@ -46,6 +46,8 @@ type API struct {
 	now      func() time.Time
 	sessions *SessionStore
 	issuer   string
+	ui       bool
+	metrics  func() map[string]float64
 }
 
 // APIOptions configures the API.
@@ -57,6 +59,11 @@ type APIOptions struct {
 	Now func() time.Time
 	// SessionTTL bounds a WebUI login.
 	SessionTTL time.Duration
+	// UI serves the embedded operator console alongside the API.
+	UI bool
+	// Metrics snapshots the registry for the console, which is served from
+	// this listener and so cannot reach the metrics one.
+	Metrics func() map[string]float64
 	// Issuer names this node in an authenticator app.
 	Issuer string
 }
@@ -85,6 +92,8 @@ func NewAPI(opts APIOptions) (*API, error) {
 		now:      opts.Now,
 		sessions: NewSessionStore(opts.SessionTTL, opts.Now),
 		issuer:   opts.Issuer,
+		ui:       opts.UI,
+		metrics:  opts.Metrics,
 	}, nil
 }
 
@@ -104,6 +113,7 @@ func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /api/v1/status", a.guard(ScopeRead, a.handleStatus))
+	mux.Handle("GET /api/v1/metrics", a.guard(ScopeRead, a.handleMetrics))
 	mux.Handle("GET /api/v1/records", a.guard(ScopeRead, a.handleRecords))
 
 	for path, kind := range kindPaths {
@@ -131,10 +141,42 @@ func (a *API) Handler() http.Handler {
 	mux.Handle("POST /api/v1/tokens", a.guard(ScopeAdmin, a.handleCreateToken))
 	mux.Handle("DELETE /api/v1/tokens/{id}", a.guard(ScopeAdmin, a.handleRevokeToken))
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "no such endpoint")
+	// The console, when enabled, takes everything that is not an API path. It
+	// adds no listener of its own: it is this handler on this server or it is
+	// not served at all.
+	if a.ui {
+		if ui, err := uiHandler(); err == nil {
+			mux.Handle("/", ui)
+		} else {
+			a.log.Error("embedded console unavailable", slog.String("err", err.Error()))
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				writeError(w, http.StatusInternalServerError, "console unavailable")
+			})
+		}
+	} else {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusNotFound, "no such endpoint")
+		})
+	}
+
+	return securityHeaders(mux)
+}
+
+// securityHeaders applies the response headers to everything, API included: an
+// error body is still a response a browser might be talked into rendering.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setSecurityHeaders(w)
+		next.ServeHTTP(w, r)
 	})
-	return mux
+}
+
+func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if a.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]float64{})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.metrics())
 }
 
 // guard authenticates and authorises before running h.

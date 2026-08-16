@@ -487,6 +487,8 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			Log:        log,
 			SessionTTL: cfg.Management.SessionTimeout,
 			Issuer:     "cgdns " + cfg.Node.ID,
+			UI:         cfg.Management.UI,
+			Metrics:    reg.Snapshot,
 			Status: func() management.Status {
 				s := management.Status{
 					NodeID:  cfg.Node.ID,

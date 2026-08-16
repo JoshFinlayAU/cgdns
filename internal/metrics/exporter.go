@@ -92,3 +92,25 @@ func (r *Registry) Handler() http.Handler {
 		}
 	})
 }
+
+// Snapshot reads every source into a map.
+//
+// It exists for the WebUI, which is served from the management listener and so
+// cannot reach the metrics listener: those are deliberately separate sockets
+// with separate ACLs, and punching a hole between them for a dashboard would
+// undo that.
+func (r *Registry) Snapshot() map[string]float64 {
+	r.mu.RLock()
+	srcs := make([]Source, len(r.sources))
+	copy(srcs, r.sources)
+	r.mu.RUnlock()
+
+	out := make(map[string]float64, len(srcs))
+	for _, s := range srcs {
+		if s.Read == nil {
+			continue
+		}
+		out[s.Name] = s.Read()
+	}
+	return out
+}

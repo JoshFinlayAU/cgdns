@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cgdns</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+
+<div id="login" class="login">
+  <form id="login-form" class="card">
+    <h1>cgdns</h1>
+    <p class="sub" id="login-node">operator console</p>
+    <label>Username <input id="u" autocomplete="username" autofocus required></label>
+    <label>Password <input id="p" type="password" autocomplete="current-password" required></label>
+    <label id="code-row" hidden>Authenticator code
+      <input id="c" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code">
+    </label>
+    <button type="submit">Sign in</button>
+    <p class="err" id="login-err" role="alert"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <span class="brand">cgdns</span>
+    <span class="node" id="hdr-node"></span>
+    <nav>
+      <button data-view="overview" class="on">Overview</button>
+      <button data-view="subscribers">Subscribers</button>
+      <button data-view="overrides">Overrides</button>
+      <button data-view="classes">Classes</button>
+      <button data-view="feeds">Feeds</button>
+      <button data-view="tokens">Tokens</button>
+      <button data-view="users">Users</button>
+      <button data-view="account">Account</button>
+    </nav>
+    <span class="spacer"></span>
+    <span class="who" id="hdr-who"></span>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+
+  <main>
+    <section id="view-overview" class="view">
+      <div class="grid" id="status-grid"></div>
+      <h2>Resolution</h2>
+      <div class="grid" id="resolve-grid"></div>
+      <h2>Defences</h2>
+      <div class="grid" id="defence-grid"></div>
+    </section>
+
+    <section id="view-subscribers" class="view" hidden>
+      <div class="bar">
+        <h2>Subscribers</h2>
+        <button data-new="subscribers" class="primary">Add</button>
+      </div>
+      <p class="hint">A client prefix, the subscriber it belongs to, and the policy class applied to it.</p>
+      <table id="tbl-subscribers"></table>
+    </section>
+
+    <section id="view-overrides" class="view" hidden>
+      <div class="bar">
+        <h2>Per-subscriber overrides</h2>
+        <button data-new="overrides" class="primary">Add</button>
+      </div>
+      <p class="hint">Allow and block lists that take precedence over the shared class feeds, so one customer can be unblocked without editing a feed you may not own.</p>
+      <table id="tbl-overrides"></table>
+    </section>
+
+    <section id="view-classes" class="view" hidden>
+      <div class="bar">
+        <h2>Classes</h2>
+        <button data-new="classes" class="primary">Add</button>
+      </div>
+      <table id="tbl-classes"></table>
+    </section>
+
+    <section id="view-feeds" class="view" hidden>
+      <div class="bar">
+        <h2>Feeds</h2>
+        <button data-new="feeds" class="primary">Add</button>
+      </div>
+      <table id="tbl-feeds"></table>
+    </section>
+
+    <section id="view-tokens" class="view" hidden>
+      <div class="bar">
+        <h2>API tokens</h2>
+        <button id="new-token" class="primary">Mint</button>
+      </div>
+      <p class="hint">For provisioning systems. A token is shown once and cannot be recovered.</p>
+      <table id="tbl-tokens"></table>
+    </section>
+
+    <section id="view-users" class="view" hidden>
+      <div class="bar">
+        <h2>Operators</h2>
+        <button id="new-user" class="primary">Add</button>
+      </div>
+      <table id="tbl-users"></table>
+    </section>
+
+    <section id="view-account" class="view" hidden>
+      <h2>Two-factor authentication</h2>
+      <div id="totp-state"></div>
+
+      <h2>Change password</h2>
+      <form id="pw-form" class="card inline">
+        <label>Current <input id="pw-cur" type="password" autocomplete="current-password" required></label>
+        <label>New <input id="pw-new" type="password" autocomplete="new-password" minlength="12" required></label>
+        <button type="submit">Change</button>
+      </form>
+      <p class="hint">Changing it signs out every other session for this account.</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="editor">
+    <form method="dialog" id="editor-form">
+      <h3 id="editor-title"></h3>
+      <p class="hint" id="editor-hint"></p>
+      <textarea id="editor-body" spellcheck="false" rows="10"></textarea>
+      <p class="err" id="editor-err" role="alert"></p>
+      <menu>
+        <button value="cancel" class="ghost">Cancel</button>
+        <button id="editor-save" value="save" class="primary">Save</button>
+      </menu>
+    </form>
+  </dialog>
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

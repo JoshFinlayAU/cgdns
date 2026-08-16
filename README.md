@@ -89,6 +89,8 @@ The first account is created with the bootstrap token, so there is no default pa
 cgdnsctl user create josh admin      # prompts for the password, never an argument
 ```
 
+**The console** - status, the resolution and defence counters, and editors for subscribers, per-subscriber overrides, classes, feeds, tokens and operators. No framework and no build step: three embedded files, so there is nothing to fetch from a CDN and nothing the content-security policy needs an exception for. It renders every value with `textContent`, which is why the policy can refuse `unsafe-inline` outright. The page itself loads without a session because it holds no data; everything behind it does not.
+
 **The WebUI binds to localhost by default**, on HTTPS. Put a tunnel or reverse proxy in front and let it terminate the real TLS. If no certificate is configured the daemon generates a self-signed one into `node.state_dir` - nobody is meant to trust it, it exists so the browser will store a `Secure` session cookie. Enabling the UI adds no listener of its own.
 
 **`cgdnsctl`** - operator CLI, and a plain client of that API with no privileged state of its own, so anything it does your provisioning system can do over HTTP. Because the pair replicates its control plane, pointing it at either node is equivalent - that is the "manage from any node" behaviour, achieved by replication rather than by a cluster-wide API.
@@ -97,7 +99,6 @@ cgdnsctl user create josh admin      # prompts for the password, never an argume
 
 | | Status |
 |---|---|
-| WebUI | The API it sits on is done, and it will be served by the management listener or not at all. The UI itself is not, and it needs local users and TOTP - unlike API tokens, human passwords want a slow KDF. |
 | DoQ | RFC 9250. |
 | Aggressive NSEC3 | NSEC is done. NSEC3 means hashing each candidate with the zone's parameters and reasoning about the closest encloser; those zones fall through to a normal lookup for now. |
 
