@@ -392,3 +392,96 @@ func TestDefault_IsNotUsableWithoutOperatorInput(t *testing.T) {
 		t.Fatal("bare defaults must not validate; operator input is required")
 	}
 }
+
+// The operator interface and the WebUI must be reachable only on the management
+// interface. An anycast address is the opposite of that: the whole internet
+// routes to it, and which node answers is a matter of BGP.
+func TestValidate_RejectsAdminPlanesOnAnycastAddresses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(*Config)
+		want  string
+	}{
+		{
+			name: "management inside the anycast v4 prefix",
+			apply: func(c *Config) {
+				c.Management.Listen = []string{"10.255.0.53:8443"}
+				c.Management.AllowFrom = []string{"10.20.0.0/24"}
+				c.Management.TLS.CertFile = "/etc/cgdns/tls/mgmt.pem"
+				c.Management.TLS.KeyFile = "/etc/cgdns/tls/mgmt.key"
+			},
+			want: "management.listen",
+		},
+		{
+			name: "management inside the anycast v6 prefix",
+			apply: func(c *Config) {
+				c.Management.Listen = []string{"[fd51:13:53::53]:8443"}
+				c.Management.AllowFrom = []string{"fd00::/8"}
+				c.Management.TLS.CertFile = "/etc/cgdns/tls/mgmt.pem"
+				c.Management.TLS.KeyFile = "/etc/cgdns/tls/mgmt.key"
+			},
+			want: "management.listen",
+		},
+		{
+			name: "metrics inside the anycast prefix",
+			apply: func(c *Config) {
+				c.Metrics.Listen = "10.255.0.53:9153"
+				c.Metrics.AllowFrom = []string{"10.20.0.0/24"}
+			},
+			want: "metrics.listen",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			c.Health.Enabled = true
+			c.Health.AnycastPrefixes = []string{"10.255.0.53/32", "fd51:13:53::53/128"}
+			c.Health.GoBGPTarget = "127.0.0.1:50051"
+			tc.apply(&c)
+
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("an admin plane bound to an anycast address was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error does not name %s: %v", tc.want, err)
+			}
+			if !strings.Contains(err.Error(), "anycast") {
+				t.Fatalf("error does not explain the anycast problem: %v", err)
+			}
+		})
+	}
+}
+
+// The management interface address itself must still be accepted, or the rule
+// would leave nowhere valid to bind.
+func TestValidate_AcceptsAdminPlaneOnTheManagementAddress(t *testing.T) {
+	c := valid()
+	c.Health.Enabled = true
+	c.Health.AnycastPrefixes = []string{"10.255.0.53/32", "fd51:13:53::53/128"}
+	c.Health.GoBGPTarget = "127.0.0.1:50051"
+	c.Management.Listen = []string{"10.20.0.7:8443"}
+	c.Management.AllowFrom = []string{"10.20.0.0/24"}
+	c.Management.TLS.CertFile = "/etc/cgdns/tls/mgmt.pem"
+	c.Management.TLS.KeyFile = "/etc/cgdns/tls/mgmt.key"
+	c.Metrics.Listen = "10.20.0.7:9153"
+	c.Metrics.AllowFrom = []string{"10.20.0.0/24"}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("management on a dedicated management address was rejected: %v", err)
+	}
+}
+
+// Enabling the WebUI must not create a second listener anywhere: it is served
+// by the management server, on the management addresses, or not at all.
+func TestValidate_UIAddsNoListenerOfItsOwn(t *testing.T) {
+	c := valid()
+	c.Management.UI = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("UI on loopback management was rejected: %v", err)
+	}
+
+	c.Management.Listen = []string{"0.0.0.0:8443"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a wildcard management bind was accepted, which would expose the WebUI on every address including anycast")
+	}
+}

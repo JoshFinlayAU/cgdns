@@ -841,6 +841,9 @@ func (c *Config) Validate() error {
 			if dnsAddrs[ap.Addr()] && !ap.Addr().IsLoopback() {
 				bad("management.listen: %q shares an address with a DNS listener; the admin plane must not ride on a service/anycast address", a)
 			}
+			if p, covered := anycastCovers(c.Health.AnycastPrefixes, ap.Addr()); covered {
+				bad("management.listen: %q is inside the anycast prefix %s; the operator interface and WebUI must be reachable only on the management interface, never on an address the whole internet routes to and that moves between nodes", a, p)
+			}
 			if !ap.Addr().IsLoopback() {
 				allLoopback = false
 			}
@@ -1020,6 +1023,9 @@ func (c *Config) Validate() error {
 			if dnsAddrs[ap.Addr()] && !ap.Addr().IsLoopback() {
 				bad("metrics.listen: %q shares an address with a DNS listener; metrics must not ride on a service/anycast address", c.Metrics.Listen)
 			}
+			if p, covered := anycastCovers(c.Health.AnycastPrefixes, ap.Addr()); covered {
+				bad("metrics.listen: %q is inside the anycast prefix %s; metrics must be reachable only on the management interface", c.Metrics.Listen, p)
+			}
 			if !ap.Addr().IsLoopback() && len(c.Metrics.AllowFrom) == 0 {
 				bad("metrics.allow_from must list source prefixes when metrics.listen is not loopback (default deny)")
 			}
@@ -1122,6 +1128,26 @@ func (c *Config) MetricsAllowFrom() []netip.Prefix { return mustParsePrefixes(c.
 
 // checkPrefixes validates a CIDR list, insisting on masked form so an operator
 // never writes 10.0.0.5/24 and wonders why the ACL matched more than expected.
+// anycastCovers reports whether addr falls inside one of the anycast prefixes
+// this node originates.
+//
+// An anycast address is by definition reachable from anywhere the route is
+// carried, and it moves between nodes. Binding an admin plane there would put
+// the operator interface on the internet-facing service address and make which
+// node you reached a matter of routing.
+func anycastCovers(prefixes []string, addr netip.Addr) (netip.Prefix, bool) {
+	for _, raw := range prefixes {
+		p, err := netip.ParsePrefix(raw)
+		if err != nil {
+			continue
+		}
+		if p.Contains(addr) {
+			return p, true
+		}
+	}
+	return netip.Prefix{}, false
+}
+
 func checkPrefixes(bad func(string, ...any), field string, in []string) {
 	for _, s := range in {
 		p, err := netip.ParsePrefix(s)

@@ -112,9 +112,14 @@ health:
   # anycast_prefixes: ["<anycast-v4>/32", "<anycast-v6>/128"]
   # gobgp_target: "127.0.0.1:50051"
 
-# The operator API. Bind the management interface address, never a service or
-# anycast address -- the daemon refuses to start if they overlap. Off loopback,
-# TLS and allow_from both become mandatory.
+# The operator API and WebUI. Both are served here and nowhere else: enabling
+# the UI adds no listener of its own.
+#
+# Bind the management interface address. The daemon refuses to start on a
+# wildcard, on an address shared with a DNS listener, or on anything inside
+# health.anycast_prefixes -- an anycast address is routed from the whole
+# internet and moves between nodes, which is no place for an admin plane. Off
+# loopback, TLS and allow_from both become mandatory.
 management:
   enabled: true
   listen:

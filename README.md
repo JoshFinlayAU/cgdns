@@ -125,9 +125,13 @@ validator enforces rather than documents:
 - `listen.allow_query` is default-deny and required. An open recursive resolver
   is an amplification source.
 - The management plane may not share a non-loopback address with a DNS
-  listener - those are anycast, and the admin plane must not follow an anycast
-  route to an arbitrary node.
+  listener, and may not bind anything inside `health.anycast_prefixes`. Those
+  addresses are routed from the whole internet and move between nodes, which is
+  no place for an admin plane. The same rule applies to `metrics.listen`.
 - Management off loopback requires both TLS and a source ACL.
+- **The WebUI is served by the management listener and nowhere else.** Enabling
+  it adds no listener of its own, so it inherits the bind address, the TLS
+  requirement and the source ACL rather than needing its own.
 - Every rate-limit knob is configurable under `rate_limit` - the three per-class
   rates, the window, the slip ratio, the prefix lengths a bucket covers, the
   table bound, and an exemption list. A rate of 0 means that class is unlimited.

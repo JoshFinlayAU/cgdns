@@ -18,7 +18,14 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/netacl"
 )
 
-// Server exposes the operator API on the management addresses.
+// Server exposes the operator API — and, when enabled, the WebUI — on the
+// management addresses and nowhere else.
+//
+// That is the whole point of this type: there is exactly one listener path for
+// the admin plane, so enabling the UI can never quietly add a second one. The
+// config layer refuses a wildcard bind, refuses an address shared with a DNS
+// listener, and refuses anything inside an anycast prefix; this type refuses a
+// non-loopback bind without TLS and filters every connection at accept.
 type Server struct {
 	opts      ServerOptions
 	http      *http.Server
