@@ -71,6 +71,10 @@ Every Nth over-limit response is sent truncated instead of dropped, so a legitim
 
 Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collapsed to a single bucket, 1,547 answered (the configured rate), and the node stayed healthy and in the anycast set throughout. A resolver that limits itself out of the anycast set has turned an attack into an outage.
 
+**Aggressive NSEC** - a signed denial does not only say "this name does not exist", it says "nothing exists between these two names". Ordinary caching throws that away and re-asks for every new name in the gap; keeping it lets one denial answer for all of them (RFC 8198). Against a random-subdomain flood aimed at a signed zone this is the strongest defence there is: measured on the lab, 100 made-up names produced 99 answers from cache and **zero** outbound queries, so the authoritative under attack saw nothing from us. Only validated denials are reused - an unvalidated NSEC is an attacker's claim about what does not exist - and an NSEC is only ever used inside the zone its own SOA names. NSEC3 zones fall through to a normal lookup rather than being answered from records this does not understand.
+
+**Denial validation** - a denial is validated like an answer. An unvalidated NXDOMAIN is an assertion that a name does not exist, and taking one on trust lets anyone who can answer for a zone erase a name for as long as it stays cached. `AD` is now set on proven denials, and a denial that validates is cached as authenticated: negative caching keeps only the SOA (RFC 2308), so re-proving a cached denial would fail for want of evidence deliberately not kept.
+
 **Prefetch** - a busy resolver spends much of its latency budget on the unlucky client whose query arrives the moment a popular entry expires; everyone behind them waits on one upstream round trip. Entries close to expiry are refreshed in the background as they are read, so a name asked for constantly is answered from cache constantly. Only names actually being asked for are refreshed, so an idle entry expires normally rather than the cache turning into a crawler. Refreshes are deduplicated per name and capped, so the thing preventing a stampede cannot cause one, and denials are never refreshed - a name that does not exist is not made more available by asking again, and a random-subdomain flood would otherwise become outbound traffic of our own.
 
 **Serve-stale** - when an authoritative has gone away, answering slightly old data beats answering nothing (RFC 8767). Expired entries are kept for `max_stale` and used *only* after resolution has already failed, so a working authoritative is always preferred and a live entry is served by the normal path. Answers carry EDE 3 so a client can tell, and never set `AD`: the signatures are as old as the data and may have expired, so claiming the chain validated would be a claim we cannot stand behind. NXDOMAIN and NODATA are never overridden - those are answers, and replacing them would resurrect names their owner deliberately removed.
@@ -83,11 +87,10 @@ The interaction that matters: **health checks do not accept a stale answer.** Se
 
 | | Status |
 |---|---|
-| WebUI | The API it sits on is done. The UI is not, and it needs local users and TOTP - unlike API tokens, human passwords want a slow KDF. |
-| Packaging | `.deb` / `.rpm` via nfpm. |
-| `resolver.outbound_source` | Egress source address is currently whatever the route picks. |
+| WebUI | The API it sits on is done, and it will be served by the management listener or not at all. The UI itself is not, and it needs local users and TOTP - unlike API tokens, human passwords want a slow KDF. |
 | DoQ | RFC 9250. |
-| Aggressive NSEC | RFC 8198. |
+| Aggressive NSEC3 | NSEC is done. NSEC3 means hashing each candidate with the zone's parameters and reasoning about the closest encloser; those zones fall through to a normal lookup for now. |
+
 
 ## Design constraints
 
@@ -224,6 +227,7 @@ series worth alerting on:
 | `cgdns_ratelimit_evictions_total` | sustained means `max_buckets` is too small for the client population |
 | `cgdns_serve_stale_served_total` | rising means authoritatives are failing and expired data is keeping subscribers online |
 | `cgdns_prefetch_dropped_total` | sustained means `max_concurrent` is too small, so popular names expire before their refresh gets a slot |
+| `cgdns_nsec_synthesised_total` | rising fast means a flood of made-up names is being absorbed here rather than reaching the zone it targets |
 | `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
 | `cgdns_peer_cache_fetch_hits_total` | work the sibling saved this node |
 

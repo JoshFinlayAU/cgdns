@@ -592,9 +592,9 @@ func TestCanonicalCompare(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.a+" vs "+tt.b, func(t *testing.T) {
 			t.Parallel()
-			got := canonicalCompare(tt.a, tt.b)
+			got := CanonicalCompare(tt.a, tt.b)
 			if (got < 0) != (tt.want < 0) || (got > 0) != (tt.want > 0) || (got == 0) != (tt.want == 0) {
-				t.Errorf("canonicalCompare(%q, %q) = %d, want sign of %d", tt.a, tt.b, got, tt.want)
+				t.Errorf("CanonicalCompare(%q, %q) = %d, want sign of %d", tt.a, tt.b, got, tt.want)
 			}
 		})
 	}

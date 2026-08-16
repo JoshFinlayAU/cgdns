@@ -148,6 +148,15 @@ type Resolver struct {
 	// TrustAnchorFile overrides the root anchors shipped in the package. A node
 	// down long enough to miss a KSK rollover needs a fresh copy.
 	TrustAnchorFile string `yaml:"trust_anchor_file"`
+	// AggressiveNSEC reuses a validated denial to answer for every name its
+	// NSEC range covers (RFC 8198), instead of asking the authoritative again.
+	// It is the strongest defence there is against a random-subdomain flood
+	// aimed at a signed zone: the flood never leaves this node.
+	AggressiveNSEC bool `yaml:"aggressive_nsec"`
+	// AggressiveNSECMaxZones and AggressiveNSECMaxRecords bound that store.
+	AggressiveNSECMaxZones   int `yaml:"aggressive_nsec_max_zones"`
+	AggressiveNSECMaxRecords int `yaml:"aggressive_nsec_max_records_per_zone"`
+
 	// AcceptSHA1 permits RSASHA1 signatures. SHA-1 is not collision resistant;
 	// enabling it weakens the guarantee validation exists to provide.
 	AcceptSHA1 bool `yaml:"accept_sha1"`
@@ -490,18 +499,21 @@ func Default() Config {
 			TCPIdleTimeout:    10 * time.Second,
 		},
 		Resolver: Resolver{
-			Mode:                ModeForward,
-			ClientBudget:        5 * time.Second,
-			QueryTimeout:        2 * time.Second,
-			MaxDelegationDepth:  16,
-			MaxOutboundPerQuery: 32,
-			MaxCNAMEChain:       8,
-			UDPBufferSize:       1232,
-			QNAMEMinimisation:   true,
-			CaseRandomisation:   true,
-			UseIPv4:             true,
-			UseIPv6:             true,
-			DNSSEC:              true,
+			Mode:                     ModeForward,
+			ClientBudget:             5 * time.Second,
+			QueryTimeout:             2 * time.Second,
+			MaxDelegationDepth:       16,
+			MaxOutboundPerQuery:      32,
+			MaxCNAMEChain:            8,
+			UDPBufferSize:            1232,
+			QNAMEMinimisation:        true,
+			CaseRandomisation:        true,
+			AggressiveNSEC:           true,
+			AggressiveNSECMaxZones:   10000,
+			AggressiveNSECMaxRecords: 512,
+			UseIPv4:                  true,
+			UseIPv6:                  true,
+			DNSSEC:                   true,
 		},
 		Cache: Cache{
 			MaxEntries:     1_000_000,
@@ -942,6 +954,18 @@ func (c *Config) Validate() error {
 		if anyPrefix, covered := anycastCovers(c.Health.AnycastPrefixes, addr); covered {
 			bad("%s: %q is inside the anycast prefix %s; sourcing outbound queries from a shared address invites replies back to whichever node the return path picks, so use an address unique to this node",
 				f.name, f.val, anyPrefix)
+		}
+	}
+
+	if c.Resolver.AggressiveNSEC {
+		if !c.Resolver.DNSSEC {
+			bad("resolver.aggressive_nsec requires resolver.dnssec: reusing an unvalidated NSEC would let anyone who can answer for a zone erase names from it for as long as we cached the claim")
+		}
+		if c.Resolver.AggressiveNSECMaxZones < 1 {
+			bad("resolver.aggressive_nsec_max_zones must be > 0")
+		}
+		if c.Resolver.AggressiveNSECMaxRecords < 1 {
+			bad("resolver.aggressive_nsec_max_records_per_zone must be > 0")
 		}
 	}
 

@@ -22,6 +22,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"github.com/JoshFinlayAU/cgdns/internal/aggressive"
 	"github.com/JoshFinlayAU/cgdns/internal/cache"
 	"github.com/JoshFinlayAU/cgdns/internal/dnssec"
 	"github.com/JoshFinlayAU/cgdns/internal/privacy"
@@ -53,6 +54,9 @@ type RecursiveMetrics struct {
 	Secure           atomic.Uint64
 	Insecure         atomic.Uint64
 	Bogus            atomic.Uint64
+	// SynthesisedDenials counts NXDOMAINs answered from a cached NSEC proof
+	// rather than by asking the authoritative (RFC 8198).
+	SynthesisedDenials atomic.Uint64
 }
 
 // RecursiveOptions configures a Recursive resolver.
@@ -79,6 +83,11 @@ type RecursiveOptions struct {
 	// ServerPort is the port authoritatives are contacted on. Defaults to 53;
 	// configurable so a test hierarchy can run unprivileged on loopback.
 	ServerPort uint16
+
+	// NSEC caches validated denial proofs so a later query for a name already
+	// proven not to exist is answered without asking again (RFC 8198). Nil
+	// disables it.
+	NSEC *aggressive.Store
 
 	// QNAMEMinimisation and CaseRandomisation default on; both have config
 	// escape hatches for broken authoritatives.
@@ -231,7 +240,7 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 	}
 
 	if r.opts.Validator != nil && res.secure == dnssec.StatusIndeterminate {
-		status, verr := r.validate(ctx, res)
+		status, verr := r.validateResult(ctx, res, dns.CanonicalName(q.Name), q.Qtype)
 		switch status {
 		case dnssec.StatusBogus:
 			r.opts.Metrics.Bogus.Add(1)
@@ -242,7 +251,22 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 			return servfail(req.Msg, dnssec.ExtendedError(verr), verr.Error())
 		case dnssec.StatusSecure:
 			r.opts.Metrics.Secure.Add(1)
-			r.opts.Cache.PutRRset(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET), res.answer, true)
+			if len(res.answer) > 0 {
+				r.opts.Cache.PutRRset(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET), res.answer, true)
+			} else {
+				// Re-cache the denial as authenticated, exactly as a validated
+				// answer is. Negative caching keeps only the SOA (RFC 2308), so
+				// a cached denial no longer carries the NSEC and signatures that
+				// proved it — re-validating one on the way out would fail for
+				// want of evidence we deliberately did not keep.
+				r.cacheValidatedDenial(q, res)
+			}
+			if len(res.answer) == 0 && r.opts.NSEC != nil {
+				// Only a denial this resolver just proved is worth keeping for
+				// reuse; an unvalidated NSEC is an attacker's claim about what
+				// does not exist.
+				r.opts.NSEC.Put(res.authority, time.Now())
+			}
 		default:
 			r.opts.Metrics.Insecure.Add(1)
 		}
@@ -258,6 +282,38 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 	// AD is set only by a chain this resolver validated itself.
 	resp.AuthenticatedData = res.secure == dnssec.StatusSecure
 	return resp
+}
+
+// cacheValidatedDenial stores a denial that has just validated, marked
+// authenticated so a later hit is trusted without re-proving it.
+func (r *Recursive) cacheValidatedDenial(q dns.Question, res *result) {
+	var soa []dns.RR
+	var ttl time.Duration
+	for _, rr := range res.authority {
+		v, ok := rr.(*dns.SOA)
+		if !ok {
+			continue
+		}
+		t := v.Hdr.Ttl
+		if v.Minttl < t {
+			t = v.Minttl
+		}
+		soa, ttl = []dns.RR{rr}, time.Duration(t)*time.Second
+		break
+	}
+	if ttl <= 0 {
+		return
+	}
+	r.opts.Cache.PutNegative(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET),
+		res.rcode, soa, ttl, true)
+}
+
+// validateResult verifies an answer or a denial, whichever this is.
+func (r *Recursive) validateResult(ctx context.Context, res *result, qname string, qtype uint16) (dnssec.Status, error) {
+	if len(res.answer) == 0 {
+		return r.validateDenial(ctx, res, qname, qtype)
+	}
+	return r.validate(ctx, res)
 }
 
 // validate builds the chain for an answer and verifies it.
@@ -349,6 +405,21 @@ func (r *Recursive) resolve(ctx context.Context, qname string, qtype uint16, st 
 		}
 		return res, nil
 	}
+
+	// A signed denial already in hand may prove this name does not exist, in
+	// which case there is nothing to ask anyone (RFC 8198). This is what stops
+	// a flood of made-up names under a signed zone reaching its authoritative.
+	if r.opts.NSEC != nil && !skipCache {
+		if d, ok := r.opts.NSEC.ProveNXDOMAIN(qname, time.Now()); ok {
+			r.opts.Metrics.SynthesisedDenials.Add(1)
+			return &result{
+				rcode:     dns.RcodeNameError,
+				authority: d.Authority,
+				secure:    dnssec.StatusSecure,
+			}, nil
+		}
+	}
+
 	return r.walk(ctx, qname, qtype, st)
 }
 

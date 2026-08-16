@@ -27,6 +27,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"github.com/JoshFinlayAU/cgdns/internal/aggressive"
 	"github.com/JoshFinlayAU/cgdns/internal/cache"
 	"github.com/JoshFinlayAU/cgdns/internal/config"
 	"github.com/JoshFinlayAU/cgdns/internal/control"
@@ -464,6 +465,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if prefetcher != nil {
 		registerPrefetchMetrics(reg, prefetchMetrics)
 	}
+	if cfg.Resolver.AggressiveNSEC && cfg.Resolver.DNSSEC {
+		registerAggressiveMetrics(reg, nsecMetrics)
+	}
 
 	var mgmt *management.Server
 	if cfg.Management.Enabled {
@@ -753,6 +757,10 @@ func registerPolicyMetrics(reg *metrics.Registry, m *policy.Metrics, c *subscrib
 
 // buildHandler selects the resolution strategy named in the config. Both
 // satisfy transport.Handler, so the listeners are unaffected by the choice.
+// nsecMetrics is shared between the store and the metrics registry, which are
+// built in different places.
+var nsecMetrics = &aggressive.Metrics{}
+
 func buildHandler(
 	cfg config.Config,
 	rrCache resolver.Cache,
@@ -807,7 +815,20 @@ func buildHandler(
 		}
 
 		srcV4, srcV6 := cfg.OutboundSources()
+		var nsecStore *aggressive.Store
+		if cfg.Resolver.AggressiveNSEC && cfg.Resolver.DNSSEC {
+			nsecStore = aggressive.New(aggressive.Options{
+				MaxZones:          cfg.Resolver.AggressiveNSECMaxZones,
+				MaxRecordsPerZone: cfg.Resolver.AggressiveNSECMaxRecords,
+				Metrics:           nsecMetrics,
+			})
+			log.Info("aggressive NSEC enabled",
+				slog.Int("max_zones", cfg.Resolver.AggressiveNSECMaxZones),
+				slog.Int("max_records_per_zone", cfg.Resolver.AggressiveNSECMaxRecords))
+		}
+
 		rec, err := resolver.NewRecursive(resolver.RecursiveOptions{
+			NSEC:              nsecStore,
 			OutboundSource:    resolver.OutboundSource{V4: srcV4, V6: srcV6},
 			Cache:             rrCache,
 			Infra:             infra,
@@ -1156,5 +1177,20 @@ func registerPrefetchMetrics(reg *metrics.Registry, m *prefetch.Metrics) {
 		// so popular names are expiring before their refresh gets a slot.
 		metrics.Source{Name: "cgdns_prefetch_dropped_total", Help: "Refreshes skipped because the concurrency cap was full.", Kind: metrics.Counter, Read: u64(m.Dropped.Load)},
 		metrics.Source{Name: "cgdns_prefetch_in_flight", Help: "Refreshes running now.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.InFlight.Load()) }},
+	)
+}
+
+func registerAggressiveMetrics(reg *metrics.Registry, m *aggressive.Metrics) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	reg.Register(
+		// Rising fast means a flood of made-up names is being absorbed here
+		// rather than reaching the zone it is aimed at.
+		metrics.Source{Name: "cgdns_nsec_synthesised_total", Help: "NXDOMAINs answered from a cached NSEC proof instead of asking the authoritative.", Kind: metrics.Counter, Read: u64(m.Synthesised.Load)},
+		metrics.Source{Name: "cgdns_nsec_stored_total", Help: "NSEC records kept from validated denials.", Kind: metrics.Counter, Read: u64(m.Stored.Load)},
+		metrics.Source{Name: "cgdns_nsec_misses_total", Help: "Lookups with no cached NSEC proof covering the name.", Kind: metrics.Counter, Read: u64(m.Misses.Load)},
+		metrics.Source{Name: "cgdns_nsec_zones", Help: "Zones with NSEC records cached.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.Zones.Load()) }},
+		metrics.Source{Name: "cgdns_nsec_records", Help: "NSEC records held.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.Records.Load()) }},
 	)
 }

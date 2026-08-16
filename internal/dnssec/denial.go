@@ -45,13 +45,13 @@ func ProveNoDS(denial []dns.RR, name string) error {
 		// The NSEC must come from the parent side of the cut: NS present,
 		// DS absent, and no SOA (a SOA would make this the child's apex,
 		// which cannot speak to its own delegation).
-		if !hasType(nsec.TypeBitMap, dns.TypeNS) {
+		if !HasType(nsec.TypeBitMap, dns.TypeNS) {
 			continue
 		}
-		if hasType(nsec.TypeBitMap, dns.TypeSOA) {
+		if HasType(nsec.TypeBitMap, dns.TypeSOA) {
 			continue
 		}
-		if hasType(nsec.TypeBitMap, dns.TypeDS) {
+		if HasType(nsec.TypeBitMap, dns.TypeDS) {
 			return fmt.Errorf("%w: NSEC for %s asserts a DS exists", ErrNoProof, name)
 		}
 		return nil
@@ -66,13 +66,13 @@ func ProveNoDS(denial []dns.RR, name string) error {
 			return err
 		}
 		if nsec3.Match(name) {
-			if !hasType(nsec3.TypeBitMap, dns.TypeNS) {
+			if !HasType(nsec3.TypeBitMap, dns.TypeNS) {
 				continue
 			}
-			if hasType(nsec3.TypeBitMap, dns.TypeSOA) {
+			if HasType(nsec3.TypeBitMap, dns.TypeSOA) {
 				continue
 			}
-			if hasType(nsec3.TypeBitMap, dns.TypeDS) {
+			if HasType(nsec3.TypeBitMap, dns.TypeDS) {
 				return fmt.Errorf("%w: NSEC3 for %s asserts a DS exists", ErrNoProof, name)
 			}
 			return nil
@@ -107,11 +107,11 @@ func ProveNODATA(denial []dns.RR, name string, qtype uint16) error {
 		if !ok || dns.CanonicalName(nsec.Hdr.Name) != name {
 			continue
 		}
-		if hasType(nsec.TypeBitMap, qtype) {
+		if HasType(nsec.TypeBitMap, qtype) {
 			return fmt.Errorf("%w: NSEC for %s asserts %s exists", ErrNoProof, name, dns.TypeToString[qtype])
 		}
 		// A CNAME would have been followed instead of answering NODATA.
-		if hasType(nsec.TypeBitMap, dns.TypeCNAME) {
+		if HasType(nsec.TypeBitMap, dns.TypeCNAME) {
 			return fmt.Errorf("%w: NSEC for %s asserts a CNAME exists", ErrNoProof, name)
 		}
 		return nil
@@ -128,10 +128,10 @@ func ProveNODATA(denial []dns.RR, name string, qtype uint16) error {
 		if !nsec3.Match(name) {
 			continue
 		}
-		if hasType(nsec3.TypeBitMap, qtype) {
+		if HasType(nsec3.TypeBitMap, qtype) {
 			return fmt.Errorf("%w: NSEC3 for %s asserts %s exists", ErrNoProof, name, dns.TypeToString[qtype])
 		}
-		if hasType(nsec3.TypeBitMap, dns.TypeCNAME) {
+		if HasType(nsec3.TypeBitMap, dns.TypeCNAME) {
 			return fmt.Errorf("%w: NSEC3 for %s asserts a CNAME exists", ErrNoProof, name)
 		}
 		return nil
@@ -166,7 +166,7 @@ func ProveNXDOMAIN(denial []dns.RR, name string) error {
 	if len(nsecs) > 0 {
 		covered := false
 		for _, n := range nsecs {
-			if nsecCovers(n, name) {
+			if NSECCovers(n, name) {
 				covered = true
 				break
 			}
@@ -175,9 +175,9 @@ func ProveNXDOMAIN(denial []dns.RR, name string) error {
 			return fmt.Errorf("%w: no NSEC covers %s", ErrNoProof, name)
 		}
 
-		wildcard := wildcardOf(name)
+		wildcard := WildcardOf(name)
 		for _, n := range nsecs {
-			if nsecCovers(n, wildcard) || dns.CanonicalName(n.Hdr.Name) == wildcard {
+			if NSECCovers(n, wildcard) || dns.CanonicalName(n.Hdr.Name) == wildcard {
 				return nil
 			}
 		}
@@ -195,7 +195,7 @@ func ProveNXDOMAIN(denial []dns.RR, name string) error {
 		if !covered {
 			return fmt.Errorf("%w: no NSEC3 covers %s", ErrNoProof, name)
 		}
-		wildcard := wildcardOf(name)
+		wildcard := WildcardOf(name)
 		for _, n := range nsec3s {
 			if n.Cover(wildcard) || n.Match(wildcard) {
 				return nil
@@ -218,9 +218,10 @@ func checkNSEC3Params(n *dns.NSEC3) error {
 	return nil
 }
 
-// nsecCovers reports whether name falls strictly between the NSEC's owner and
+// NSECCovers reports whether name falls strictly between the NSEC's owner and
 // its next name, in canonical order.
-func nsecCovers(n *dns.NSEC, name string) bool {
+// NSECCovers reports whether an NSEC's range proves name does not exist.
+func NSECCovers(n *dns.NSEC, name string) bool {
 	owner := dns.CanonicalName(n.Hdr.Name)
 	next := dns.CanonicalName(n.NextDomain)
 	name = dns.CanonicalName(name)
@@ -228,15 +229,15 @@ func nsecCovers(n *dns.NSEC, name string) bool {
 	if name == owner || name == next {
 		return false
 	}
-	if canonicalCompare(owner, next) < 0 {
-		return canonicalCompare(owner, name) < 0 && canonicalCompare(name, next) < 0
+	if CanonicalCompare(owner, next) < 0 {
+		return CanonicalCompare(owner, name) < 0 && CanonicalCompare(name, next) < 0
 	}
 	// The last NSEC in a zone wraps around to the apex.
-	return canonicalCompare(owner, name) < 0 || canonicalCompare(name, next) < 0
+	return CanonicalCompare(owner, name) < 0 || CanonicalCompare(name, next) < 0
 }
 
-// wildcardOf returns the wildcard that could have synthesised name.
-func wildcardOf(name string) string {
+// WildcardOf returns the wildcard that could have synthesised name.
+func WildcardOf(name string) string {
 	name = dns.CanonicalName(name)
 	i, end := dns.NextLabel(name, 0)
 	if end {
@@ -245,9 +246,9 @@ func wildcardOf(name string) string {
 	return "*." + name[i:]
 }
 
-// canonicalCompare orders two names per RFC 4034 §6.1: label by label from the
+// CanonicalCompare orders two names per RFC 4034 §6.1: label by label from the
 // right, each compared as case-insensitive octets.
-func canonicalCompare(a, b string) int {
+func CanonicalCompare(a, b string) int {
 	if a == b {
 		return 0
 	}
@@ -305,8 +306,8 @@ func compareLabel(a, b string) int {
 	}
 }
 
-// hasType reports whether a type bitmap contains t.
-func hasType(bitmap []uint16, t uint16) bool {
+// HasType reports whether a type bitmap contains t.
+func HasType(bitmap []uint16, t uint16) bool {
 	for _, v := range bitmap {
 		if v == t {
 			return true

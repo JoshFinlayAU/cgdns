@@ -50,6 +50,8 @@ listen:
     - "::1/128"
 
 resolver:
+  # Reuse a validated denial for every name its NSEC range covers (RFC 8198).
+  aggressive_nsec: true
   mode: recursive
   # upstreams must be empty in recursive mode — the daemon refuses to start
   # otherwise, rather than let you believe traffic is being forwarded.
@@ -132,7 +134,11 @@ policy:
   # customer can be unblocked without editing a shared list.
   overrides_file: deploy/dev/overrides.txt
 
+control:
+  store_file: "run/control-recursive.json"
+
 management:
+  bootstrap_token_file: "run/bootstrap-recursive.token"
   enabled: true
   # PRODUCTION: bind the management interface address. The daemon refuses to
   # start if this shares a non-loopback address with a DNS listener, and
