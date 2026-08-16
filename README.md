@@ -6,6 +6,10 @@ The recursion engine is its own - it walks the delegation chain from the root ra
 
 ..before you say it, I know per-subscriber policy doesn't sound very carrier, and it isn't until some sales guy somewhere sells someone that "filtered DNS product" that we have.. now its just an ACL. You don't have to use it, and you probably won't... until you do.
 
+## Side note
+
+I don't want this to be a repo/product that gets lots of feature ideas from the home labbers, its recursive DNS at carrier scale.. lets just make it fast as f*ck, simple to spin up, easy to pull telemetry out of and bug free?
+
 ## Deployment model
 
 Two resolvers per POP, each announce their anycast IP.
