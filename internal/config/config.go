@@ -28,6 +28,8 @@ type Config struct {
 	Cache      Cache      `yaml:"cache"`
 	Subscriber Subscriber `yaml:"subscriber"`
 	Policy     Policy     `yaml:"policy"`
+	Control    Control    `yaml:"control"`
+	Peer       Peer       `yaml:"peer"`
 	Health     Health     `yaml:"health"`
 	Management Management `yaml:"management"`
 	Metrics    Metrics    `yaml:"metrics"`
@@ -219,6 +221,56 @@ type PolicyClass struct {
 	RedirectTo []string `yaml:"redirect_to"`
 }
 
+// Control configures the local control-plane store.
+type Control struct {
+	// StoreFile is the durable record store. Empty keeps it in memory, which
+	// means the node relies entirely on its sibling to repopulate after a
+	// restart.
+	StoreFile string `yaml:"store_file"`
+}
+
+// Peer configures the link to the other resolver in this POP.
+//
+// It carries config replication, which is reliable, and cache sharing, which is
+// best-effort. Cache sharing is POP-local by design: CDN and cloud
+// authoritatives answer on where the resolver sits, so sharing entries between
+// POPs would serve one region's endpoints to another.
+type Peer struct {
+	Enabled bool `yaml:"enabled"`
+
+	// Listen is this node's pair-link address, on the pair VLAN.
+	Listen string `yaml:"listen"`
+	// Remote is the sibling's pair-link address.
+	Remote string `yaml:"remote"`
+
+	// TLS is mutual: the peer may insert into this node's cache, so an
+	// unauthenticated peer could poison it. CAFile is required.
+	TLS    TLS    `yaml:"tls"`
+	CAFile string `yaml:"ca_file"`
+
+	// FetchTimeout bounds a cache fetch, which sits on the query path. Keep it
+	// well below what going upstream costs — beyond that the sibling is a
+	// pessimisation rather than an optimisation.
+	FetchTimeout time.Duration `yaml:"fetch_timeout"`
+	// Timeout bounds a config request, which is off the query path.
+	Timeout time.Duration `yaml:"timeout"`
+
+	// PushInterval and PushBatch control how queued cache entries are flushed.
+	PushInterval time.Duration `yaml:"push_interval"`
+	PushBatch    int           `yaml:"push_batch"`
+	// QueueLimit caps queued entries; beyond it the oldest are dropped.
+	QueueLimit int `yaml:"queue_limit"`
+	// SyncInterval is how often config anti-entropy runs.
+	SyncInterval time.Duration `yaml:"sync_interval"`
+	// IdleTimeout closes a pair connection that has gone quiet.
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
+
+	// PullOnMiss consults the sibling before going upstream. Disable to make
+	// the link push-only, which removes the sibling from the query path
+	// entirely at the cost of a colder peer.
+	PullOnMiss bool `yaml:"pull_on_miss"`
+}
+
 // Health configures the anycast health decision.
 //
 // Withdrawal is fast and re-advertisement is dampened: a dead node costs only
@@ -358,6 +410,19 @@ func Default() Config {
 		},
 		Subscriber: Subscriber{
 			DefaultClass: "default",
+		},
+		Control: Control{
+			StoreFile: "/var/lib/cgdns/control.json",
+		},
+		Peer: Peer{
+			FetchTimeout: 150 * time.Millisecond,
+			Timeout:      2 * time.Second,
+			PushInterval: 200 * time.Millisecond,
+			PushBatch:    256,
+			QueueLimit:   4096,
+			SyncInterval: 30 * time.Second,
+			IdleTimeout:  2 * time.Minute,
+			PullOnMiss:   true,
 		},
 		Health: Health{
 			Interval:         5 * time.Second,
@@ -706,6 +771,59 @@ func (c *Config) Validate() error {
 
 		if c.Management.SessionTimeout <= 0 {
 			bad("management.session_timeout must be > 0")
+		}
+	}
+
+	if c.Peer.Enabled {
+		for _, f := range []struct {
+			name, val string
+		}{{"peer.listen", c.Peer.Listen}, {"peer.remote", c.Peer.Remote}} {
+			if f.val == "" {
+				bad("%s is required when peer.enabled is true", f.name)
+			} else if _, err := netip.ParseAddrPort(f.val); err != nil {
+				bad("%s: %q is not a valid host:port (IPv6 needs brackets): %v", f.name, f.val, err)
+			}
+		}
+		if c.Peer.Listen != "" && c.Peer.Listen == c.Peer.Remote {
+			bad("peer.listen and peer.remote are the same address; a node cannot pair with itself")
+		}
+		// Mutual TLS is not optional here: the sibling writes into this node's
+		// cache, so an unauthenticated peer could poison it.
+		if c.Peer.TLS.CertFile == "" || c.Peer.TLS.KeyFile == "" {
+			bad("peer.tls.cert_file and peer.tls.key_file are required when peer.enabled is true")
+		}
+		if c.Peer.CAFile == "" {
+			bad("peer.ca_file is required: the pair link uses mutual TLS, and without a CA the peer cannot be verified")
+		}
+		for _, f := range []string{c.Peer.TLS.CertFile, c.Peer.TLS.KeyFile, c.Peer.CAFile} {
+			if f == "" {
+				continue
+			}
+			if _, err := os.Stat(f); err != nil {
+				bad("peer: %q is not readable: %v", f, err)
+			}
+		}
+		if c.Peer.FetchTimeout <= 0 {
+			bad("peer.fetch_timeout must be > 0")
+		}
+		if c.Peer.FetchTimeout > c.Resolver.QueryTimeout {
+			bad("peer.fetch_timeout (%s) exceeds resolver.query_timeout (%s): consulting the sibling would cost more than resolving upstream",
+				c.Peer.FetchTimeout, c.Resolver.QueryTimeout)
+		}
+		if c.Peer.Timeout <= 0 {
+			bad("peer.timeout must be > 0")
+		}
+		if c.Peer.PushInterval <= 0 {
+			bad("peer.push_interval must be > 0")
+		}
+		if c.Peer.PushBatch <= 0 {
+			bad("peer.push_batch must be > 0")
+		}
+		if c.Peer.QueueLimit <= 0 {
+			bad("peer.queue_limit must be > 0")
+		}
+		if c.Peer.SyncInterval <= 0 {
+			bad("peer.sync_interval must be > 0")
 		}
 	}
 

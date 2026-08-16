@@ -57,7 +57,7 @@ type RecursiveMetrics struct {
 
 // RecursiveOptions configures a Recursive resolver.
 type RecursiveOptions struct {
-	Cache *cache.Cache
+	Cache Cache
 	Infra *cache.Infra
 
 	// RootHints bootstraps the walk. Required.

@@ -22,6 +22,16 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/transport"
 )
 
+// Cache is the resolver's view of the cache.
+//
+// Declared here, in the consumer, so the pair link can decorate it with
+// push-on-fill and pull-on-miss without this package knowing a peer exists.
+type Cache interface {
+	Get(k cache.Key) (cache.Entry, bool)
+	PutRRset(k cache.Key, rrs []dns.RR, authenticated bool)
+	PutNegative(k cache.Key, rcode int, soa []dns.RR, ttl time.Duration, authenticated bool)
+}
+
 // Metrics counts resolver-level events.
 type Metrics struct {
 	CacheHits    atomic.Uint64
@@ -38,7 +48,7 @@ type ForwardOptions struct {
 	// Upstreams must be non-empty.
 	Upstreams []netip.AddrPort
 	// Cache is required.
-	Cache *cache.Cache
+	Cache Cache
 	// QueryTimeout bounds a single outbound exchange.
 	QueryTimeout time.Duration
 	// UDPSize is the EDNS0 buffer we advertise upstream.

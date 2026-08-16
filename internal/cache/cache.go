@@ -215,6 +215,25 @@ func (c *Cache) Get(k Key) (Entry, bool) {
 	return n.entry, true
 }
 
+// Peek returns the live entry for k without counting a hit or a miss, and
+// without promoting it in the LRU.
+//
+// Hit ratio is an operational signal about client traffic; internal readers
+// such as the peer push path would distort it.
+func (c *Cache) Peek(k Key) (Entry, bool) {
+	now := c.now()
+	s := c.shardFor(k)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, ok := s.m[k]
+	if !ok || !now.Before(n.entry.Expiry) {
+		return Entry{}, false
+	}
+	return n.entry, true
+}
+
 // Put inserts or replaces an entry, clamping ttl into the configured bounds.
 // A ttl that clamps to zero is not cached at all.
 func (c *Cache) Put(k Key, e Entry, ttl time.Duration) {

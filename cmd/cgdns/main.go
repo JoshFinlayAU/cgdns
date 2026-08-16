@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,10 +27,12 @@ import (
 
 	"github.com/JoshFinlayAU/cgdns/internal/cache"
 	"github.com/JoshFinlayAU/cgdns/internal/config"
+	"github.com/JoshFinlayAU/cgdns/internal/control"
 	"github.com/JoshFinlayAU/cgdns/internal/dnssec"
 	"github.com/JoshFinlayAU/cgdns/internal/health"
 	"github.com/JoshFinlayAU/cgdns/internal/metrics"
 	"github.com/JoshFinlayAU/cgdns/internal/netacl"
+	"github.com/JoshFinlayAU/cgdns/internal/peer"
 	"github.com/JoshFinlayAU/cgdns/internal/policy"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver"
 	"github.com/JoshFinlayAU/cgdns/internal/resolver/roothints"
@@ -115,10 +118,65 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		return fmt.Errorf("building infra cache: %w", err)
 	}
 
+	store, err := control.Open(control.StoreOptions{NodeID: cfg.Node.ID, Path: cfg.Control.StoreFile})
+	if err != nil {
+		return err
+	}
+
+	var (
+		peerServer *peer.Server
+		peerClient *peer.Client
+	)
+	peerMetrics := &peer.Metrics{}
+	resolverCache := resolver.Cache(rrCache)
+
+	if cfg.Peer.Enabled {
+		serverTLS, clientTLS, err := loadPeerTLS(cfg.Peer)
+		if err != nil {
+			return err
+		}
+		peerServer, err = peer.NewServer(peer.ServerOptions{
+			NodeID: cfg.Node.ID, Addr: cfg.Peer.Listen, TLS: serverTLS,
+			Cache: rrCache, Store: store, IdleTimeout: cfg.Peer.IdleTimeout,
+			Log: log, Metrics: peerMetrics,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = peerServer.Close() }()
+
+		peerClient, err = peer.NewClient(peer.ClientOptions{
+			NodeID: cfg.Node.ID, Addr: cfg.Peer.Remote, TLS: clientTLS,
+			Timeout: cfg.Peer.Timeout, FetchTimeout: cfg.Peer.FetchTimeout,
+			PushInterval: cfg.Peer.PushInterval, PushBatch: cfg.Peer.PushBatch,
+			QueueLimit: cfg.Peer.QueueLimit, SyncInterval: cfg.Peer.SyncInterval,
+			Store: store, Log: log, Metrics: peerMetrics,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = peerClient.Close() }()
+
+		fetchClient := peerClient
+		if !cfg.Peer.PullOnMiss {
+			// Push-only: the sibling stays warm but never sits on the query
+			// path.
+			fetchClient = nil
+		}
+		resolverCache = peer.NewCache(peer.CacheOptions{
+			Local: rrCache, Client: fetchClient, Log: log, Metrics: peerMetrics,
+		})
+		log.Info("pair link configured",
+			slog.String("listen", cfg.Peer.Listen),
+			slog.String("remote", cfg.Peer.Remote),
+			slog.Bool("pull_on_miss", cfg.Peer.PullOnMiss),
+			slog.Duration("fetch_timeout", cfg.Peer.FetchTimeout))
+	}
+
 	resMetrics := &resolver.Metrics{}
 	recMetrics := &resolver.RecursiveMetrics{}
 
-	handler, err := buildHandler(cfg, rrCache, infraCache, resMetrics, recMetrics, log)
+	handler, err := buildHandler(cfg, resolverCache, infraCache, resMetrics, recMetrics, log)
 	if err != nil {
 		return fmt.Errorf("building resolver: %w", err)
 	}
@@ -127,6 +185,13 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	classifier, registry, err := buildPolicy(cfg, log)
 	if err != nil {
 		return err
+	}
+
+	var publisher *control.Publisher
+	if classifier != nil {
+		publisher = control.NewPublisher(control.PublisherOptions{
+			Store: store, Classifier: classifier, Registry: registry, Log: log,
+		})
 	}
 	if classifier != nil {
 		handler = policy.NewEnforcer(policy.Options{
@@ -275,6 +340,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if monitor != nil {
 		registerHealthMetrics(reg, healthMetrics, monitor)
 	}
+	if cfg.Peer.Enabled {
+		registerPeerMetrics(reg, peerMetrics, peerClient, peerServer, store)
+	}
 	if cfg.Resolver.Mode == config.ModeRecursive {
 		registerRecursiveMetrics(reg, recMetrics, infraCache)
 	}
@@ -289,6 +357,18 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if monitor != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); errCh <- monitor.Run(ctx) }()
+	}
+	if peerServer != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- peerServer.Serve(ctx) }()
+	}
+	if peerClient != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- peerClient.Run(ctx) }()
+	}
+	if publisher != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); publisher.Run(ctx) }()
 	}
 
 	wg.Add(1)
@@ -475,7 +555,7 @@ func registerPolicyMetrics(reg *metrics.Registry, m *policy.Metrics, c *subscrib
 // satisfy transport.Handler, so the listeners are unaffected by the choice.
 func buildHandler(
 	cfg config.Config,
-	rrCache *cache.Cache,
+	rrCache resolver.Cache,
 	infra *cache.Infra,
 	fwdMetrics *resolver.Metrics,
 	recMetrics *resolver.RecursiveMetrics,
@@ -554,6 +634,77 @@ func buildHandler(
 	default:
 		return nil, fmt.Errorf("unknown resolver mode %q", cfg.Resolver.Mode)
 	}
+}
+
+// loadPeerTLS builds the mutual-TLS pair for the pair link.
+//
+// Both directions verify: this node presents a certificate when dialling the
+// sibling, and requires one when the sibling dials in. The sibling can insert
+// into this node's cache, so an unverified peer could poison it.
+func loadPeerTLS(p config.Peer) (server, client *tls.Config, err error) {
+	cert, err := tls.LoadX509KeyPair(p.TLS.CertFile, p.TLS.KeyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading pair-link keypair: %w", err)
+	}
+	caPEM, err := os.ReadFile(p.CAFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading pair-link CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, nil, fmt.Errorf("pair-link CA %s contains no usable certificate", p.CAFile)
+	}
+
+	minVersion := uint16(tls.VersionTLS13)
+	if p.TLS.MinVersion == "1.2" {
+		minVersion = tls.VersionTLS12
+	}
+
+	host, _, err := net.SplitHostPort(p.Remote)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing peer.remote: %w", err)
+	}
+
+	return &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientCAs:    pool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			MinVersion:   minVersion,
+		}, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      pool,
+			ServerName:   host,
+			MinVersion:   minVersion,
+		}, nil
+}
+
+// registerPeerMetrics exposes the pair-link counters.
+func registerPeerMetrics(reg *metrics.Registry, m *peer.Metrics, c *peer.Client, s *peer.Server, store *control.Store) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	bo := func(f func() bool) func() float64 {
+		return func() float64 {
+			if f() {
+				return 1
+			}
+			return 0
+		}
+	}
+	reg.Register(
+		metrics.Source{Name: "cgdns_peer_outbound_up", Help: "1 when the outbound pair link is established.", Kind: metrics.Gauge, Read: bo(c.Connected)},
+		metrics.Source{Name: "cgdns_peer_inbound_up", Help: "1 when the sibling is attached inbound.", Kind: metrics.Gauge, Read: bo(s.Connected)},
+		metrics.Source{Name: "cgdns_peer_cache_push_sent_total", Help: "Cache entries offered to the sibling.", Kind: metrics.Counter, Read: u64(m.CachePushSent.Load)},
+		metrics.Source{Name: "cgdns_peer_cache_push_received_total", Help: "Cache entries accepted from the sibling.", Kind: metrics.Counter, Read: u64(m.CachePushReceived.Load)},
+		metrics.Source{Name: "cgdns_peer_cache_fetch_hits_total", Help: "Local misses served by the sibling.", Kind: metrics.Counter, Read: u64(m.CacheFetchHits.Load)},
+		metrics.Source{Name: "cgdns_peer_cache_fetch_misses_total", Help: "Local misses the sibling could not serve.", Kind: metrics.Counter, Read: u64(m.CacheFetchMisses.Load)},
+		metrics.Source{Name: "cgdns_peer_cache_fetch_errors_total", Help: "Cache fetches that failed on the pair link.", Kind: metrics.Counter, Read: u64(m.CacheFetchErrors.Load)},
+		metrics.Source{Name: "cgdns_peer_records_sent_total", Help: "Config records sent to the sibling.", Kind: metrics.Counter, Read: u64(m.RecordsSent.Load)},
+		metrics.Source{Name: "cgdns_peer_records_received_total", Help: "Config records adopted from the sibling.", Kind: metrics.Counter, Read: u64(m.RecordsReceived.Load)},
+		metrics.Source{Name: "cgdns_peer_sync_errors_total", Help: "Config anti-entropy rounds that failed.", Kind: metrics.Counter, Read: u64(m.SyncErrors.Load)},
+		metrics.Source{Name: "cgdns_peer_rejected_total", Help: "Pair-link handshakes refused.", Kind: metrics.Counter, Read: u64(m.Rejected.Load)},
+		metrics.Source{Name: "cgdns_control_records", Help: "Live control-plane records held.", Kind: metrics.Gauge, Read: func() float64 { return float64(len(store.Records())) }},
+	)
 }
 
 // loadTLS builds the TLS configuration for the encrypted transports.
