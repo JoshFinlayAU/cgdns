@@ -30,6 +30,7 @@ import (
 	"github.com/JoshFinlayAU/cgdns/internal/control"
 	"github.com/JoshFinlayAU/cgdns/internal/dnssec"
 	"github.com/JoshFinlayAU/cgdns/internal/health"
+	"github.com/JoshFinlayAU/cgdns/internal/management"
 	"github.com/JoshFinlayAU/cgdns/internal/metrics"
 	"github.com/JoshFinlayAU/cgdns/internal/netacl"
 	"github.com/JoshFinlayAU/cgdns/internal/peer"
@@ -64,6 +65,7 @@ func main() {
 }
 
 func run(configPath, logLevelOverride string, checkOnly bool) error {
+	startedAt := time.Now()
 	ctx0 := context.Background()
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -347,12 +349,67 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		registerRecursiveMetrics(reg, recMetrics, infraCache)
 	}
 
+	var mgmt *management.Server
+	if cfg.Management.Enabled {
+		if store == nil {
+			return errors.New("management is enabled but there is no control store to manage")
+		}
+		if err := management.Bootstrap(store, cfg.Management.BootstrapTokenFile, time.Now(), log); err != nil {
+			return err
+		}
+
+		api, err := management.NewAPI(management.APIOptions{
+			Store: store,
+			Log:   log,
+			Status: func() management.Status {
+				s := management.Status{
+					NodeID:  cfg.Node.ID,
+					Version: version,
+					Uptime:  time.Since(startedAt).Round(time.Second).String(),
+				}
+				if peerClient != nil {
+					s.PeerOutboundUp = peerClient.Connected()
+				}
+				if peerServer != nil {
+					s.PeerInboundUp = peerServer.Connected()
+				}
+				if monitor != nil {
+					s.Healthy = monitor.State() == health.StateHealthy
+					s.Advertised = s.Healthy
+				}
+				return s
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		var mgmtTLS *tls.Config
+		if cfg.Management.TLS.CertFile != "" {
+			if mgmtTLS, err = loadTLS(cfg.Management.TLS); err != nil {
+				return fmt.Errorf("loading management TLS: %w", err)
+			}
+		}
+
+		mgmt, err = management.NewServer(management.ServerOptions{
+			Listen:  cfg.Management.Listen,
+			TLS:     mgmtTLS,
+			ACL:     netacl.New(cfg.ManagementAllowFrom(), true),
+			Handler: api.Handler(),
+			Log:     log,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = mgmt.Close() }()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	_ = ctx0
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 8)
 
 	if monitor != nil {
 		wg.Add(1)
@@ -369,6 +426,14 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if publisher != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); publisher.Run(ctx) }()
+	}
+	if mgmt != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- mgmt.Serve(ctx) }()
+	}
+	if cfg.Control.StoreFile != "" {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- store.RunFlusher(ctx, time.Second) }()
 	}
 
 	wg.Add(1)

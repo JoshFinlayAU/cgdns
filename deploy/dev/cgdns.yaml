@@ -59,6 +59,11 @@ cache:
 subscriber:
   default_class: default
 
+control:
+  # The durable record store. Empty keeps it in memory, which leaves the node
+  # relying entirely on its sibling to repopulate after a restart.
+  store_file: "run/control.json"
+
 management:
   enabled: true
   # PRODUCTION: bind the management interface address, never a service or
@@ -68,6 +73,9 @@ management:
     - "127.0.0.1:8443"
   ui: true
   session_timeout: 8h
+  # An admin token is minted here on first start if the node holds none. Read it
+  # once and delete the file; a node that already has a token never writes it.
+  bootstrap_token_file: "run/bootstrap.token"
   tls:
     min_version: "1.3"
   # allow_from: ["10.20.0.0/24"]   # required once listen is not loopback-only

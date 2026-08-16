@@ -1,6 +1,8 @@
 package control
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -264,5 +266,74 @@ func TestStore_MissingComputesDelta(t *testing.T) {
 func TestStore_RequiresNodeID(t *testing.T) {
 	if _, err := Open(StoreOptions{}); err == nil {
 		t.Error("a store without a node ID has no tiebreak and must be refused")
+	}
+}
+
+// A store with a path must actually reach disk. It was configured with a file,
+// looked durable, and was not: nothing called Flush, so every control change —
+// including the API token that lets the node be managed at all — was lost on
+// restart.
+func TestStore_FlusherPersistsChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.json")
+	st, err := Open(StoreOptions{NodeID: "ns1", Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Written before the flusher starts, which is what the daemon does when it
+	// mints a bootstrap token. A flusher that waits before its first flush
+	// never persists this.
+	if _, err := st.Put(KindClass, "filtered", ClassRecord{Name: "filtered", Action: "nxdomain"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- st.RunFlusher(ctx, 10*time.Millisecond) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the flusher never wrote the store: %v", err)
+	}
+
+	// A change taken just before shutdown must still land.
+	if _, err := st.Put(KindClass, "late", ClassRecord{Name: "late", Action: "nxdomain"}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("flusher returned: %v", err)
+	}
+
+	reopened, err := Open(StoreOptions{NodeID: "ns1", Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := reopened.State()
+	classes := state.Classes()
+	if len(classes) != 2 {
+		t.Fatalf("reopened store has %d classes, want 2: %+v", len(classes), classes)
+	}
+	if reopened.Hash() != st.Hash() {
+		t.Fatalf("reopened store disagrees: %s vs %s", reopened.Hash(), st.Hash())
+	}
+}
+
+// An in-memory store must not make the flusher spin or fail.
+func TestStore_FlusherWithoutAPath(t *testing.T) {
+	st, err := Open(StoreOptions{NodeID: "ns1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := st.RunFlusher(ctx, time.Millisecond); err != nil {
+		t.Fatal(err)
 	}
 }

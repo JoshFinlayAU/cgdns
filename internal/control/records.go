@@ -13,6 +13,7 @@
 package control
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -252,4 +253,105 @@ func normaliseNames(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// KeyFor returns the store key a record payload must be filed under, so an API
+// cannot file a subscriber for 10.0.0.0/8 under the key 192.0.2.0/24 and leave
+// the store keyed inconsistently with its own contents.
+func KeyFor(kind RecordKind, payload []byte) (string, error) {
+	switch kind {
+	case KindSubscriber:
+		var v SubscriberRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return "", err
+		}
+		p, err := netip.ParsePrefix(v.Prefix)
+		if err != nil {
+			return "", fmt.Errorf("subscriber prefix %q: %w", v.Prefix, err)
+		}
+		return p.Masked().String(), nil
+	case KindOverride:
+		var v OverrideRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return "", err
+		}
+		return v.SubscriberID, nil
+	case KindFeed:
+		var v FeedRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return "", err
+		}
+		return v.Name, nil
+	case KindClass:
+		var v ClassRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return "", err
+		}
+		return strings.ToLower(v.Name), nil
+	default:
+		return "", fmt.Errorf("control: %s records have no derived key", kind)
+	}
+}
+
+// Canonical validates a payload and returns it in the exact form the publish
+// path will hold.
+//
+// Two things make this mandatory rather than tidiness. The publish path drops a
+// bad record silently — correct, since a malformed record must never break
+// resolution — so without validation here an operator gets a success response
+// for something that will never take effect. And the publish path normalises
+// (lowercases, sorts, dedupes), so storing the payload as typed would leave the
+// store disagreeing with the policy actually in force. That last one is worse
+// than it looks: Store.Hash is the drift detector between the two nodes in a
+// pair, so the same policy entered as "Example.COM" on one node and
+// "example.com" on the other would report drift forever.
+func Canonical(kind RecordKind, payload []byte) ([]byte, error) {
+	s := NewState()
+	switch kind {
+	case KindSubscriber:
+		var v SubscriberRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return nil, err
+		}
+		if err := s.setSubscriber(v); err != nil {
+			return nil, err
+		}
+		return json.Marshal(s.Subscribers()[0])
+	case KindOverride:
+		var v OverrideRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return nil, err
+		}
+		if err := s.setOverride(v); err != nil {
+			return nil, err
+		}
+		return json.Marshal(s.Overrides()[0])
+	case KindFeed:
+		var v FeedRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return nil, err
+		}
+		if err := s.setFeed(v); err != nil {
+			return nil, err
+		}
+		return json.Marshal(s.Feeds()[0])
+	case KindClass:
+		var v ClassRecord
+		if err := json.Unmarshal(payload, &v); err != nil {
+			return nil, err
+		}
+		if err := s.setClass(v); err != nil {
+			return nil, err
+		}
+		return json.Marshal(s.Classes()[0])
+	default:
+		return nil, fmt.Errorf("control: cannot validate a %s record", kind)
+	}
+}
+
+// Validate reports whether a payload is acceptable, discarding the canonical
+// form.
+func Validate(kind RecordKind, payload []byte) error {
+	_, err := Canonical(kind, payload)
+	return err
 }

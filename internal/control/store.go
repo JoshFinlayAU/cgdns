@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,10 @@ const (
 	KindFeed RecordKind = 3
 	// KindClass holds a subscriber class definition.
 	KindClass RecordKind = 4
+	// KindToken holds an API token's hash and scopes. Only the hash is stored,
+	// so replicating it to the sibling — which is what lets an operator manage
+	// the pair from either node — never moves the secret itself.
+	KindToken RecordKind = 5
 )
 
 // String implements fmt.Stringer.
@@ -38,6 +43,8 @@ func (k RecordKind) String() string {
 		return "feed"
 	case KindClass:
 		return "class"
+	case KindToken:
+		return "token"
 	default:
 		return "unknown"
 	}
@@ -436,4 +443,50 @@ func (s *Store) State() (*State, uint64) {
 		}
 	}
 	return state, version
+}
+
+// RunFlusher persists the store whenever it changes, until ctx is cancelled.
+//
+// Writes are held in memory and flushed by this loop rather than written
+// through on every Put, because anti-entropy with the sibling can adopt a burst
+// of records at once and each would otherwise be a separate rewrite of the
+// whole file.
+//
+// It always flushes once more on the way out. A node that took a config change
+// and was then restarted before the next flush would come back without it and,
+// worse, would look converged to an operator reading a stale file.
+func (s *Store) RunFlusher(ctx context.Context, minInterval time.Duration) error {
+	if s.path == "" {
+		<-ctx.Done()
+		return nil
+	}
+	if minInterval <= 0 {
+		minInterval = time.Second
+	}
+
+	stop := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		close(stop)
+	}()
+
+	// Flush before waiting, never after. Writes land before this loop starts —
+	// the daemon mints its bootstrap token during startup — and a wait-first
+	// loop would sit on them until some later change happened to arrive.
+	known := s.Version()
+	for {
+		if err := s.Flush(); err != nil {
+			return err
+		}
+		known = s.WaitForChange(known, stop)
+		if ctx.Err() != nil {
+			break
+		}
+		// Coalesce a burst rather than rewriting the file per record.
+		select {
+		case <-time.After(minInterval):
+		case <-stop:
+		}
+	}
+	return s.Flush()
 }

@@ -38,10 +38,11 @@ type Config struct {
 
 // Node identifies this daemon within a cluster.
 type Node struct {
-	// ID must be unique across the cluster; it becomes the raft server ID and
-	// the memberlist node name once clustering lands.
+	// ID must be unique within the pair. It identifies the node on the pair
+	// link and breaks ties between concurrent control-plane writes, so two
+	// nodes sharing an ID would make convergence undefined.
 	ID string `yaml:"id"`
-	// StateDir holds RFC 5011 trust-anchor state, raft logs and snapshots.
+	// StateDir holds RFC 5011 trust-anchor state and the control store.
 	// Wiping it is not harmless — it re-bootstraps the trust anchor.
 	StateDir string `yaml:"state_dir"`
 }
@@ -339,6 +340,13 @@ type Management struct {
 	// UI serves the embedded WebUI in addition to the API.
 	UI bool `yaml:"ui"`
 
+	// BootstrapTokenFile receives an admin token when the node starts with no
+	// token at all. The alternatives are worse: a default credential is a
+	// permanent hole, and a manual out-of-band step gets skipped. A node that
+	// already holds a token — including one replicated from its sibling — never
+	// writes here. Set it empty to refuse bootstrapping entirely.
+	BootstrapTokenFile string `yaml:"bootstrap_token_file"`
+
 	// SessionTimeout bounds an authenticated WebUI session.
 	SessionTimeout time.Duration `yaml:"session_timeout"`
 }
@@ -435,11 +443,12 @@ func Default() Config {
 			GoBGPTarget:      "127.0.0.1:50051",
 		},
 		Management: Management{
-			Enabled:        true,
-			Listen:         []string{"127.0.0.1:8443"},
-			TLS:            TLS{MinVersion: "1.3"},
-			UI:             true,
-			SessionTimeout: 8 * time.Hour,
+			Enabled:            true,
+			Listen:             []string{"127.0.0.1:8443"},
+			TLS:                TLS{MinVersion: "1.3"},
+			UI:                 true,
+			SessionTimeout:     8 * time.Hour,
+			BootstrapTokenFile: "/var/lib/cgdns/bootstrap.token",
 		},
 		Metrics: Metrics{
 			Listen: "127.0.0.1:9153",
