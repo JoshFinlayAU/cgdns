@@ -165,7 +165,6 @@ Everything on the original list is in. What remains is real work, not polish:
 
 | | Status |
 |---|---|
-| Public IPv6 anycast | Deliberately deferred. It needs a routed prefix rather than the on-link /64 the lab has. |
 | Session replication | A WebUI session is node-local, so moving to the sibling means signing in again. That is a considered trade, not an oversight — see the console section. |
 
 ## Design constraints
