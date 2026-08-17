@@ -199,6 +199,11 @@ validator enforces rather than documents:
   an anycast address: a query sourced from an address the sibling also holds
   invites the reply back to whichever node the return path picks. A source this
   node cannot bind is refused at startup rather than failing every query later.
+  Binding it is only half the requirement: whatever sits upstream has to be able
+  to route replies back to that address. Where the loopback is private and NATed,
+  the router needs an explicit route to it, or it will un-NAT each reply to a
+  destination it cannot reach and drop it - the queries leave, the NAT counter
+  climbs, and nothing ever comes back.
 - Every rate-limit knob is configurable under `rate_limit` - the three per-class
   rates, the window, the slip ratio, the prefix lengths a bucket covers, the
   table bound, and an exemption list. A rate of 0 means that class is unlimited.
