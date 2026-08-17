@@ -12,7 +12,18 @@ I don't want this to be a repo/product that gets lots of feature ideas from the 
 
 ## LOUIS
 
-Louis read this before you comment. [docs/LOUIS.md](docs/LOUIS.md)
+Start here: **[docs/OVERVIEW.md](docs/OVERVIEW.md)** — what it is, what it is made
+of, the architecture decisions and why they matter, everything else that was
+considered, and what I need from you to run a real-world test in S1.
+
+Read that first and in full. It answers the questions in the order you would ask
+them, and the last section is the only thing I am actually asking for.
+
+If you still want the receipts after that, every individual decision is written
+up with its alternatives and its trade-offs in `docs/LOUIS.md`, and
+`docs/provisioning.md` has the addressing and BGP configuration end to end. Both
+are referenced from the overview at the points where they are relevant — you
+should not need to go looking.
 
 ## Deployment model
 

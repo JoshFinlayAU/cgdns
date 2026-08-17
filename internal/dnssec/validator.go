@@ -224,7 +224,12 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 		return nil, StatusBogus, ErrChainTooDeep
 	}
 
-	dsSet, status, err := v.delegationSigners(ctx, zone, depth)
+	dsSet, parentKeys, status, err := v.delegationSigners(ctx, zone, depth)
+	if errors.Is(err, errNotAZoneCut) {
+		// Not cut from its parent, so it has no keys of its own: the records
+		// sitting at this name are signed by the parent zone.
+		return parentKeys, StatusSecure, nil
+	}
 	if err != nil || status != StatusSecure {
 		return nil, status, err
 	}
@@ -271,27 +276,31 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 
 // delegationSigners returns the DS set securing zone, either from a trust
 // anchor or from the validated parent zone.
-func (v *Validator) delegationSigners(ctx context.Context, zone string, depth int) ([]*dns.DS, Status, error) {
+// delegationSigners returns the DS set securing zone. When the name turns out
+// not to be a zone cut it returns the parent's keys instead, since those are
+// what sign records sitting at that name — refetching them would spend outbound
+// queries the client's budget has to pay for.
+func (v *Validator) delegationSigners(ctx context.Context, zone string, depth int) ([]*dns.DS, []*dns.DNSKEY, Status, error) {
 	if anchors := v.AnchorsFor(zone); len(anchors) > 0 {
 		out := make([]*dns.DS, 0, len(anchors))
 		for _, a := range anchors {
 			out = append(out, a.ToDS())
 		}
-		return out, StatusSecure, nil
+		return out, nil, StatusSecure, nil
 	}
 	if zone == "." {
-		return nil, StatusIndeterminate, nil
+		return nil, nil, StatusIndeterminate, nil
 	}
 
 	parent := parentZone(zone)
 	parentKeys, status, err := v.trustedKeys(ctx, parent, depth+1)
 	if err != nil || status != StatusSecure {
-		return nil, status, err
+		return nil, nil, status, err
 	}
 
 	rrs, sigs, denial, err := v.fetch.FetchSigned(ctx, zone, dns.TypeDS)
 	if err != nil {
-		return nil, StatusIndeterminate, fmt.Errorf("%w: fetching DS for %s: %w", ErrEvidenceUnavailable, zone, err)
+		return nil, nil, StatusIndeterminate, fmt.Errorf("%w: fetching DS for %s: %w", ErrEvidenceUnavailable, zone, err)
 	}
 
 	dsSet := make([]*dns.DS, 0, len(rrs))
@@ -305,9 +314,12 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 		// No DS. The parent must prove it, otherwise an attacker who strips
 		// the DS looks exactly like an unsigned delegation.
 		if err := v.verifyDenial(denial, parentKeys, zone); err != nil {
-			return nil, StatusBogus, fmt.Errorf("unproven insecure delegation for %s: %w", zone, err)
+			return nil, nil, StatusBogus, fmt.Errorf("unproven insecure delegation for %s: %w", zone, err)
 		}
-		return nil, StatusInsecure, nil
+		if isCut, known := ZoneCutFromDenial(denial, zone); known && !isCut {
+			return nil, parentKeys, StatusSecure, errNotAZoneCut
+		}
+		return nil, nil, StatusInsecure, nil
 	}
 
 	rrset := make([]dns.RR, 0, len(dsSet))
@@ -315,7 +327,7 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 		rrset = append(rrset, ds)
 	}
 	if _, err := v.VerifyRRset(rrset, sigs, parentKeys); err != nil {
-		return nil, StatusBogus, fmt.Errorf("verifying DS for %s: %w", zone, err)
+		return nil, nil, StatusBogus, fmt.Errorf("verifying DS for %s: %w", zone, err)
 	}
 
 	// A DS naming only algorithms we refuse leaves the zone unvalidatable.
@@ -328,9 +340,9 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 		}
 	}
 	if !usable {
-		return nil, StatusBogus, fmt.Errorf("%w: DS for %s names no supported algorithm", ErrUnsupportedAlg, zone)
+		return nil, nil, StatusBogus, fmt.Errorf("%w: DS for %s names no supported algorithm", ErrUnsupportedAlg, zone)
 	}
-	return dsSet, StatusSecure, nil
+	return dsSet, nil, StatusSecure, nil
 }
 
 // verifyDenial checks that denial records prove name/qtype does not exist, and
@@ -427,6 +439,10 @@ func parentZone(zone string) string {
 	}
 	return zone[i:]
 }
+
+// errNotAZoneCut signals that a name carries no DS because it is not a
+// delegation point at all. It never escapes trustedKeys.
+var errNotAZoneCut = errors.New("dnssec: name is not a zone cut")
 
 // ExtendedError maps a validation failure to its RFC 8914 code, so a client
 // learns why validation failed rather than just that it did.

@@ -3,6 +3,16 @@
 *Every significant choice in this project, what else was on the table, and why we
 landed where we did. Written to be picked apart.*
 
+> **Read [OVERVIEW.md](OVERVIEW.md) first.** It covers what the product is, what
+> it is built from, the architecture decisions that matter, and what is needed to
+> run a real-world test — in the order those questions get asked, and in about a
+> third of the length.
+>
+> **This document is the reference behind it.** It exists so that any decision in
+> the overview can be traced to its alternatives, its trade-off, and the test or
+> lab run that keeps it true. Read it when you want the receipts on a specific
+> point, not front to back.
+
 ---
 
 ## First, the question everyone opens with: why is there filtering in a carrier resolver?
@@ -92,8 +102,10 @@ says which: a unit/integration test in the repo, a live run against the real
 internet, or a run on the two-node lab POP.
 
 **Current state, verified at the time of writing:** `go build ./...` clean,
-`go test ./...` green across all 22 packages, **zero skipped tests**, 343 test /
-benchmark / fuzz functions.
+`go vet ./...` clean, `gofmt` clean, `go test ./...` green across all 22
+packages, **zero skipped tests**. 378 tests and 13 benchmarks over ~18,100 lines
+of non-test Go. There are **no fuzz tests yet** — see §18, where that is listed
+as a gap rather than glossed over.
 
 ---
 
@@ -901,6 +913,66 @@ claimed as done.
 
 ---
 
+### 4.9 `cgdns-routed` — installing the routes gobgpd learns
+
+**The gap it closes.** gobgpd is a BGP *speaker*: it holds a learned route in its
+RIB and never puts it in the forwarding table. That is enough to advertise an
+anycast address, which is all the resolver needed at first — but it means a node
+**cannot use a default its upstream is offering**, and keeps a static one even
+when that next hop is gone.
+
+**Alternatives.**
+
+| Option | Why not |
+|---|---|
+| Adopt a full routing suite (FRR, BIRD) on the resolver | An enormous amount of machinery, and a second routing daemon's worth of attack surface and failure modes, to install one default route |
+| Shell out to `ip route` from cgdns | Forbidden by the same rule that forbids `vtysh` and `birdc`: parsing and driving a CLI makes routing behaviour depend on a text format nobody versions |
+| Have the resolver install routes itself over netlink | It would need `CAP_NET_ADMIN`. See the privilege argument below — this is the whole reason it is a separate binary |
+| Static routes only | Works until the next hop is gone, which is precisely the case worth handling |
+
+**Why it is a separate daemon, and this is the point of it.** Installing routes
+needs `CAP_NET_ADMIN`, and **the process answering queries from the internet must
+not also be able to reconfigure the network.** The `cgdns-routed` unit grants
+that one capability and nothing else — not even the `CAP_NET_BIND_SERVICE` the
+resolver has. Neither daemon can do the other's job.
+
+**Deliberately narrow, in three ways:**
+
+1. **Prefixes are matched exactly against an explicit allow list.** Accepting a
+   default does not accept the routes inside it. Config validation refuses an
+   empty list rather than defaulting to "anything": *"the agent installs nothing
+   without one, and an empty list is more likely a mistake than an intention."*
+2. **At most `max_routes` are held**, so a loose filter upstream cannot become a
+   full table in the kernel.
+3. **It only ever deletes routes it installed**, identified by protocol.
+
+Between the router's output policy, gobgp's import policy and this list there are
+three filters — **and only the last is not somebody else's configuration to get
+wrong.**
+
+**Installed routes carry a preferred source, and that was learned the hard way.**
+It was not in the first version. A static default written by hand usually pins a
+source; the learned route that replaced it did not, so **the node's egress
+address silently moved off its intended interface**. Resolver queries were
+unaffected, because they pin their own source — but nothing else on the node did.
+Config validation now requires `route_agent.source_v4`/`_v6` to match what the
+resolver sources from.
+
+**The metric is below any static fallback**, so a learned route wins while it
+exists and the static one takes over the instant it is withdrawn.
+
+**It polls rather than streams.** A default route changes rarely, and a reconcile
+is idempotent: it repairs drift from anything that touched the table behind us,
+which a stream of deltas would not.
+
+**Lab-verified on ns2** with gobgp filtered to accept only a default: the router
+advertising a default put it in gobgp's RIB and *not* the kernel; starting the
+agent installed it with the right preferred source and metric, beating the static
+route; withdrawing it removed the route within one interval and egress fell back
+to the static route, with resolution unaffected throughout.
+
+---
+
 ## 5. The control plane — replication without consensus
 
 Configuration (subscriber prefix mappings, per-subscriber overrides, feed
@@ -1400,14 +1472,59 @@ tested and still be dead code. Grep for callers, not just for the function.
 3. **A stale process on the port** made a fixed build show the old failures. Wait
    for the socket to clear before concluding anything.
 
-### 8.7 Validate once on insert, trust on hit
+### 8.7 Validate once on insert, trust on hit — and record that it happened
 
 **Decision.** A cache entry marked `Authenticated` is served as Secure without
-re-verifying.
+re-verifying. Separately, every entry records whether validation was **actually
+run** (`Validated`), as distinct from what the verdict was.
 
-**Why.** Re-verifying on every hit would put public-key cryptography on the hot
-path for no added assurance — the entry has not changed since we verified it,
-and the cache is node-local memory.
+**Why not re-verify.** It would put public-key cryptography on the hot path for
+no added assurance — the entry has not changed since we verified it, and the
+cache is node-local memory.
+
+**Why the second flag exists, and it is the subtler half.** A cached entry keeps
+**no signatures**. The delegation walk caches records on its way past — delegation
+NS sets, glue, the root's own NS RRset — and those were never judged. Without a
+way to tell "not judged yet" from "judged, turned out insecure", a later client
+query for one of those names re-validates a cached copy **against evidence the
+cache never kept**, and the name fails for as long as the entry lives.
+
+Now: *not judged* is passed over and resolved again; *judged insecure* is served
+without `AD` and without being re-walked on every hit.
+
+**This one caused a full-POP outage in the lab**, and it is worth understanding
+because of how far the blast radius travelled from the bug. The failure reached
+**the root's own NS set** — at which point the health probe, which resolves `. NS`
+through the real serving path, failed on both nodes. Both withdrew themselves
+from the anycast set. A cache-metadata bug three layers away from the health
+check took the POP off the air.
+
+Two readings, both fair. The health check **worked** — it is designed to catch
+"this node cannot resolve" regardless of cause, and it did, on a cause nobody
+anticipated. And it is exactly the class of bug we took on by owning the resolver
+(§2.1). Both are in this document rather than one of them.
+
+### 8.7a Each RRset is verified against its own signer
+
+**Decision.** Verification uses the keys of the zone that signed each RRset, not
+one zone chosen for the whole answer (RFC 4035 §5.3.1). The answer takes the
+status of its weakest link.
+
+**Why.** A CNAME crossing a zone boundary is signed by one zone and its target's
+address records by another. Verifying the whole answer under a single zone's keys
+fails on one side of the cut or the other — and it fails on perfectly valid data,
+which is the worst kind of validation failure.
+
+### 8.7b An unreachable authority is not a verdict on a zone
+
+**Decision.** A DNSKEY or DS that could not be *fetched* surfaces as EDE 22/23
+with its own counter (`cgdns_dnssec_unavailable_total`), not as Bogus. The answer
+is still withheld — unvalidated data is never served.
+
+**Why.** Reporting Bogus tells an operator their signing is broken when the truth
+is that **this node could not see**. That sends someone to debug a zone that is
+fine, while the actual fault — a reachability problem on our side — goes
+unexamined. The distinction costs one counter and saves an incident.
 
 ### 8.8 Aggressive NSEC (RFC 8198)
 
@@ -1678,6 +1795,48 @@ come up and start taking anycast traffic with filtering the operator did not
 intend. At runtime, the node is *already serving subscribers*, and taking
 resolution down because a blocklist URL 500'd would be a self-inflicted outage.
 Feed fetch failure fails **open**.
+
+### 10.5a Fetching a feed is a control-plane operation wearing the clothes of a download
+
+**Decision.** A feed record carrying a URL is fetched on a schedule, hashed into
+a temporary file and renamed into place, then compiled into new rules that are
+swapped into the query path — **with no restart**.
+
+**Why it is treated as control-plane rather than as a download.** A feed decides
+what subscribers are allowed to resolve. Something that can silently change that
+is a control-plane input, and gets control-plane handling:
+
+- **A record may pin a SHA-256. It is checked whenever present, and it is
+  *required* for an `http://` URL** — a list fetched over plain HTTP can be
+  rewritten by anyone on the path.
+- **Content is hashed into a temporary file and renamed into place**, so a reader
+  sees the whole old feed or the whole new one and never half of either.
+- `cgdns_feed_hash_mismatches_total` above zero is worth an alert: the feed was
+  tampered with, or its publisher changed it without telling the control plane.
+
+**Every failure keeps the previous content** — a bad hash, a timeout, an HTTP
+error, a feed over its size cap, or one that came back **empty**. That last case
+is the one worth stating: an empty list would silently unblock everything it used
+to block, which is a filtering product quietly ceasing to be one. One broken feed
+does not stop the others refreshing.
+
+**A refresh that changes nothing does not republish**, because recompiling
+identical rules would swap the query path's tables for no reason.
+
+**`POST /api/v1/policy/refresh` forces one**, because a feed added through the API
+otherwise waits for the next interval — which is an odd thing to explain to
+someone who has just pressed save.
+
+**Two validation rules encode the reasoning:** `feed_refresh_interval` may not be
+under a minute (*"refetching a blocklist more often than that costs the publisher
+more than it gains anyone"*), and `feed_max_bytes` must be set, because an
+uncapped feed can fill the disk of every node subscribed to it.
+
+**Verified end to end on a dev node:** a feed served over HTTP with a pinned
+digest was fetched, compiled, and blocked its names with EDE 15 while other names
+resolved; changing the content refreshed and recompiled with no restart; and
+rewriting it *without* updating the digest was refused, counted, and left the
+previous list serving.
 
 ### 10.6 Block actions and telling the client why
 
@@ -2304,6 +2463,27 @@ This cost real time to diagnose and is now captured in the shipped unit.
 `StateDirectory=cgdns` and `RuntimeDirectory=cgdns` so systemd owns the
 directory lifecycle.
 
+### 15.5a Two units, two capability sets
+
+The package ships `cgdns.service` and `cgdns-routed.service`, and the difference
+between them is the privilege separation in §4.9 made concrete:
+
+| | `cgdns` | `cgdns-routed` |
+|---|---|---|
+| Capability | `CAP_NET_BIND_SERVICE` | `CAP_NET_ADMIN` |
+| Bounding set | the same one capability | the same one capability |
+| Can bind port 53 | yes | **no** |
+| Can install a route | **no** | yes |
+| Extra address family | — | `AF_NETLINK`, which is how it installs them |
+
+Neither can do the other's job, and a compromise of the internet-facing daemon
+does not reach the routing table.
+
+`cgdns-routed` is `PartOf=gobgpd.service` — it reads gobgpd's RIB, so it is
+useless without it. It is a **separate unit** rather than part of the resolver
+precisely so that a routing problem and a resolution problem stay separate
+failures.
+
 ### 15.6 The shadowing-unit trap — hit for real
 
 **What happens.** A hand-placed `/etc/systemd/system/cgdns.service` **overrides**
@@ -2466,6 +2646,9 @@ Not everything with a counter deserves a page. These do:
 | `cgdns_prefetch_dropped_total` | `max_concurrent` too small — popular names expiring before their refresh gets a slot |
 | `cgdns_nsec_synthesised_total` | Rising fast means a flood of made-up names is being absorbed here rather than reaching the zone it targets |
 | `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
+| `cgdns_feed_hash_mismatches_total` | **Above zero is worth waking up for**: a blocklist was tampered with in transit, or its publisher changed content without the control plane being told. Either way the previous list is still serving |
+| `cgdns_feed_fetch_failures_total` | Filtering is going stale. Resolution is unaffected, so this is a next-business-day alert, not a page |
+| `cgdns_feed_last_success_timestamp` | The honest measure of feed freshness — how long since a feed last updated cleanly, rather than whether the last attempt errored |
 
 **The store hash is deliberately not a metric.** Drift is a *comparison between
 two nodes*, and a single node cannot report it — publishing a hash as a series
@@ -2488,7 +2671,7 @@ Everything we chose to live with, in one place.
 | 5 | **Health dampening state is lost on process restart** | Keeping it on disk adds a durability problem to a decision that should be fast | `StartLimitBurst=5` / `StartLimitIntervalSec=300` in the unit |
 | 6 | **A POP going dark sends its subscribers to the next-closest POP** | This is the design, not a failure — anycast doing its job | Latency change only; `cgdns_anycast_advertised` per node |
 | 6b | **A single node failure leaves the POP**, rather than being absorbed by the sibling: that address is then served from another state, and the remote same-role node carries two states' primary load | The price of never putting both of a subscriber's resolvers on one box (§1). The subscriber's other resolver stays local throughout | `cgdns_anycast_advertised` per node; capacity planning must assume a same-role node can inherit a neighbouring state's primary load |
-| 6c | **The lab differs from the reference deployment model in seven respects** — shared router, loopback query source, RFC 1918/ULA with NAT, v6 on its own interface, one shared anycast address, one POP | It was built to prove the software, which it did thoroughly | Real, and tabulated in §3.4a. **None of the production addressing, peering or anycast topology has been run.** The first POP built to `provisioning.md` is the test |
+| 6c | **The lab differs from the reference deployment model in seven respects** — shared router, loopback query source, RFC 1918/ULA with NAT, static return routes, v6 on its own interface, one shared anycast address, one POP | It was built to prove the software, which it did thoroughly | Real, and tabulated in §3.4a. **None of the production addressing, peering or anycast topology has been run.** The first POP built to `provisioning.md` is the test |
 | 6d | **A node reporting itself advertised is not evidence a route left the box** | The health decision is internal by design; it cannot see the PE | §3.4b — confirm on the PE, confirm egress with a packet capture. A gobgpd misconfiguration already caused exactly this, silently |
 | 7 | **Nothing detects config drift between POPs automatically** | There is deliberately no cross-POP control plane | `cgdnsctl drift` is per-pair; cross-POP consistency is the provisioning system's job |
 | 8 | **We own DNS correctness** rather than inheriting Unbound's two decades of hardening | The three features that justify the product all need to be inside the resolver | Named regression tests for every security invariant; RFC + section cited in source; live and lab verification |
@@ -2501,16 +2684,27 @@ Everything we chose to live with, in one place.
 
 ## 18. Not built yet, and why that order
 
-Every feature originally on this list has now landed — WebUI, DoQ and aggressive
-NSEC3 included. What remains is **verification work, not construction**, and it
-matters more than the feature list did:
+Every feature originally on this list has now landed — WebUI, DoQ, aggressive
+NSEC3, feed fetching with hot reload, and the route agent included. What remains
+is **verification work, not construction**, and it matters more than the feature
+list did:
 
 | Item | Status and reasoning |
 |---|---|
-| **The two-address anycast model, proven end to end** | The headline deployment property, and it has never been run — the lab uses one shared address (§3.4a). This is the most important outstanding item, and it belongs before the first production POP |
+| **The reference deployment model, stood up once** | The lab differs from it in seven respects (§3.4a) — shared router, loopback query source, RFC 1918/ULA with NAT, static return routes, v6 on its own interface, one shared anycast address, one POP. **None of the production addressing, peering or anycast topology has been run.** The most important outstanding item, and it belongs before the first production deployment |
+| **A second POP** | "The same address announced from every POP" is what makes inter-POP failover real, and it cannot be demonstrated with one site |
 | **Config anti-entropy on live nodes** | Unit-tested, and the management API now makes runtime writes possible; the full multi-day live soak has not been run |
+| **Fuzz tests on the wire parsers** | There are none. Every packet is attacker-controlled; Go's memory safety removes the worst outcomes, but fuzzing is the right tool for a parsing surface and its absence is a gap, not a decision |
+| **A soak under real subscriber load** | Everything to date is a two-node lab plus the live internet |
+
+**Deliberately deferred, with reasons rather than omissions:**
+
+| Item | Why |
+|---|---|
+| **Public IPv6 anycast** | Needs a separately routed prefix, not an on-link `/64`. A `/128` from a connected subnet makes the router run neighbour discovery for it on the wrong interface |
+| **Session replication** | A console session is node-local, so moving to the sibling means signing in again. Replicating live session state would put mutable per-request data on the pair link to save one login |
 | **A licence** | §20. Needed before any external distribution |
-| **RFC 8326 `GRACEFUL_SHUTDOWN`** | Planned maintenance currently does a plain withdraw (§4.8) |
+| **RFC 8326 `GRACEFUL_SHUTDOWN`** | Planned maintenance does a plain withdraw (§4.8), which works but drops what was in flight when the route disappears |
 
 **Order rationale.** The build order throughout has been: query path first
 (nothing else matters if resolution is wrong), then the things that keep it
@@ -2645,7 +2839,7 @@ to the sibling, which is why `cgdnsctl` re-reads after writing and why drift
 alerting exists.
 
 **"How much of this is actually tested versus asserted?"**
-343 test/benchmark/fuzz functions, `-race` clean, **zero skips** — verified at the
+378 tests and 13 benchmarks, `-race` clean, **zero skips** — verified at the
 time of writing. Beyond that: verified live against the real root servers and
 against `dnssec-failed.org`; verified on the two-node lab POP for anycast
 failover, graceful withdraw on SIGTERM, pair partition and heal, config

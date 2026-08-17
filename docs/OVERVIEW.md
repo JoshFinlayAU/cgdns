@@ -35,6 +35,12 @@ both.*
 **Part 3 — [The architecture decisions that matter](#part-3--the-architecture-decisions-that-matter)**
 
 **Part 4 — [Everything else we considered](#part-4--everything-else-we-considered)**
+· [What we are deliberately not doing](#things-we-are-deliberately-not-doing-and-the-bar-for-changing-that)
+· [What is outstanding](#what-is-outstanding)
+· [How this has been tested and hardened](#how-this-has-been-tested-and-hardened)
+
+**→ [What I need to start a real-world test](#what-i-need-to-start-a-real-world-test)** — *the ask, if you read nothing else*
+· [Addressing](#addressing) · [BGP peering](#bgp-peering) · [The test plan, already written](#the-test-plan-is-already-written)
 
 ---
 ---
@@ -195,20 +201,13 @@ will do.
 
 Standing up one POP to the reference model is the most important outstanding
 item, and it belongs before the first production deployment rather than during
-it.
+it. **The procedure for doing it is written** — addressing, both sides of the BGP
+configuration, the build order and the turnup checks, in
+[provisioning.md](provisioning.md) and summarised at the end of this document.
+What it needs is the addresses and the peering, not more design.
 
-**Verification has to happen at the far end, not the near end.** A lesson already
-paid for: `cgdns_anycast_advertised` reports the node's own internal health
-decision and says **nothing** about whether a route ever left the box. A gobgpd
-import filter placed globally instead of per-neighbour rejects the routes the
-node originates as well as those it receives — the API returns success having
-done nothing, and the node reports itself advertised while the PE has no route to
-it at all. Confirm an announcement on the PE, and confirm the egress path with a
-packet capture. A `dig` that returns an answer proves an answer came back, not
-which address or family produced it.
-
-**There has been no multi-day soak under real subscriber load.** Everything has
-been verified in a two-node lab and against the live internet. That is meaningful
+**There has been no multi-day soak under real subscriber load.** Everything is
+verified in a two-node lab and against the live internet. That is meaningful
 evidence and it is not the same as production.
 
 **Capacity planning has a consequence people miss.** Because each node holds one
@@ -216,27 +215,13 @@ of the two addresses, a single node failure sends that address to the next state
 The same-role node there must be sized to absorb a neighbouring state's primary
 load.
 
-**A genuinely instructive failure, included deliberately.** A DNSSEC bug was found
-in the lab in which cached delegation records — stored by the walk on its way
-past, and keeping no signatures — were re-validated on a later lookup against
-evidence the cache never held. Names failed for as long as the entry lived. When
-it reached the root's own NS set, the health probe failed and **both nodes
-withdrew themselves from the anycast set**: a full-POP outage, self-inflicted,
-from a correctness bug three layers away from the health check.
-
-It is in this document because it is the best argument for both halves of the
-design. The health check found it, because it probes the real serving path. And
-it is exactly the class of bug we took on when we chose to own the resolver. It
-is fixed — entries now record whether validation actually ran, separating "not
-judged yet" from "judged insecure" — with a regression test.
-
 ---
 
 ## The evidence behind those claims
 
 | Claim | Backed by |
 |---|---|
-| Correctness of the resolution engine | **391 test, benchmark and fuzz functions**, `-race` clean, **zero skipped tests**; verified live against the real root servers |
+| Correctness of the resolution engine | **378 tests and 13 benchmarks**, `-race` clean, **zero skipped tests**; verified live against the real root servers |
 | DNSSEC validation | `AD` set on `iana.org` and `cloudflare.com`; SERVFAIL with EDE 9 on `dnssec-failed.org` |
 | IPv6 is real, not nominal | Full lab run with **IPv4 egress disabled entirely** — every outbound query over v6, DNSSEC still validating |
 | Anycast failover | Lab: prefix withdrawn on SIGTERM, router moves to sibling, no failed queries, re-advertises on restart |
@@ -642,9 +627,10 @@ simple read.
 
 **Health owns one decision, and probes the real path.** One component decides
 whether the node belongs in the anycast set, and it decides by running queries
-through the same handler chain a subscriber uses. This is what caught the
-validation bug that had both lab nodes withdraw themselves — a bug three layers
-away from anything a health endpoint would have tested.
+through the same handler chain a subscriber uses. That means it detects "this
+node cannot resolve" whatever the cause, including causes several layers away
+from anything a dedicated health endpoint would exercise — which is the whole
+point of probing the serving path rather than a private one.
 
 **Privilege is split across two daemons.** Installing routes needs
 `CAP_NET_ADMIN`. The resolver does not get it. The route agent gets nothing else,
@@ -749,6 +735,42 @@ The other way it goes wrong is sustained under-investment. A resolver we own
 needs its invariant tests kept green and its RFC behaviour kept current. That
 obligation is permanent and it is the true cost of the decision.
 
+## Things we are deliberately not doing, and the bar for changing that
+
+This section exists so that "why aren't you using X" has an answer that is not a
+shrug — and so that adding X has a standard to meet rather than a mood.
+
+Every item below was considered and set aside on a reason, not on unfamiliarity:
+
+| Not doing | Why not |
+|---|---|
+| **DoH3 / HTTP/3** | DoQ (RFC 9250) already gives per-query streams over QUIC. DoH3 adds an HTTP layer on top of the same transport for no benefit a resolver can use |
+| **Oblivious DNS (ODoH)** | It exists to hide subscriber queries *from the resolver operator*. We are the resolver operator, and the queries are already ours by design |
+| **DNSCrypt** | Pre-standard, superseded by DoT/DoH/DoQ, and no client population that matters requires it |
+| **eBPF / XDP fast path** | The hot path is already zero-allocation with a 344 ns cache hit. Nothing measured says the kernel boundary is the bottleneck, and adding one would be optimising by reputation rather than by profile |
+| **Kubernetes, containers, a service mesh** | The workload is two long-lived processes per POP that must bind fixed addresses, hold BGP sessions and keep serving while the control plane is down. An orchestrator adds a dependency in exactly the failure mode where nothing else may be depended on |
+| **A distributed cache (Redis, memcached)** | Cache is POP-local *by correctness requirement*, and the pair already shares it in under a millisecond. A network round trip to a shared store is slower than the local memory it would replace |
+| **ML / "AI-powered" threat feeds** | The policy engine consumes any feed you point it at. What generates a feed is a supplier decision, not a resolver decision, and putting a model on the query path would break the no-I/O rule |
+| **A rewrite in Rust** | Would buy tail-latency predictability we have not measured a need for, at the cost of the pool of people here who can maintain it |
+| **Multi-tenant RBAC / a customer portal** | A separate application against the existing API, if it is ever wanted. Not a mode of the resolver |
+
+**The bar for revisiting any of these** — the same bar the current design had to
+clear:
+
+1. **Name the requirement it serves.** A customer need, an obligation, or a
+   measured problem. Not a capability.
+2. **Show the measurement**, if the claim is performance. A profile or a
+   benchmark against `main`, not an article.
+3. **Say what it costs** — dependencies, failure modes, attack surface, and who
+   maintains it at 3 a.m.
+4. **Show it breaks no design constraint**: no I/O on the query path, no unbounded
+   work per query, nothing trusted beyond its authority, dual-stack throughout, no
+   subscriber data in logs or labels, fail loudly at startup.
+
+Anything clearing those four gets built. Anything that cannot is a preference —
+and preferences are how carrier infrastructure accumulates the complexity that
+eventually takes it down.
+
 ## What is outstanding
 
 Every feature originally planned has landed. What remains splits into two kinds
@@ -758,7 +780,7 @@ of work, and the first kind matters more than the feature list ever did.
 
 1. **Stand up one POP to the model in `provisioning.md`** — one node per PE,
    public addressing with no NAT, eth0 as the query source, each node owning its
-   own anycast address. The lab differs from this in six respects (Part 1), so
+   own anycast address. The lab differs from this in seven respects (Part 1), so
    this is the first time the production topology will exist anywhere. Before the
    first production deployment, not during it.
 2. **A second POP**, since "the same address announced from every POP" is the
@@ -766,6 +788,10 @@ of work, and the first kind matters more than the feature list ever did.
 3. **Config anti-entropy over a multi-day window** — unit-tested and lab-verified
    in short runs.
 4. **A soak under real subscriber load.**
+5. **Fuzz tests on the wire parsers.** There are none today. Every packet is
+   attacker-controlled and Go's memory safety removes the worst outcomes, but
+   fuzzing is the right tool for the parsing surface and its absence is a gap,
+   not a decision.
 
 **Deliberately deferred, with reasons:**
 
@@ -781,3 +807,188 @@ The features are built, tested and lab-verified; what has not been proven is the
 production topology and multi-day behaviour under real subscriber load. That is
 the right place for a project at this stage to be — but it should be said plainly
 rather than inferred from a short list.
+
+---
+
+## How this has been tested and hardened
+
+Gathered in one place, because "it has been tested" means nothing without saying
+how.
+
+### Correctness
+
+| | |
+|---|---|
+| **378 tests, 13 benchmarks** | Across 22 packages, over ~18,100 lines of non-test Go |
+| **Zero skipped tests** | Deliberate policy. The dual-stack tests skip *loudly* if IPv6 disappears, because a green run with skips is not coverage |
+| **`-race` mandatory** | This is a heavily concurrent daemon; a data race that only appears under production load is not something to find under production load |
+| **`go vet`, `gofmt` clean** | Enforced by `make check` |
+| **Table-driven, with golden wire fixtures** | New protocol behaviour gets a captured wire-format fixture in `testdata/` |
+| **Benchmark comparison before merge** | Resolver or cache changes are not merged without a benchstat comparison against `main` |
+| **Every security invariant has a named test** | Bailiwick rules, the 32-query amplification cap, 0x20 verification, stripped-DS-is-bogus, denial validation. Each is confirmed to fail when the property it guards is removed — a test that cannot fail is not evidence |
+
+### Verified against the real internet, not just a lab
+
+Resolution from the live root servers, cold and warm. DNSSEC `AD` on `iana.org`
+and `cloudflare.com`; SERVFAIL with EDE 9 on `dnssec-failed.org`. Cross-TLD
+CNAME chains, glueless delegations, NXDOMAIN with SOA. Aggressive NSEC/NSEC3
+measured against `nlnetlabs.nl`, `isc.org`, `debian.org` and an unsigned control.
+A full run with **IPv4 egress disabled entirely**, so every outbound query went
+over IPv6 and DNSSEC still validated.
+
+### Attack and failure testing
+
+- **Live flood** against a running node: 15 000 queries at 500/s. Confirmed the
+  limiter collapsed a water-torture flood into one bucket, answered at the
+  configured rate, and — the part that matters — **the node stayed healthy and in
+  the anycast set throughout**. A resolver that limits itself out of the anycast
+  set has turned an attack into an outage.
+- **Node isolation** with both `iptables` *and* `ip6tables`, confirming a node cut
+  off from the internet keeps answering cached names for subscribers **and still
+  withdraws itself**.
+- **Pair partition** with traffic dropped in both directions: both nodes keep
+  resolving, both stay advertised, the link heals on its own.
+- **Anycast failover**: prefix withdrawn on SIGTERM, router moves traffic, no
+  failed queries, node re-advertises on restart.
+- **A real package install** on a lab node, including the upgrade and removal
+  paths and the shadowing-unit trap.
+
+### Security posture, by construction
+
+| Layer | What is enforced |
+|---|---|
+| **Query ACL** | Default-deny and *required* — the daemon will not start without one. A `/0` logs a loud warning |
+| **Amplification** | Hard cap on outbound queries per client query, shared across every sub-lookup it triggers |
+| **Cache poisoning** | Strict bailiwick checks; out-of-bailiwick glue discarded, never cached. 0x20 mixed-case verification on every response |
+| **DNSSEC downgrade** | A stripped DS is *bogus*, not insecure. No silent downgrade, ever |
+| **Management plane** | Default-deny ACL enforced at `accept`, before the TLS handshake. Never on a wildcard, a DNS address, or inside an anycast prefix. TLS mandatory off loopback |
+| **Credentials** | API tokens constant-time compared against a dummy hash to defeat timing enumeration; operator passwords argon2id + TOTP; only hashes replicate |
+| **Web console** | CSP with no `unsafe-inline`, every value rendered via `textContent`, `__Host-` cookie, `SameSite=Strict` plus a CSRF token a cross-origin request cannot produce |
+| **Pair link** | Mutual TLS with a CA, required by config validation — the sibling can write to this node's cache |
+| **Process** | systemd-hardened: `NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and a capability bounding set of exactly one capability |
+| **Privilege separation** | The resolver cannot install routes. The route agent cannot bind privileged ports. Neither can do the other's job |
+| **Memory safety** | Go, no cgo, on a codebase whose entire input surface is attacker-controlled |
+| **Supply chain** | Eight direct dependencies, no web framework, no ORM, no logging or metrics library, no test framework beyond stdlib |
+
+### Where the testing does not reach
+
+Said plainly: no fuzzing yet, no multi-day soak, no production traffic, and the
+reference deployment topology has never been stood up. Those are the four gaps,
+and they are the four items in the list above this one.
+
+---
+---
+
+# What I need to start a real-world test
+
+Everything above is built, tested, and proven as far as a lab can prove it. The
+next step is not more code. It is **one POP, built to the reference model, in S1**.
+
+Here is exactly what that needs.
+
+## Addressing
+
+| # | What | For | The important bit |
+|---|---|---|---|
+| **2 ×** | **`/31`** to the Nokias in S1 | `eth0` on each node — the eBGP session **and** the source of every outbound query | One per node. **Must sit inside an aggregate we announce globally**, because authoritative servers on the internet reply to this address. The `/31` itself never leaves our network |
+| **2 ×** | **`/127`** to the Nokias in S1 | the same, IPv6 | RFC 6164. Same global-aggregate requirement |
+| **2 ×** | **`/32`** I can announce to the Nokias | the anycast service addresses — one owned by each node | Stays **inside our routing domain**, tagged `no-export`. Subscribers are internal, so it never needs to survive public-internet filtering |
+| **2 ×** | **`/128`** I can announce to the Nokias | the same, IPv6 | Needs to come from a **routed** prefix, not an on-link `/64` — a `/128` out of a connected subnet makes the router run neighbour discovery for it on the wrong interface |
+
+**The distinction between the first two rows and the last two is the one to get
+right.** The `eth0` addresses must be globally reachable, because that is where
+the world replies to. The anycast addresses must *not* leave our routing domain,
+because leaking them draws traffic toward a node that is not the nearest. Getting
+these the wrong way round produces a resolver that looks perfectly configured and
+cannot resolve anything.
+
+## BGP peering
+
+**One session per node, per family, to that node's own Nokia** where the topology
+allows. If both nodes peer with the same router, that router is a single point of
+failure for the entire POP and the second node has bought us nothing.
+
+From the PE side:
+
+- eBGP to each node — private ASN on our side, single-hop over the interface.
+- **Originate a default** to each node. That is the only default they take;
+  management deliberately supplies none, so that a BGP failure can never silently
+  turn the management path into the service path.
+- **Accept only the anycast prefixes**, filtered to exactly the `/32` and `/128`
+  above and tagged `no-export`. Reject everything else from them.
+
+`docs/provisioning.md` has the complete working configuration for both sides. The
+PE example there is written against the lab's MikroTik, so the S1 Nokias need the
+SR OS equivalent — a small piece of work, but it is your team's to do and it is
+the only part of this I cannot write myself.
+
+## One thing that is easy to forget
+
+**A `/31` and a `/127` for the pair link** between the two nodes. It is a directly
+connected cable between adjacent boxes and is never announced, but it is numbered
+from public space on purpose: it keeps ICMPv6 errors and traceroute honest and
+avoids the source-selection surprises ULA brings (RFC 6724). Everything crossing
+it is mutually authenticated TLS regardless.
+
+Management addressing on `eth2` can come from the existing S1 management range.
+
+## And the thing I need most
+
+**Time to test it properly, and the trust to do that before anyone mentions
+customers.**
+
+To be completely clear about what I am **not** asking for: **no customer goes
+near this. Not one.** I am asking for a POP that exists, so that the seven things
+a single-site lab could not prove can be proven against real routers instead of
+reasoned about in a document:
+
+1. Real PE peering, one node per router
+2. Public addressing with no NAT in the path
+3. `eth0` as the query source, with replies arriving where they were asked from
+4. Each node owning its own anycast address
+5. A single node failing, and only its address moving
+6. Inter-POP behaviour, once there is a second site
+7. Multi-day stability under sustained load
+
+I will come back with the results either way, including the parts that do not
+work. The flood test, the isolation test and the partition test all exist because
+the failure case is the one worth designing for, and that is the standard I want
+this held to.
+
+When it has run clean for long enough that I would put my own service behind it,
+I will say so. **Then** we can have the conversation about a customer.
+
+## The test plan is already written
+
+This is not a request for time to work out how to test it. The turnup and
+verification procedure is written up in `docs/provisioning.md`, and it is
+specific about where each check is made.
+
+**The principle it is built on: verify at the far end, not the near end.** A
+daemon reporting on itself proves the daemon's opinion.
+`cgdns_anycast_advertised` reports the node's internal health decision and says
+nothing about whether a route ever left the box — so the announcement is
+confirmed **on the PE**, not on the node.
+
+| Check | Where | Proves |
+|---|---|---|
+| `/ip route print where bgp` — expect one `/32` and one `/128` per node | **On the PE** | The announcement actually landed |
+| `gobgp neighbor`, `ip route show default proto bgp` | On the node | Sessions are up and the learned default is installed |
+| `tcpdump -ni eth0 'udp port 53'` | **On the wire** | Every outbound query carries `eth0`'s address, not the anycast one |
+| `systemctl stop cgdns` | **On the PE** | Withdrawal removes exactly that node's two prefixes |
+
+**The packet capture is not optional, and it is the check most worth
+understanding.** Sourcing a query from the anycast address is the single failure
+the whole addressing model exists to prevent — and it is **invisible from inside
+one POP**, because the replies still come back to the only node announcing that
+address. It only breaks once a second site exists, at which point replies start
+landing on a node that never asked. A capture detects it on day one, in one POP,
+which is why it is a check at every build rather than a thing to remember later.
+
+A `dig` against the anycast address proves an answer came back. It does not prove
+which family or which source address produced it, and those are exactly what this
+model depends on getting right.
+
+**So the sequence is:** interfaces on both nodes, PE sessions and filter, gobgpd,
+then cgdns — which announces only once its health checks pass. Each stage is
+verifiable before the next one starts, and none of it involves a customer.

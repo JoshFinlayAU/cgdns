@@ -485,7 +485,12 @@ func TestProveNoDS(t *testing.T) {
 		{"NS without DS proves insecure delegation", []uint16{dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}, false},
 		{"DS present contradicts the claim", []uint16{dns.TypeNS, dns.TypeDS, dns.TypeRRSIG}, true},
 		{"SOA means this is the child apex", []uint16{dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG}, true},
-		{"no NS is not a delegation", []uint16{dns.TypeA, dns.TypeRRSIG}, true},
+		// A minimal-covering NSEC asserts a fixed type set for the queried name
+		// and omits NS. The bitmap is signed, so its absence is authenticated:
+		// no DS exists here. Whether the name is a delegation is a separate
+		// question, answered by ZoneCutFromDenial — and a name that is not one
+		// keeps being signed by the parent, which is stricter than insecure.
+		{"minimal-covering NSEC without NS still proves no DS", []uint16{dns.TypeA, dns.TypeRRSIG}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

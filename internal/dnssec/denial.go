@@ -49,12 +49,18 @@ func ProveNoDS(denial []dns.RR, name string) error {
 		if dns.CanonicalName(nsec.Hdr.Name) != name {
 			continue
 		}
-		// The NSEC must come from the parent side of the cut: NS present,
-		// DS absent, and no SOA (a SOA would make this the child's apex,
-		// which cannot speak to its own delegation).
-		if !HasType(nsec.TypeBitMap, dns.TypeNS) {
-			continue
-		}
+		// What proves the absence of a DS is a matching NSEC that does not
+		// list one. NS is deliberately not required: a minimal-covering NSEC
+		// asserts a fixed type set for the queried name and omits NS entirely,
+		// and demanding it rejects every such zone as unprovable.
+		//
+		// Whether NS is present decides something else — whether the name is a
+		// zone cut at all — and that is read separately by ZoneCutFromDenial.
+		// A name with no NS is not a delegation, so the parent's keys keep
+		// signing it, which is stricter than calling it insecure.
+		//
+		// A SOA still disqualifies the record: it makes this the child's own
+		// apex, which cannot speak to its own delegation.
 		if HasType(nsec.TypeBitMap, dns.TypeSOA) {
 			continue
 		}
@@ -73,9 +79,6 @@ func ProveNoDS(denial []dns.RR, name string) error {
 			return err
 		}
 		if nsec3.Match(name) {
-			if !HasType(nsec3.TypeBitMap, dns.TypeNS) {
-				continue
-			}
 			if HasType(nsec3.TypeBitMap, dns.TypeSOA) {
 				continue
 			}
@@ -319,6 +322,74 @@ func HasType(bitmap []uint16, t uint16) bool {
 		if v == t {
 			return true
 		}
+	}
+	return false
+}
+
+// ZoneCutFromDenial reports whether the parent's own denial records say name is
+// a delegation point.
+//
+// A name with no DS is only an insecure delegation if it is a delegation. Many
+// names sit inside their parent zone rather than being cut from it — go.jp
+// within jp, co.uk within uk — and the parent answers for them directly. Reading
+// "no DS" as "insecure delegation" at such a name declares every signed zone
+// beneath it insecure, and strips AD from names that validate perfectly well.
+//
+// The second return is false when the records say neither way, and the caller
+// must not assume: an opt-out span covering the name proves only that nothing
+// signed exists there, which is exactly the insecure-delegation case.
+func ZoneCutFromDenial(denial []dns.RR, name string) (isCut bool, known bool) {
+	name = dns.CanonicalName(name)
+	for _, rr := range denial {
+		switch v := rr.(type) {
+		case *dns.NSEC:
+			if dns.CanonicalName(v.Hdr.Name) != name {
+				continue
+			}
+			if minimalCovering(v) {
+				// The bitmap is synthesised for the queried name rather than
+				// read from a zone, so its contents describe the generator's
+				// fixed list and not what actually exists. It cannot be used to
+				// decide whether this name is a delegation.
+				continue
+			}
+			return HasType(v.TypeBitMap, dns.TypeNS) && !HasType(v.TypeBitMap, dns.TypeSOA), true
+		case *dns.NSEC3:
+			if err := checkNSEC3Params(v); err != nil {
+				continue
+			}
+			if !v.Match(name) {
+				continue
+			}
+			return HasType(v.TypeBitMap, dns.TypeNS) && !HasType(v.TypeBitMap, dns.TypeSOA), true
+		}
+	}
+	return false, false
+}
+
+// minimalCovering reports whether an NSEC was synthesised to deny exactly the
+// name asked for, rather than describing a real gap in the zone.
+//
+// A synthesising signer answers with the queried name as owner and the name
+// immediately after it, formed by prepending a label of one NUL byte — the
+// smallest name that sorts above the owner. Its type bitmap is a fixed list the
+// generator emits for every such answer, so a type missing from it proves
+// nothing about what the zone actually holds.
+//
+// Only that exact shape counts. An ordinary NSEC whose next name happens to be
+// a child of its owner is entirely normal — a zone apex usually points at its
+// own first record — and must not be mistaken for a synthesised one.
+func minimalCovering(n *dns.NSEC) bool {
+	owner := dns.CanonicalName(n.Hdr.Name)
+	next := dns.CanonicalName(n.NextDomain)
+
+	i, end := dns.NextLabel(next, 0)
+	if end || next[i:] != owner {
+		return false
+	}
+	switch next[:i] {
+	case "\x00.", "\\000.":
+		return true
 	}
 	return false
 }

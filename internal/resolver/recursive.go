@@ -511,6 +511,15 @@ func (r *Recursive) walkFrom(ctx context.Context, qname string, qtype uint16, st
 	if startAt != "" {
 		search = startAt
 	}
+	// A DS RRset is authoritative in the parent zone, not the child (RFC 4035
+	// §3.1.4.1). Starting the search at the name itself finds the child's own
+	// delegation as soon as it has been cached — from any earlier lookup of that
+	// name — and asks it about its own DS, which it refuses or answers NODATA
+	// from its apex. Either way the chain collapses to insecure and AD is lost
+	// on a zone that is properly signed.
+	if qtype == dns.TypeDS && search == qname && qname != "." {
+		_, search = splitFirstLabel(qname)
+	}
 	zone, servers := r.bestDelegation(search)
 
 	sname := zone
