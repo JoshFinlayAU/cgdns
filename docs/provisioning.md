@@ -9,7 +9,7 @@ Four interfaces per node, one job each.
 | Interface | Carries | Addressing |
 |---|---|---|
 | `eth0` | eBGP session to the PE, **and** the source address for outbound queries | public v4 + v6, sized to the PE link — a /31 (RFC 3021) or /30, and a /127 (RFC 6164) or /64 |
-| `eth1` | pair link to the sibling: config replication and cache sharing | /31 or /30 and /127 or /64, private is fine — it never leaves the pair |
+| `eth1` | pair link to the sibling: config replication and cache sharing | a /31 or /30, and a /127 (RFC 6164) from public space |
 | `eth2` | management: operator API, metrics, SSH | management prefix and gateway, **no default route** |
 | `anycast0` | the service address subscribers query | `/32` + `/128` on a dummy device |
 
@@ -91,8 +91,8 @@ network:
   ethernets:
     eth0:                                    # to the PE; also the query source
       addresses: ["160.30.37.200/31", "2404:xxxx:xxxx::200/127"]
-    eth1:                                    # pair link
-      addresses: ["100.127.255.1/31", "fd51:13:2::1/127"]
+    eth1:                                    # pair link, not announced
+      addresses: ["100.127.255.1/31", "2404:xxxx:xxxx:ffff::0/127"]
     eth2:                                    # management
       addresses: ["10.51.13.146/24"]
       routes:
@@ -119,6 +119,12 @@ silently becomes the service path.
 The policy rule solves a second, separate problem: management traffic *sourced*
 from `eth2` must reply out `eth2`. Without it, SSH from off-subnet arrives on
 management and leaves via the BGP default, and the asymmetry breaks the session.
+
+The pair link is numbered from public space but never announced — it is a
+directly connected link between two adjacent boxes, so it needs no reachability
+beyond the pair. Numbering it publicly keeps ICMPv6 errors and traceroute
+honest, and avoids the source-selection surprises ULA brings (RFC 6724). What
+crosses it is mutually authenticated TLS regardless.
 
 ## 2. gobgpd on the node
 
