@@ -143,6 +143,32 @@ policy:
   # REQUIRED for an http:// URL, because a blocklist decides what subscribers
   # may resolve and one fetched over plain HTTP can be rewritten in transit.
 
+# Installs the handful of routes the upstream offers. gobgpd holds a learned
+# route in its RIB and never puts it in the forwarding table, so without this a
+# node cannot use a default its upstream is advertising and keeps a static one
+# even when that next hop is gone.
+#
+# Runs as its own daemon (cgdns-routed) because installing routes needs
+# CAP_NET_ADMIN, which the resolver deliberately does not have.
+route_agent:
+  enabled: false
+  gobgp_target: "127.0.0.1:50051"
+  # Matched EXACTLY. Accepting a default does not accept the routes inside it.
+  # Pair this with an import policy on gobgpd and an output policy on the
+  # router; this list is the last of the three and the only one that is not
+  # somebody else's configuration to get wrong.
+  # accept: ["0.0.0.0/0", "::/0", "<sibling-loopback-v4>/32", "<sibling-loopback-v6>/128"]
+  max_routes: 16
+  # Below any static fallback's metric, so a learned route wins while it exists
+  # and the static one takes over the moment it is withdrawn.
+  metric: 5
+  # Match whatever the static default pins, usually this node's loopback. A
+  # learned route that wins without a source silently moves the node's egress
+  # address to the outgoing interface.
+  # source_v4: "<this-node-loopback-v4>"
+  # source_v6: "<this-node-loopback-v6>"
+  interval: 5s
+
 control:
   store_file: /var/lib/cgdns/control.json
 

@@ -32,6 +32,7 @@ type Config struct {
 	RateLimit  RateLimit  `yaml:"rate_limit"`
 	Peer       Peer       `yaml:"peer"`
 	Health     Health     `yaml:"health"`
+	RouteAgent RouteAgent `yaml:"route_agent"`
 	Management Management `yaml:"management"`
 	Metrics    Metrics    `yaml:"metrics"`
 	Log        Log        `yaml:"log"`
@@ -434,6 +435,49 @@ type Health struct {
 	GoBGPTarget string `yaml:"gobgp_target"`
 }
 
+// RouteAgent configures the companion daemon that installs BGP-learned routes.
+//
+// gobgpd holds a learned route in its RIB and never puts it in the forwarding
+// table, so a node cannot use a default its upstream is offering. The agent
+// closes that gap for an explicitly listed handful of prefixes, and runs as its
+// own daemon because installing routes needs CAP_NET_ADMIN — a privilege the
+// process answering internet queries has no business holding.
+type RouteAgent struct {
+	Enabled bool `yaml:"enabled"`
+
+	// GoBGPTarget is the gobgpd gRPC endpoint, the same one health uses.
+	GoBGPTarget string `yaml:"gobgp_target"`
+
+	// Accept lists the prefixes that may be installed, matched exactly. The
+	// upstream router filters what it sends and gobgp filters what it accepts;
+	// this is the third filter and the only one that is not someone else's
+	// configuration to get wrong. Accepting a default does not accept the
+	// more-specific routes inside it.
+	Accept []string `yaml:"accept"`
+
+	// MaxRoutes bounds how many may be held at once, so a policy failure
+	// upstream cannot become a full table in the kernel.
+	MaxRoutes int `yaml:"max_routes"`
+
+	// SourceV4 and SourceV6 are stamped on installed routes as the preferred
+	// source. Set them to match whatever a static route already pins, usually
+	// this node's loopback: a learned route that wins without a source
+	// silently moves the node's egress address to the outgoing interface.
+	SourceV4 string `yaml:"source_v4"`
+	SourceV6 string `yaml:"source_v6"`
+
+	// Metric is the priority given to installed routes. It belongs below any
+	// static fallback, so a learned route wins while it exists and the static
+	// one takes over the moment it is withdrawn.
+	Metric int `yaml:"metric"`
+
+	// Table is the kernel routing table to install into. Zero means main.
+	Table int `yaml:"table"`
+
+	// Interval is how often the RIB is reconciled against the kernel.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // Management configures the operator plane: REST API, CLI backend and WebUI.
 //
 // This is an administrative surface on a carrier resolver, so it is locked
@@ -616,6 +660,12 @@ func Default() Config {
 			MaxHold:          5 * time.Minute,
 			StableAfter:      5 * time.Minute,
 			GoBGPTarget:      "127.0.0.1:50051",
+		},
+		RouteAgent: RouteAgent{
+			GoBGPTarget: "127.0.0.1:50051",
+			MaxRoutes:   16,
+			Metric:      5,
+			Interval:    5 * time.Second,
 		},
 		Management: Management{
 			Enabled:            true,
@@ -1027,6 +1077,51 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.RouteAgent.Enabled {
+		if c.RouteAgent.GoBGPTarget == "" {
+			bad("route_agent.gobgp_target is required")
+		}
+		if len(c.RouteAgent.Accept) == 0 {
+			bad("route_agent.accept must list the prefixes that may be installed: the agent installs nothing without one, and an empty list is more likely a mistake than an intention")
+		}
+		for _, raw := range c.RouteAgent.Accept {
+			p, err := netip.ParsePrefix(raw)
+			switch {
+			case err != nil:
+				bad("route_agent.accept: %q is not a valid prefix: %v", raw, err)
+			case p.Masked() != p:
+				bad("route_agent.accept: %q has host bits set", raw)
+			}
+		}
+		if c.RouteAgent.MaxRoutes < 1 {
+			bad("route_agent.max_routes must be > 0: an unbounded agent turns a loose upstream filter into a full table in the kernel")
+		}
+		if c.RouteAgent.Metric < 1 {
+			bad("route_agent.metric must be > 0 and below any static fallback, so a withdrawn route falls back rather than leaving a hole")
+		}
+		if c.RouteAgent.Interval <= 0 {
+			bad("route_agent.interval must be > 0")
+		}
+		for _, f := range []struct {
+			name, val string
+			want4     bool
+		}{
+			{"route_agent.source_v4", c.RouteAgent.SourceV4, true},
+			{"route_agent.source_v6", c.RouteAgent.SourceV6, false},
+		} {
+			if f.val == "" {
+				continue
+			}
+			addr, err := netip.ParseAddr(f.val)
+			switch {
+			case err != nil:
+				bad("%s: %q is not a valid IP address: %v", f.name, f.val, err)
+			case addr.Is4() != f.want4:
+				bad("%s: %q is not an IPv%d address", f.name, f.val, map[bool]int{true: 4, false: 6}[f.want4])
+			}
+		}
+	}
+
 	if c.Cache.Prefetch.Enabled {
 		if c.Cache.Prefetch.Threshold <= 0 || c.Cache.Prefetch.Threshold >= 1 {
 			bad("cache.prefetch.threshold must be between 0 and 1 exclusive (it is a fraction of the original TTL), got %v", c.Cache.Prefetch.Threshold)
@@ -1291,6 +1386,22 @@ func (c *Config) OutboundSources() (v4, v6 netip.Addr) {
 	}
 	if c.Resolver.OutboundSourceV6 != "" {
 		v6, _ = netip.ParseAddr(c.Resolver.OutboundSourceV6)
+	}
+	return v4, v6
+}
+
+// RouteAgentAccept returns the parsed route-agent allow list.
+func (c *Config) RouteAgentAccept() []netip.Prefix {
+	return mustParsePrefixes(c.RouteAgent.Accept)
+}
+
+// RouteAgentSources returns the parsed preferred source addresses.
+func (c *Config) RouteAgentSources() (v4, v6 netip.Addr) {
+	if c.RouteAgent.SourceV4 != "" {
+		v4, _ = netip.ParseAddr(c.RouteAgent.SourceV4)
+	}
+	if c.RouteAgent.SourceV6 != "" {
+		v6, _ = netip.ParseAddr(c.RouteAgent.SourceV6)
 	}
 	return v4, v6
 }

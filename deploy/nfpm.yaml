@@ -25,6 +25,16 @@ contents:
     file_info:
       mode: 0755
 
+  - src: ./bin/cgdns-routed
+    dst: /usr/sbin/cgdns-routed
+    file_info:
+      mode: 0755
+
+  - src: ./deploy/systemd/cgdns-routed.service
+    dst: /usr/lib/systemd/system/cgdns-routed.service
+    file_info:
+      mode: 0644
+
   - src: ./deploy/systemd/cgdns.service
     dst: /usr/lib/systemd/system/cgdns.service
     file_info:

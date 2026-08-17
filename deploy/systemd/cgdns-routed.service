@@ -1,0 +1,34 @@
+[Unit]
+Description=cgdns learned-route installer
+Documentation=https://github.com/JoshFinlayAU/cgdns
+After=network-online.target gobgpd.service
+Wants=network-online.target
+# It reads gobgpd's RIB, so it is useless without it, but it must not take the
+# resolver down with it either: this is a separate unit precisely so a routing
+# problem and a resolution problem stay separate failures.
+PartOf=gobgpd.service
+
+[Service]
+Type=simple
+User=cgdns
+Group=cgdns
+ExecStart=/usr/sbin/cgdns-routed -config /etc/cgdns/cgdns.yaml
+Restart=on-failure
+RestartSec=5s
+
+# The one capability this needs, and the one the resolver deliberately does not
+# have. Installing routes is why this daemon exists separately.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

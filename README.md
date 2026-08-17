@@ -63,6 +63,14 @@ A feed decides what subscribers are allowed to resolve, so it is treated as a co
 
 **Subscriber policy** - RPZ zones and plain domain lists, compiled per subscriber class with specificity-ordered matching. Per-subscriber allow and block overrides take precedence over shared class feeds, so one customer can be unblocked without editing a feed you may not own. Blocked answers carry EDE 15 so clients can distinguish policy from a genuine NXDOMAIN. A feed that fails to load leaves the previous rules serving - filtering goes stale, resolution does not.
 
+**Learned routes** - gobgpd is a BGP speaker: it holds a learned route in its RIB and never puts it in the forwarding table. That is enough to advertise an anycast address, but it means a node cannot use a default its upstream is offering, and keeps a static one even when that next hop is gone. `cgdns-routed` closes the gap for an explicitly listed handful of prefixes - a default and the sibling's loopback, typically.
+
+It is narrow on purpose. Prefixes are matched **exactly**, so accepting a default does not accept the routes inside it; at most `max_routes` are held, so a loose filter upstream cannot become a full table in the kernel; and it only ever deletes routes it installed. That is three filters - the router's output policy, gobgp's import policy, and the agent's own list - and only the last is not somebody else's configuration to get wrong.
+
+Installed routes carry a metric below any static fallback, so a learned default wins while it exists and the static one takes over the instant it is withdrawn. They also carry a preferred source: a static default usually pins one, and a learned route that wins without it silently moves the node's egress address off the loopback.
+
+It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and the process answering internet queries should not also be able to reconfigure the network. Its unit grants that capability and nothing else - not even the `CAP_NET_BIND_SERVICE` the resolver has.
+
 **Anycast health** - the node owns the decision on whether it belongs in the anycast set, and drives GoBGP (it just made sense.. go project.. gRPC..) over its gRPC API. `gobgpd` runs as a separate unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a resolver restart does not drop the session. Checks run through the real serving path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays on stable serving time rather than on recovery. SIGTERM withdraws before the
 listeners stop, so a planned restart moves traffic away first.
 
