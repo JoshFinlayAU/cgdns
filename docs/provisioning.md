@@ -253,7 +253,10 @@ gobgp neighbor
 ip -4 route show default proto bgp
 ip -6 route show default proto bgp
 
-# on the wire — which family and source address are really in use
+# on the wire — which family and source address are really in use.
+# Every outbound query must carry eth0's address. Seeing anycast0's
+# address here is the one failure this addressing model exists to
+# prevent, and it looks perfectly healthy until a second POP exists.
 tcpdump -ni eth0 'udp port 53'
 
 # withdrawal actually works
@@ -263,7 +266,9 @@ systemctl stop cgdns                         # the PE should lose exactly
 
 A packet capture is the only honest answer to "which path is it using". A `dig`
 against the anycast address proves an answer came back, not which family or
-source address produced it.
+source address produced it — a node has been seen configured to source v4 from
+its own address while quietly doing every query over v6 from another interface,
+with nothing reporting the difference.
 
 ## How the lab differs
 

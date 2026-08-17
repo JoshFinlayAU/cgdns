@@ -170,13 +170,42 @@ protocol behaviour cites its RFC section in the source, and why the test suite i
 the size it is. **This obligation does not end**, and under-investing in it later
 is the way this decision turns out to have been wrong.
 
-**The production anycast topology has not been run end to end.** The lab proved
-recursion, DNSSEC, health-driven withdraw and re-advertise, anycast failover and
-the pair link — but on a *single shared* anycast address across both nodes. The
-production model gives each node its own address, so the failover the lab
-demonstrated (within the POP) is **not** the behaviour production will have
-(out of the POP, to the same-role node in the next state). Proving that is the
-most important outstanding item, and it belongs before the first production POP.
+**The reference deployment model has never been run.** This is the single most
+important caveat in this document, and it is wider than one setting.
+
+The lab pair predates the model in [provisioning.md](provisioning.md) and reaches
+equivalent behaviour by other means. It is a worked example, not the reference:
+
+| Lab | Reference model |
+|---|---|
+| Both nodes peer with one router over a shared /29 | one node per PE, so a router failure withdraws one node, not the POP |
+| A separate `loopback0` holds the query source | `eth0` is the query source; no loopback |
+| RFC 1918 and ULA addressing, masqueraded out by the router | public space, no NAT |
+| Static return routes on the router to reach each loopback | not needed — eth0 is natively routed |
+| A dedicated interface carries IPv6 on its own VLAN | v6 rides eth0 alongside v4 |
+| One shared anycast address across the pair | each node owns its own, announced from every POP |
+| One POP | the same two addresses announced from every POP |
+
+So the lab has proved the *software* thoroughly — recursion, DNSSEC,
+health-driven withdraw and re-advertise, failover, the pair link, rate limiting
+under flood, serve-stale isolation — and has proved **none of the production
+addressing, peering or anycast topology**. In particular, the failover it
+demonstrated was *within* the POP, which is specifically not what production
+will do.
+
+Standing up one POP to the reference model is the most important outstanding
+item, and it belongs before the first production deployment rather than during
+it.
+
+**Verification has to happen at the far end, not the near end.** A lesson already
+paid for: `cgdns_anycast_advertised` reports the node's own internal health
+decision and says **nothing** about whether a route ever left the box. A gobgpd
+import filter placed globally instead of per-neighbour rejects the routes the
+node originates as well as those it receives — the API returns success having
+done nothing, and the node reports itself advertised while the PE has no route to
+it at all. Confirm an announcement on the PE, and confirm the egress path with a
+packet capture. A `dig` that returns an answer proves an answer came back, not
+which address or family produced it.
 
 **There has been no multi-day soak under real subscriber load.** Everything has
 been verified in a two-node lab and against the live internet. That is meaningful
@@ -389,10 +418,50 @@ nodes keep serving and both stay in the anycast set.
 
 ## Anycast and routing
 
-**`cgdns` decides**, and it is the only thing that does: one component owns
-"should this node be in the anycast set", because two components with independent
-opinions produce a flapping prefix. The decision is driven by probes through the
-real serving path.
+**Four interfaces per node, one job each**, and keeping them apart is what makes
+the rest work:
+
+| Interface | Carries |
+|---|---|
+| `eth0` | eBGP to this node's PE, **and the source address for every outbound query** — public space in both families, because authoritative servers on the internet reply to it |
+| `eth1` | pair link to the sibling: config replication and cache sharing. Numbered from public space but never announced |
+| `eth2` | management: operator API, metrics, SSH. **Supplies no default route** |
+| `anycast0` | this node's service address — a `/32` + `/128` on a dummy device, and what DNS listeners bind to |
+
+**Queries must never be sourced from `anycast0`.** That address exists in every
+POP, so a reply addressed to it follows BGP to whichever POP is nearest *the
+authoritative server* — which is not necessarily the one that asked. The reply
+lands on a node that never sent the query and is dropped, while the node that did
+ask times out. Sourcing from `eth0` makes the address unique to one node, so
+replies come home.
+
+That makes `eth0` **the one leg of the system that touches the public internet**:
+the resolver talks to root, TLD and authoritative servers directly, and they
+reply to whatever source the query carried. So it must sit inside an aggregate
+the AS announces globally, even though no subscriber ever addresses it. The `/31`
+itself never leaves the network — longest-match sorts out the rest.
+
+**There is no loopback interface, deliberately.** A loopback earns its place when
+an address must outlive any single interface — a node dual-homed to two PEs
+cannot source from either link's address, because that address dies with its
+link. With one uplink per node, eth0 going down takes the node with it anyway, so
+a separate loopback buys nothing. Add one the day a node gets a second uplink,
+and not before.
+
+**Each node peers with its own PE** where the topology allows. Two nodes peering
+with the same router makes that router a single point of failure for the whole
+POP: it dies, both anycast addresses withdraw together, and the second node
+bought you nothing.
+
+**Management supplies no default route.** It takes a prefix and a gateway in
+their own routing table; the only default in the main table is the one BGP
+learns. Accepting a management default and relying on metrics to make it lose is
+a trap that works right up until BGP drops, at which point management silently
+becomes the service path.
+
+**`cgdns` decides** whether the node is in the anycast set, and it is the only
+thing that does: two components with independent opinions produce a flapping
+prefix. The decision is driven by probes through the real serving path.
 
 **`gobgpd` speaks BGP**, as its own service. cgdns drives it over gRPC — never by
 shelling out to a CLI, and never embedded in-process, which would drop the
@@ -461,8 +530,8 @@ capability rather than via `setcap` — `NoNewPrivileges` strips file capabiliti
 and ambient ones survive replacing the binary on upgrade, so deployment needs no
 `setcap` step.
 
-Bringing a pair up from nothing — the address plan, the two loopbacks per node,
-the BGP sessions and the policy routing — is documented step by step in
+Bringing a pair up from nothing — the address plan, the BGP sessions, the PE
+side and the policy routing — is documented step by step in
 [provisioning.md](provisioning.md).
 
 ---
@@ -523,8 +592,14 @@ failure.
 from the next state until the node returns, and the same-role node there carries
 two states' primary load. Capacity planning must assume that.
 
-**Status: reasoned but not yet proven** — the lab runs a single shared address, so
-this is the top outstanding verification item.
+**A second failure domain comes with it.** Each node peers with its own PE where
+the topology allows, so a router failure withdraws one address rather than the
+whole POP. Two nodes on one router means that router is a single point of failure
+and the second node bought nothing.
+
+**Status: reasoned and documented, not yet run.** The lab uses a single shared
+address on both nodes, so this is the top outstanding verification item — see the
+lab-versus-reference table in Part 1.
 
 ## 4. The control plane converges; it does not vote
 
@@ -676,16 +751,30 @@ obligation is permanent and it is the true cost of the decision.
 
 ## What is outstanding
 
-Every feature originally planned has landed. What remains is verification, and it
-matters more than the feature list did:
+Every feature originally planned has landed. What remains splits into two kinds
+of work, and the first kind matters more than the feature list ever did.
 
-1. **Prove the two-address anycast model end to end** — the headline deployment
-   property, never yet run. Before the first production POP, not during it.
-2. **Config anti-entropy on live nodes over a multi-day window** — unit-tested and
-   lab-verified in short runs.
-3. **A licence** — not yet chosen, and needed before any external distribution.
-4. **RFC 8326 `GRACEFUL_SHUTDOWN`** — planned maintenance currently does a plain
-   withdraw, which works but drops what was in flight when the route disappears.
+**Verification — the reference model has not been run:**
+
+1. **Stand up one POP to the model in `provisioning.md`** — one node per PE,
+   public addressing with no NAT, eth0 as the query source, each node owning its
+   own anycast address. The lab differs from this in six respects (Part 1), so
+   this is the first time the production topology will exist anywhere. Before the
+   first production deployment, not during it.
+2. **A second POP**, since "the same address announced from every POP" is the
+   property that makes inter-POP failover real and cannot be shown with one.
+3. **Config anti-entropy over a multi-day window** — unit-tested and lab-verified
+   in short runs.
+4. **A soak under real subscriber load.**
+
+**Deliberately deferred, with reasons:**
+
+| | Status |
+|---|---|
+| **Public IPv6 anycast** | Needs a separately routed prefix rather than an on-link `/64`. A `/128` taken from a connected subnet makes the router attempt neighbour discovery for it on the wrong interface |
+| **Session replication** | A console session is node-local, so moving to the sibling means signing in again. A considered trade: replicating live session state would put mutable per-request data on the pair link for a saving measured in one login |
+| **A licence** | Not yet chosen, and needed before any external distribution |
+| **RFC 8326 `GRACEFUL_SHUTDOWN`** | Planned maintenance does a plain withdraw, which works but drops what was in flight when the route disappears. Tagging routes with the community first would let the PE drain the path before withdrawal |
 
 **Where the risk sits now.** It has moved out of the code and into deployment.
 The features are built, tested and lab-verified; what has not been proven is the

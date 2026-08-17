@@ -617,59 +617,121 @@ accepted limitation — see §5.5.
 If a cross-site *management* cluster is ever wanted (which would be a different
 thing from a resolution cluster), it is a starting point.
 
-### 3.4 Two loopback interfaces per node, and a `dummy` device for anycast
+### 3.4 Four interfaces per node, one job each — and no loopback
 
-**Decision.** Each node carries:
+**Decision.** The reference model, set out in full in
+[provisioning.md](provisioning.md):
 
-| Interface | Role |
-|---|---|
-| `anycast0` (a netplan dummy device) | **this node's** anycast /32 + /128 — ANY-A on ns1, ANY-B on ns2. DNS listeners bind here |
-| `loopback0` | unique per node — outbound recursion sources from here |
-| pair VLAN | pair link + management API |
-| p2p /30 | eBGP session to the nearest router, nothing else |
+| Interface | Role | Addressing |
+|---|---|---|
+| `eth0` | eBGP to this node's PE, **and the source of every outbound query** | public v4 + v6, sized to the PE link — a `/31` (RFC 3021) or `/30`, and a `/127` (RFC 6164) |
+| `eth1` | pair link: config replication and cache sharing | public space, `/31` + `/127`, never announced |
+| `eth2` | management: operator API, metrics, SSH | management prefix and gateway, **no default route** |
+| `anycast0` | the service address subscribers query | `/32` + `/128` on a dummy device |
 
-**Why two loopbacks.** If outbound recursion sourced from the *anycast* address,
-the authoritative's reply would be routed to whichever node the return path
-picks — and since every POP announces that same address from its own same-role
-node, the reply can land on **a different POP's node entirely**, which has no
-matching outstanding query. That produces intermittent, load-dependent failures
-that only appear in production. Sourcing from a unique per-node address makes
-replies come home, and gives upstream filters a single address to permit.
+**Why queries must never be sourced from `anycast0`.** That address exists in
+every POP, so a reply addressed to it follows BGP to whichever POP is nearest
+*the authoritative server* — not necessarily the one that asked:
+
+```
+ns1 @ POP-A  --query, src <anycast>-->  root server
+             <--reply, dst <anycast>--  routed to POP-C, not POP-A
+POP-C's ns1: never asked -> dropped.    POP-A's ns1: times out.
+```
+
+Intermittent, load-dependent, and only visible in production. Sourcing from
+`eth0` makes the address unique to one node, so replies come home.
+
+**The consequence people miss: `eth0` is the one leg that touches the public
+internet.** The resolver walks the delegation chain itself and talks to root, TLD
+and authoritative servers directly, and they reply to whatever source the query
+carried. So `eth0` must sit inside an aggregate the AS announces globally, even
+though no subscriber ever addresses it. The `/31` itself never leaves the
+network; longest-match does the rest.
+
+**There is no loopback interface, and that is deliberate.** A loopback earns its
+place when an address must outlive any single interface — a node dual-homed to
+two PEs cannot source from either link's address, because that address dies with
+its link. With one uplink per node, `eth0` going down takes the node with it
+regardless, so a separate loopback buys nothing. **Add one the day a node gets a
+second uplink, and not before.** Single-hop eBGP peers over the interface either
+way.
+
+**One node, one PE.** Two nodes peering with the same router makes that router a
+single point of failure for the whole POP: it dies, both anycast addresses
+withdraw together, and the second node bought nothing.
+
+**Management supplies no default route.** It takes a prefix and a gateway in
+their own table, with a policy rule so traffic sourced from the management
+address replies out the management interface. The only default in the main table
+is the one BGP learns. Accepting a management default and relying on metrics to
+make it lose works right up until BGP drops, at which point management silently
+becomes the service path.
+
+**The pair link is numbered from public space but never announced.** It is a
+directly connected link between two adjacent boxes, so it needs no reachability
+beyond the pair. Public numbering keeps ICMPv6 errors and traceroute honest and
+avoids the source-selection surprises ULA brings (RFC 6724). What crosses it is
+mutually authenticated TLS regardless.
+
+**The anycast prefix stays inside the routing domain.** Subscribers are internal,
+so a `/32` in iBGP with `no-export` is right; leaking it further would draw
+traffic toward a node that may not be the nearest.
 
 ### 3.4a Where the lab differs from the production model — stated, not glossed
 
-**The lab runs a single shared anycast address, on both nodes.** `deploy/lab/ns1.yaml`
-and `ns2.yaml` are byte-identical in their listeners:
+**The lab pair predates the reference model and reaches equivalent behaviour by
+other means.** It is a worked example, not the reference, and the differences are
+wider than a single setting:
 
-```yaml
-listen:
-  # The anycast address, identical on both nodes.
-  udp:
-    - "10.255.0.53:53"
-    - "[fd51:13:53::53]:53"
-```
+| Lab | Reference model (§3.4) |
+|---|---|
+| Both nodes peer with one router over a shared `/29` | one node per PE |
+| A separate `loopback0` holds the query source | `eth0` is the query source; no loopback |
+| RFC 1918 and ULA addressing, masqueraded out by the router | public space, no NAT |
+| Static return routes on the router to reach each loopback | not needed — `eth0` is natively routed |
+| A dedicated interface (`eth3`) carries v6 on its own VLAN | v6 rides `eth0` alongside v4 |
+| One shared anycast address across the pair | each node owns its own |
+| One POP | the same two addresses announced from every POP |
 
-That is **not** the two-address model in §1. It was built to prove recursion,
-DNSSEC validation, health-driven withdraw/advertise, anycast failover and the
-pair link — all of which it proved. But the failover it demonstrated was
-*within* the POP (withdrawing ns1 moved the router's active gateway to ns2 for
-the same address), which is precisely the behaviour the production model does
-**not** have.
+The `eth3` split was a workaround for a lab environment with no v6 on the BGP
+path, not part of the design.
 
-**What this means concretely:** the properties in §1 that follow from one address
-per node — a subscriber's two resolvers never landing on one box, and a single
-node failure moving one address to the next POP — have been reasoned about but
-**not exercised end to end.** Two things need proving before the first
-production POP:
+**So what has actually been proved, and what has not.** The lab proved the
+*software* thoroughly — recursion, DNSSEC validation, health-driven
+withdraw/advertise, failover, the pair link, rate limiting under live flood,
+serve-stale isolation. It has proved **none of the production addressing, peering
+or anycast topology**. The failover it demonstrated was *within* the POP
+(withdrawing ns1 moved the router's active gateway to ns2 for the same address),
+which is precisely what the production model does not do.
 
-1. A second anycast address, with each node announcing only its own, and the
-   router selecting correctly for both.
-2. That withdrawing one node moves *only* its address, out of the POP, while the
-   sibling's address stays put and keeps serving.
+Nothing in the daemon blocks the reference model — `health.anycast_prefixes` is a
+list and each node reads its own config — but "nothing blocks it" is not the same
+as "it has been run".
 
-Nothing in the daemon blocks this — `health.anycast_prefixes` is a list and each
-node reads its own config — but "nothing blocks it" is not the same as "it has
-been run".
+### 3.4b Verify at the far end, not the near end
+
+**A principle earned the hard way, and it belongs in this document because it
+changes what a green dashboard is worth.**
+
+`cgdns_anycast_advertised` reports the node's own internal health decision. It
+says **nothing** about whether a route ever left the box.
+
+The failure that taught it: a gobgpd import filter placed in
+`[global.apply-policy]` rather than per-neighbour also judges the routes the node
+*originates*, so the anycast prefix never enters the RIB. Both the gRPC API and
+`gobgp global rib add` return success having done nothing — **the node reports
+itself advertised while the PE has no route to it at all.** Silent, and in the
+safe-looking direction.
+
+What follows:
+
+- Confirm an announcement **on the PE**, not on the node.
+- Confirm which family and source address are really in use with a **packet
+  capture**. A `dig` that returns an answer proves an answer came back, not what
+  produced it.
+- Confirm withdrawal by stopping the service and watching the PE lose exactly
+  that node's two prefixes.
 
 **Why a `dummy` device and not `lo`.** We need an address that never goes down,
 is not attached to a physical link, and never ARPs — the same trick
@@ -747,10 +809,15 @@ ns1 re-advertises on restart.
 
 **Two traps found, worth knowing before anyone repeats them:**
 
-1. **GoBGP's global `default-import-policy = "reject-route"` rejects locally
-   originated routes**, not just peer-received ones. `gobgp global rib add`
-   returns exit 0 and the prefix silently never enters the RIB — the session
-   establishes and nothing is ever advertised. Do not set it.
+1. **An import filter belongs on each neighbour, never in
+   `[global.apply-policy]`.** A global `default-import-policy = "reject-route"`
+   also judges the routes this node *originates*, not just those it receives, so
+   the anycast prefix never enters the RIB. Both the gRPC API and `gobgp global
+   rib add` return success having done nothing — the session establishes, the
+   node reports itself advertised, and the PE has no route to it at all. Filter
+   per-neighbour with an explicit prefix-set instead; see `provisioning.md` §2
+   for the working shape. This is the origin of the rule in §3.4b: **check the
+   PE, not the resolver.**
 2. **Debian trixie-backports `gobgpd` 4.7.0 ships a broken systemd unit** — it
    passes `--syslog yes`, a flag the 4.x binary no longer accepts, so the
    service fails instantly. Worked around with a drop-in overriding `ExecStart`.
@@ -1863,7 +1930,8 @@ world.
 | Proxy headers never trusted by default; `trust_proxy_headers` requires an explicit `trusted_proxies` list | A spoofable client address on the admin plane is a straight ACL bypass — a worse version of the DoH problem in §9.4 |
 
 **Why anycast specifically is the wrong place for an admin plane:** it is the
-exact opposite of a management address. The whole internet routes to it and it
+exact opposite of a management address. Everything in the routing domain that
+carries the prefix routes to it, and it
 *moves between nodes*, so "which node am I administering" becomes a routing
 question.
 
@@ -2310,7 +2378,7 @@ delivers.
 **Decision.** Two streams, both structured, both cheap: a Prometheus endpoint on
 the management plane, and structured event logs on stderr.
 
-**87 metric series**, and the shape of them matters more than the count:
+**95 metric series**, and the shape of them matters more than the count:
 
 | Subsystem | Series | Answers the question |
 |---|---|---|
@@ -2387,9 +2455,10 @@ Not everything with a counter deserves a page. These do:
 
 | Metric | What a change means |
 |---|---|
-| `cgdns_anycast_advertised` | 0 means this node is not taking traffic — the single most important series |
+| `cgdns_anycast_advertised` | 0 means this node has decided it should not be taking traffic. The most important series — but it is the node's *own decision*, not proof a route left the box (§3.4b). Pair it with a route check on the PE |
 | `cgdns_anycast_flaps_total` | Rising means dampening is escalating; a node is sick, not merely down |
 | `cgdns_dnssec_bogus_total` | A broken zone, or an attack |
+| `cgdns_dnssec_unavailable_total` | A chain could not be judged because a DNSKEY or DS was unreachable. **A reachability problem here, not a signing problem at the zone** — the distinction is what stops an operator being sent to debug someone else's DNSSEC |
 | `cgdns_recursion_case_mismatch_total` | Non-zero means off-path spoofing attempts |
 | `cgdns_ratelimit_dropped_total` | An attack, or a rate set below what real clients need |
 | `cgdns_ratelimit_evictions_total` | Sustained means `max_buckets` is too small for the client population |
@@ -2419,7 +2488,8 @@ Everything we chose to live with, in one place.
 | 5 | **Health dampening state is lost on process restart** | Keeping it on disk adds a durability problem to a decision that should be fast | `StartLimitBurst=5` / `StartLimitIntervalSec=300` in the unit |
 | 6 | **A POP going dark sends its subscribers to the next-closest POP** | This is the design, not a failure — anycast doing its job | Latency change only; `cgdns_anycast_advertised` per node |
 | 6b | **A single node failure leaves the POP**, rather than being absorbed by the sibling: that address is then served from another state, and the remote same-role node carries two states' primary load | The price of never putting both of a subscriber's resolvers on one box (§1). The subscriber's other resolver stays local throughout | `cgdns_anycast_advertised` per node; capacity planning must assume a same-role node can inherit a neighbouring state's primary load |
-| 6c | **The lab implements one shared anycast address on both nodes, not the two-address production model** | It was built to prove recursion, DNSSEC, failover and the pair link, all of which it did | Real, and called out in §3.4a — the two-address model has **not** been exercised end to end |
+| 6c | **The lab differs from the reference deployment model in seven respects** — shared router, loopback query source, RFC 1918/ULA with NAT, v6 on its own interface, one shared anycast address, one POP | It was built to prove the software, which it did thoroughly | Real, and tabulated in §3.4a. **None of the production addressing, peering or anycast topology has been run.** The first POP built to `provisioning.md` is the test |
+| 6d | **A node reporting itself advertised is not evidence a route left the box** | The health decision is internal by design; it cannot see the PE | §3.4b — confirm on the PE, confirm egress with a packet capture. A gobgpd misconfiguration already caused exactly this, silently |
 | 7 | **Nothing detects config drift between POPs automatically** | There is deliberately no cross-POP control plane | `cgdnsctl drift` is per-pair; cross-POP consistency is the provisioning system's job |
 | 8 | **We own DNS correctness** rather than inheriting Unbound's two decades of hardening | The three features that justify the product all need to be inside the resolver | Named regression tests for every security invariant; RFC + section cited in source; live and lab verification |
 | 9 | **Aggressive denial saves much less on a large NSEC3 zone than on an NSEC one** (`debian.org`: 4/50 rising to 22/50, against 49/50 for NSEC) | Inherent to NSEC3: hashing scatters names across the chain, so one denial rarely covers the next made-up name. Not an implementation shortfall | Improves as the chain caches; RRL (§11) still caps what a flood costs regardless |
@@ -2482,7 +2552,7 @@ record's TTL, which alone breaks CDN and failover behaviour. §2.1a has the full
 answer including where nscd stands with the distributions today.
 
 **"What can we get out of it for monitoring? Can we stream it?"**
-87 Prometheus series on the management listener behind the ACL, plus structured
+95 Prometheus series on the management listener behind the ACL, plus structured
 JSON event logs that journald and a shipper turn into a real per-event stream to
 Kafka, Loki or a SIEM — both available today with no change to the daemon
 (§16.6). Metrics are read at scrape time from atomic counters, so instrumentation
