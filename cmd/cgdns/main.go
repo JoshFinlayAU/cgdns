@@ -28,6 +28,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"github.com/JoshFinlayAU/cgdns/internal/acme"
 	"github.com/JoshFinlayAU/cgdns/internal/aggressive"
 	"github.com/JoshFinlayAU/cgdns/internal/cache"
 	"github.com/JoshFinlayAU/cgdns/internal/config"
@@ -385,10 +386,27 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		doh *transport.DoH
 		doq *transport.DoQ
 	)
+	acmeMetrics := &acme.Metrics{}
+	var certManager *acme.Manager
 	if len(cfg.Listen.DoT) > 0 || len(cfg.Listen.DoH) > 0 || len(cfg.Listen.DoQ) > 0 {
-		tlsCfg, err := loadTLS(cfg.Listen.TLS)
-		if err != nil {
-			return err
+		var tlsCfg *tls.Config
+		if cfg.ACME.Enabled {
+			certManager, err = buildACME(cfg, log, acmeMetrics)
+			if err != nil {
+				return err
+			}
+			// GetCertificate rather than a fixed certificate, so a renewal is
+			// picked up by the next handshake without restarting a listener.
+			tlsCfg = &tls.Config{
+				GetCertificate: certManager.GetCertificate,
+				MinVersion:     minTLSVersion(cfg.Listen.TLS.MinVersion),
+				NextProtos:     []string{"h2", "http/1.1", "dot"},
+			}
+		} else {
+			tlsCfg, err = loadTLS(cfg.Listen.TLS)
+			if err != nil {
+				return err
+			}
 		}
 		if len(cfg.Listen.DoT) > 0 {
 			dot, err = transport.NewTCP(transport.TCPOptions{
@@ -494,7 +512,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	}
 
 	reg := metrics.NewRegistry()
-	registerMetrics(reg, txMetrics, resMetrics, rrCache)
+	registerMetrics(reg, txMetrics, resMetrics, rrCache, acmeMetrics)
 	if classifier != nil {
 		registerPolicyMetrics(reg, polMetrics, classifier, registry)
 	}
@@ -680,6 +698,17 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 					limiter.Sweep(now)
 				}
 			}
+		}()
+	}
+
+	if certManager != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Run never returns an error: a CA that cannot be reached is a
+			// reason to retry, not a reason to stop resolving on the
+			// certificate already held.
+			_ = certManager.Run(ctx, cfg.ACME.CheckInterval)
 		}()
 	}
 
@@ -1045,15 +1074,86 @@ func registerPeerMetrics(reg *metrics.Registry, m *peer.Metrics, c *peer.Client,
 }
 
 // loadTLS builds the TLS configuration for the encrypted transports.
+// minTLSVersion maps the configured minimum. 1.3 unless an operator has a
+// client old enough to need otherwise.
+func minTLSVersion(v string) uint16 {
+	if v == "1.2" {
+		return tls.VersionTLS12
+	}
+	return tls.VersionTLS13
+}
+
+// buildACME assembles the certificate manager and picks the challenge type.
+//
+// dns-01 whenever a provider is configured, because it opens nothing. http-01
+// otherwise, binding its port only for the duration of each challenge.
+func buildACME(cfg config.Config, log *slog.Logger, m *acme.Metrics) (*acme.Manager, error) {
+	var solver acme.Solver
+	switch cfg.ACME.DNS01.Provider {
+	case "cloudflare":
+		raw, err := os.ReadFile(cfg.ACME.DNS01.APITokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading the acme dns-01 token: %w", err)
+		}
+		solver = &acme.DNS01{
+			Provider: &acme.Cloudflare{
+				Token:  strings.TrimSpace(string(raw)),
+				ZoneID: cfg.ACME.DNS01.ZoneID,
+			},
+			PropagationTimeout: cfg.ACME.DNS01.PropagationTimeout,
+			Resolvers:          cfg.ACME.DNS01.Resolvers,
+			Log:                log,
+		}
+	default:
+		addrs := cfg.ACME.HTTP01.Listen
+		if len(addrs) == 0 {
+			addrs = defaultChallengeAddrs(cfg)
+		}
+		solver = &acme.HTTP01{Addrs: addrs, Timeout: cfg.ACME.HTTP01.Timeout, Log: log}
+	}
+
+	return acme.New(acme.Options{
+		Domains:        cfg.ACME.Domains,
+		Email:          cfg.ACME.Email,
+		DirectoryURL:   cfg.ACME.DirectoryURL,
+		CertFile:       cfg.Listen.TLS.CertFile,
+		KeyFile:        cfg.Listen.TLS.KeyFile,
+		AccountKeyFile: cfg.ACME.AccountKeyFile,
+		RenewBefore:    cfg.ACME.RenewBefore,
+		Solver:         solver,
+		Log:            log,
+		Metrics:        m,
+	})
+}
+
+// defaultChallengeAddrs puts the http-01 responder on port 80 of every address
+// already serving an encrypted transport, since those are the addresses the
+// name resolves to and therefore the ones the CA will connect to.
+func defaultChallengeAddrs(cfg config.Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, group := range [][]string{cfg.Listen.DoT, cfg.Listen.DoH, cfg.Listen.DoQ} {
+		for _, a := range group {
+			host, _, err := net.SplitHostPort(a)
+			if err != nil {
+				continue
+			}
+			addr := net.JoinHostPort(host, "80")
+			if !seen[addr] {
+				seen[addr] = true
+				out = append(out, addr)
+			}
+		}
+	}
+	return out
+}
+
 func loadTLS(t config.TLS) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("loading TLS keypair: %w", err)
 	}
-	min := uint16(tls.VersionTLS13)
-	if t.MinVersion == "1.2" {
-		min = tls.VersionTLS12
-	}
+	min := minTLSVersion(t.MinVersion)
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   min,
@@ -1161,12 +1261,19 @@ func metricsServer(cfg config.Config, reg *metrics.Registry, log *slog.Logger) (
 	}, nil
 }
 
-func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver.Metrics, c *cache.Cache) {
+func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver.Metrics, c *cache.Cache, acmeMetrics *acme.Metrics) {
 	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	i64 := func(f func() int64) func() float64 {
 		return func() float64 { return float64(f()) }
 	}
 	reg.Register(
 		metrics.Source{Name: "cgdns_queries_total", Help: "DNS queries received.", Kind: metrics.Counter, Read: u64(tx.Queries.Load)},
+		metrics.Source{Name: "cgdns_acme_renewals_total", Help: "Certificates successfully issued or renewed.", Kind: metrics.Counter, Read: u64(acmeMetrics.Renewals.Load)},
+		metrics.Source{Name: "cgdns_acme_failures_total", Help: "Failed certificate orders. Sustained non-zero means the certificate will eventually expire.", Kind: metrics.Counter, Read: u64(acmeMetrics.Failures.Load)},
+		metrics.Source{Name: "cgdns_acme_cert_not_after", Help: "Expiry of the certificate in use, as a Unix timestamp. Alert on this approaching, not on the renewal count.", Kind: metrics.Gauge, Read: i64(acmeMetrics.NotAfter.Load)},
+		metrics.Source{Name: "cgdns_acme_challenge_seconds", Help: "How long the http-01 port was open during the last challenge. It is the exposure window.", Kind: metrics.Gauge, Read: i64(acmeMetrics.ChallengeSeconds.Load)},
 		metrics.Source{Name: "cgdns_query_parse_errors_total", Help: "Queries dropped as malformed.", Kind: metrics.Counter, Read: u64(tx.ParseErrors.Load)},
 		metrics.Source{Name: "cgdns_query_dropped_total", Help: "Queries dropped due to overload or an expired budget.", Kind: metrics.Counter, Read: u64(tx.Dropped.Load)},
 		metrics.Source{Name: "cgdns_handler_panics_total", Help: "Panics recovered at the transport boundary.", Kind: metrics.Counter, Read: u64(tx.Panics.Load)},

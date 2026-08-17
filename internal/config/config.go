@@ -33,6 +33,7 @@ type Config struct {
 	Peer       Peer       `yaml:"peer"`
 	Health     Health     `yaml:"health"`
 	RouteAgent RouteAgent `yaml:"route_agent"`
+	ACME       ACME       `yaml:"acme"`
 	Management Management `yaml:"management"`
 	Metrics    Metrics    `yaml:"metrics"`
 	Log        Log        `yaml:"log"`
@@ -541,6 +542,64 @@ type TLS struct {
 	MinVersion string `yaml:"min_version"`
 }
 
+// ACME obtains and renews the certificate the encrypted transports present.
+//
+// It writes to listen.tls.cert_file and listen.tls.key_file, so the listeners
+// and the renewal agree on where the certificate lives by construction rather
+// than by an operator remembering to keep two settings in step.
+type ACME struct {
+	Enabled bool `yaml:"enabled"`
+	// Domains the certificate must cover. The first becomes the common name,
+	// and every one of them must resolve to this node.
+	Domains []string `yaml:"domains"`
+	// Email is the CA account contact. It is where expiry warnings go, which
+	// is the backstop for renewal failing quietly.
+	Email string `yaml:"email"`
+	// DirectoryURL defaults to Let's Encrypt production. Point it at a staging
+	// endpoint while testing: the production rate limits are unforgiving and
+	// are counted per registered domain, not per attempt.
+	DirectoryURL string `yaml:"directory_url"`
+	// AccountKeyFile holds the ACME account identity across restarts.
+	AccountKeyFile string `yaml:"account_key_file"`
+	// RenewBefore is how long ahead of expiry to renew. Default 30 days.
+	RenewBefore time.Duration `yaml:"renew_before"`
+	// CheckInterval is how often expiry is reconsidered. Default 12h.
+	CheckInterval time.Duration `yaml:"check_interval"`
+
+	HTTP01 ACMEHTTP01 `yaml:"http01"`
+	DNS01  ACMEDNS01  `yaml:"dns01"`
+}
+
+// ACMEHTTP01 configures the http-01 challenge, which is the default.
+type ACMEHTTP01 struct {
+	// Listen are bound only while a challenge is outstanding and closed the
+	// moment it finishes. Defaults to port 80 on each address that serves an
+	// encrypted transport, because the CA validates against the name's own
+	// addresses.
+	Listen []string `yaml:"listen"`
+	// Timeout caps how long the port may stay open regardless of the CA.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// ACMEDNS01 configures the dns-01 challenge, which is used whenever a provider
+// is set. It opens no port at all, so it is preferred where it is available.
+type ACMEDNS01 struct {
+	// Provider names the DNS API. Empty means dns-01 is not configured and
+	// http-01 is used instead.
+	Provider string `yaml:"provider"`
+	// APITokenFile holds the credential. A file rather than an inline value so
+	// the token never sits in a config that gets copied between nodes or
+	// pasted into a ticket.
+	APITokenFile string `yaml:"api_token_file"`
+	// ZoneID skips the zone lookup when the API needs one.
+	ZoneID string `yaml:"zone_id"`
+	// PropagationTimeout bounds the wait for the record to become answerable.
+	PropagationTimeout time.Duration `yaml:"propagation_timeout"`
+	// Resolvers are asked to confirm the record is live before the challenge
+	// is accepted. The zone's authoritative servers are the right answer.
+	Resolvers []string `yaml:"resolvers"`
+}
+
 // Metrics configures the Prometheus endpoint.
 //
 // Same reasoning as Management: /metrics leaks subscriber-adjacent operational
@@ -718,6 +777,33 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf(format, args...))
 	}
 
+	if c.ACME.Enabled {
+		if len(c.Listen.DoT) == 0 && len(c.Listen.DoH) == 0 && len(c.Listen.DoQ) == 0 {
+			bad("acme.enabled is set but no encrypted transport is configured, so there is nothing for a certificate to serve")
+		}
+		if len(c.ACME.Domains) == 0 {
+			bad("acme.domains is required: the certificate has to name something, and every name must resolve to this node")
+		}
+		if c.Listen.TLS.CertFile == "" || c.Listen.TLS.KeyFile == "" {
+			bad("acme needs listen.tls.cert_file and listen.tls.key_file: they are where it writes")
+		}
+		if c.ACME.AccountKeyFile == "" {
+			bad("acme.account_key_file is required: the account is the identity the CA rate-limits, and regenerating it each restart loses that history")
+		}
+		switch c.ACME.DNS01.Provider {
+		case "":
+			// http-01 it is. The port opens per challenge and closes after.
+		case "cloudflare":
+			if c.ACME.DNS01.APITokenFile == "" {
+				bad("acme.dns01.api_token_file is required for the cloudflare provider")
+			} else if _, err := os.Stat(c.ACME.DNS01.APITokenFile); err != nil {
+				bad("acme.dns01.api_token_file %q is not readable: %v", c.ACME.DNS01.APITokenFile, err)
+			}
+		default:
+			bad("acme.dns01.provider %q is not supported; leave it empty to use http-01", c.ACME.DNS01.Provider)
+		}
+	}
+
 	if c.Node.ID == "" {
 		bad("node.id is required and must differ from the sibling's: it identifies this node on the pair link and breaks ties between concurrent control-plane writes")
 	}
@@ -740,7 +826,9 @@ func (c *Config) Validate() error {
 	if len(c.Listen.DoT) > 0 || len(c.Listen.DoH) > 0 || len(c.Listen.DoQ) > 0 {
 		if c.Listen.TLS.CertFile == "" || c.Listen.TLS.KeyFile == "" {
 			bad("listen.tls.cert_file and listen.tls.key_file are required when listen.dot, listen.doh or listen.doq is set")
-		} else {
+		} else if !c.ACME.Enabled {
+			// With ACME on, these are what it writes, so a fresh node has not
+			// got them yet and must still be allowed to start.
 			for _, f := range []string{c.Listen.TLS.CertFile, c.Listen.TLS.KeyFile} {
 				if _, err := os.Stat(f); err != nil {
 					bad("listen.tls: %q is not readable: %v", f, err)

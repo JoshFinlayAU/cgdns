@@ -96,6 +96,33 @@ Installed routes carry a metric below any static fallback, so a learned default 
 
 It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and the process answering internet queries should not also be able to reconfigure the network. Its unit grants that capability and nothing else - not even the `CAP_NET_BIND_SERVICE` the resolver has.
 
+**Certificates** - the encrypted transports need a certificate a subscriber's
+device trusts, and renewing that by hand is a scheduled outage: the failure is
+silent until the day it expires, then every encrypted client stops resolving at
+once. cgdns runs ACME itself, writing to the same `listen.tls` paths the
+listeners read, so the two cannot drift apart. Renewal is picked up through
+`GetCertificate` on the next handshake - no restart, no dropped connection.
+
+**http-01 is the default and its port is not left open.** The listener binds when
+a challenge starts and closes the moment it finishes, typically about fifteen
+seconds a quarter; `cgdns_acme_challenge_seconds` records the last exposure
+window. A resolver's addresses are reachable by every subscriber and, through
+the covering prefix, by the internet, so a web server left running all year to
+serve one file for a few seconds is attack surface bought for nothing. The
+responder serves exactly one path and 404s everything else, and it closes on its
+own timeout even if the CA never comes back.
+
+**dns-01 is used instead whenever a provider is configured**, because it opens
+nothing at all. It is also the only option where port 80 is unreachable, or
+where the name is anycast from several POPs and the CA would validate against
+whichever is nearest it rather than the one being issued for. Cloudflare is
+implemented; the credential is read from a file rather than the config so it does
+not travel with a config that gets copied between nodes.
+
+A certificate no public CA vouches for is treated as needing replacement even if
+it is valid for years and names the right hosts - that is exactly what an interim
+self-signed placeholder looks like, and nothing else would ever replace it.
+
 **Anycast health** - the node owns the decision on whether it belongs in the anycast set, and drives GoBGP (it just made sense.. go project.. gRPC..) over its gRPC API. `gobgpd` runs as a separate unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a resolver restart does not drop the session. Checks run through the real serving path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays on stable serving time rather than on recovery. SIGTERM withdraws before the
 listeners stop, so a planned restart moves traffic away first.
 

@@ -212,6 +212,54 @@ holds a learned route in its RIB and never puts it in the forwarding table.
 default that wins without a matching preferred source silently moves the node's
 egress address somewhere else.
 
+## 3a. Certificates for the encrypted transports
+
+DoT, DoH and DoQ need a certificate a subscriber device trusts. cgdns obtains and
+renews it itself:
+
+```yaml
+acme:
+  enabled: true
+  domains: ["dns1.as135559.net.au"]     # every name must resolve to this node
+  email: "noc@example.net"              # where the CA sends expiry warnings
+  account_key_file: /var/lib/cgdns/acme-account.key
+  renew_before: 720h
+  check_interval: 12h
+  http01:
+    timeout: 2m
+```
+
+It writes to `listen.tls.cert_file` and `listen.tls.key_file`, so **those must be
+somewhere the daemon can write** — under its state directory, not `/etc`. The
+daemon runs unprivileged; `/etc/cgdns/tls` is root-owned and it cannot create a
+file there. This is checked at startup rather than after an order, because
+discovering it later wastes an issuance against a rate limit that takes a week
+to recover.
+
+Forward records must exist before the first order. A PTR is not enough — the CA
+resolves the name.
+
+**http-01 runs by default and opens nothing permanently.** The port binds for the
+challenge and closes immediately after, about fifteen seconds per renewal.
+
+**dns-01 replaces it whenever a provider is set**, and opens no port at all:
+
+```yaml
+  dns01:
+    provider: cloudflare
+    api_token_file: /etc/cgdns/acme-dns01.token   # Zone:Read + DNS:Edit, nothing more
+    propagation_timeout: 2m
+    resolvers: ["1.1.1.1:53"]                     # confirm the record is live first
+```
+
+Prefer dns-01 where the zone's API is available: it needs no inbound reachability
+at all, and it is the only workable option once the same name is anycast from
+several POPs, since the CA would otherwise validate against whichever POP is
+nearest it rather than the one asking.
+
+Point `directory_url` at Let's Encrypt staging while testing. Production rate
+limits are counted per registered domain, not per attempt.
+
 ## 4. The PE
 
 A session per node per family, originating a default and accepting only the
