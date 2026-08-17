@@ -42,6 +42,7 @@ type Metrics struct {
 type Inner interface {
 	Get(k cache.Key) (cache.Entry, bool)
 	PutRRset(k cache.Key, rrs []dns.RR, authenticated bool)
+	PutValidated(k cache.Key, rrs []dns.RR, authenticated bool)
 	PutNegative(k cache.Key, rcode int, soa []dns.RR, ttl time.Duration, authenticated bool)
 }
 
@@ -141,6 +142,11 @@ func (c *Cache) Get(k cache.Key) (cache.Entry, bool) {
 // PutRRset stores a positive answer.
 func (c *Cache) PutRRset(k cache.Key, rrs []dns.RR, authenticated bool) {
 	c.inner.PutRRset(k, rrs, authenticated)
+}
+
+// PutValidated caches an answer whose DNSSEC status has been decided.
+func (c *Cache) PutValidated(k cache.Key, rrs []dns.RR, authenticated bool) {
+	c.inner.PutValidated(k, rrs, authenticated)
 }
 
 // PutNegative stores a denial.

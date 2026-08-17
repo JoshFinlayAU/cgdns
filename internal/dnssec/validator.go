@@ -231,7 +231,7 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 
 	keys, sigs, _, err := v.fetch.FetchSigned(ctx, zone, dns.TypeDNSKEY)
 	if err != nil {
-		return nil, StatusBogus, fmt.Errorf("fetching DNSKEY for %s: %w", zone, err)
+		return nil, StatusIndeterminate, fmt.Errorf("%w: fetching DNSKEY for %s: %w", ErrEvidenceUnavailable, zone, err)
 	}
 	dnskeys := make([]*dns.DNSKEY, 0, len(keys))
 	for _, rr := range keys {
@@ -291,7 +291,7 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 
 	rrs, sigs, denial, err := v.fetch.FetchSigned(ctx, zone, dns.TypeDS)
 	if err != nil {
-		return nil, StatusBogus, fmt.Errorf("fetching DS for %s: %w", zone, err)
+		return nil, StatusIndeterminate, fmt.Errorf("%w: fetching DS for %s: %w", ErrEvidenceUnavailable, zone, err)
 	}
 
 	dsSet := make([]*dns.DS, 0, len(rrs))
@@ -432,6 +432,8 @@ func parentZone(zone string) string {
 // learns why validation failed rather than just that it did.
 func ExtendedError(err error) uint16 {
 	switch {
+	case errors.Is(err, ErrEvidenceUnavailable):
+		return dns.ExtendedErrorCodeNoReachableAuthority
 	case errors.Is(err, ErrSignatureExpired):
 		return dns.ExtendedErrorCodeSignatureExpired
 	case errors.Is(err, ErrSignatureFailed):

@@ -54,6 +54,10 @@ type RecursiveMetrics struct {
 	Secure           atomic.Uint64
 	Insecure         atomic.Uint64
 	Bogus            atomic.Uint64
+	// ValidationUnavailable counts answers withheld because the records needed
+	// to judge the chain could not be fetched. Kept apart from Bogus: one means
+	// a zone is broken or forged, the other means this node could not see.
+	ValidationUnavailable atomic.Uint64
 	// SynthesisedDenials counts NXDOMAINs answered from a cached NSEC proof
 	// rather than by asking the authoritative (RFC 8198).
 	SynthesisedDenials atomic.Uint64
@@ -252,7 +256,7 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 		case dnssec.StatusSecure:
 			r.opts.Metrics.Secure.Add(1)
 			if len(res.answer) > 0 {
-				r.opts.Cache.PutRRset(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET), res.answer, true)
+				r.opts.Cache.PutValidated(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET), res.answer, true)
 			} else {
 				// Re-cache the denial as authenticated, exactly as a validated
 				// answer is. Negative caching keeps only the SOA (RFC 2308), so
@@ -267,8 +271,23 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 				// does not exist.
 				r.opts.NSEC.Put(res.authority, time.Now())
 			}
+		case dnssec.StatusIndeterminate:
+			// Serving the answer here would hand back data whose chain nobody
+			// checked, so it is withheld — but reported as the reachability
+			// failure it is, not as a verdict on the zone.
+			r.opts.Metrics.ValidationUnavailable.Add(1)
+			r.opts.Log.Warn("DNSSEC evidence unavailable",
+				slog.String("qname", privacy.Redact(q.Name)),
+				slog.String("qtype", dns.TypeToString[q.Qtype]),
+				slog.String("err", verr.Error()))
+			return servfail(req.Msg, dnssec.ExtendedError(verr), verr.Error())
 		default:
 			r.opts.Metrics.Insecure.Add(1)
+			// Recorded as validated so an unsigned zone is not re-walked on
+			// every hit; authenticated stays false, so AD is never set.
+			if len(res.answer) > 0 {
+				r.opts.Cache.PutValidated(cache.NewKey(dns.CanonicalName(q.Name), q.Qtype, dns.ClassINET), res.answer, false)
+			}
 		}
 		res.secure = status
 	}
@@ -318,32 +337,71 @@ func (r *Recursive) validateResult(ctx context.Context, res *result, qname strin
 
 // validate builds the chain for an answer and verifies it.
 //
-// An answer with no signatures is acceptable only where the zone is provably
-// unsigned; otherwise it is a stripped-signature attack and must be Bogus.
+// Each RRset is validated against the keys of the zone that signed it, not
+// against one zone chosen for the whole answer (RFC 4035 §5.3.1). A CNAME chain
+// is the case that forces this: www.example.com may be a CNAME signed by
+// example.com pointing into a wholly different zone that signs the address
+// records itself, and verifying either set with the other's keys fails.
+//
+// The answer is only as trustworthy as its weakest link, so any set that fails
+// makes the answer Bogus and any set that lands in a provably unsigned zone
+// makes it Insecure. An answer with no signatures at all is acceptable only
+// where the zone is provably unsigned; otherwise it is a stripped-signature
+// attack.
 func (r *Recursive) validate(ctx context.Context, res *result) (dnssec.Status, error) {
 	if len(res.answer) == 0 {
 		return dnssec.StatusInsecure, nil
 	}
 
-	zone := dns.CanonicalName(res.answer[0].Header().Name)
-	if len(res.sigs) > 0 {
-		zone = dns.CanonicalName(res.sigs[0].SignerName)
+	sets, _ := groupBySet(res.answer)
+	if len(sets) == 0 {
+		return dnssec.StatusInsecure, nil
 	}
 
-	keys, status, err := r.opts.Validator.TrustedKeys(ctx, zone)
-	if err != nil {
-		return status, err
+	worst := dnssec.StatusSecure
+	for id, rrs := range sets {
+		sigs := sigsForSet(res.sigs, id)
+
+		zone := id.name
+		if len(sigs) > 0 {
+			zone = dns.CanonicalName(sigs[0].SignerName)
+		}
+
+		keys, status, err := r.opts.Validator.TrustedKeys(ctx, zone)
+		if err != nil {
+			return status, err
+		}
+		if status != dnssec.StatusSecure {
+			worst = downgrade(worst, status)
+			continue
+		}
+		if len(sigs) == 0 {
+			return dnssec.StatusBogus, dnssec.ErrNoSignatures
+		}
+		if _, err := r.opts.Validator.VerifyRRset(rrs, sigs, keys); err != nil {
+			return dnssec.StatusBogus, err
+		}
 	}
-	if status != dnssec.StatusSecure {
-		return status, nil
+	return worst, nil
+}
+
+// sigsForSet picks the signatures covering one RRset.
+func sigsForSet(sigs []*dns.RRSIG, id setID) []*dns.RRSIG {
+	var out []*dns.RRSIG
+	for _, sig := range sigs {
+		if sig.TypeCovered == id.rtype && dns.CanonicalName(sig.Hdr.Name) == id.name {
+			out = append(out, sig)
+		}
 	}
-	if len(res.sigs) == 0 {
-		return dnssec.StatusBogus, dnssec.ErrNoSignatures
+	return out
+}
+
+// downgrade keeps the least trustworthy status seen so far.
+func downgrade(current, next dnssec.Status) dnssec.Status {
+	if next == dnssec.StatusSecure {
+		return current
 	}
-	if _, err := r.opts.Validator.VerifyRRset(res.answer, res.sigs, keys); err != nil {
-		return dnssec.StatusBogus, err
-	}
-	return dnssec.StatusSecure, nil
+	return next
 }
 
 // FetchSigned implements dnssec.Fetcher, letting the validator pull DNSKEY and
@@ -389,13 +447,27 @@ func (r *Recursive) resolve(ctx context.Context, qname string, qtype uint16, st 
 	// and reading it here would answer from the very entry being renewed.
 	skipCache := isRefresh(ctx) && st.outbound == 0
 
-	if entry, ok := r.opts.Cache.Get(cache.NewKey(qname, qtype, dns.ClassINET)); ok && !skipCache {
+	// An entry the delegation walk stored on its way past has never been
+	// validated, and carries no signatures to validate it with now. Serving it
+	// would either fail for want of evidence or hand back an answer whose chain
+	// nobody checked, so it is passed over and the name resolved again — which
+	// costs one walk and yields signatures, after which the entry is marked and
+	// every later hit is cheap.
+	unvalidated := false
+	if entry, ok := r.opts.Cache.Get(cache.NewKey(qname, qtype, dns.ClassINET)); ok && r.opts.Validator != nil && !entry.Validated {
+		unvalidated = true
+	}
+
+	if entry, ok := r.opts.Cache.Get(cache.NewKey(qname, qtype, dns.ClassINET)); ok && !skipCache && !unvalidated {
 		now := time.Now()
 		res := &result{rcode: entry.Rcode}
-		if entry.Authenticated {
+		switch {
+		case entry.Authenticated:
 			// Validated once on insert; re-verifying on every hit would put
 			// public-key cryptography on the hot path for no added assurance.
 			res.secure = dnssec.StatusSecure
+		case entry.Validated:
+			res.secure = dnssec.StatusInsecure
 		}
 		switch entry.Kind {
 		case cache.KindAnswer:

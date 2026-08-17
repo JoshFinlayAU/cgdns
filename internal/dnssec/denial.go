@@ -18,6 +18,13 @@ import (
 var (
 	// ErrNoProof means the supplied records do not establish the denial.
 	ErrNoProof = errors.New("dnssec: denial of existence not proven")
+
+	// ErrEvidenceUnavailable means the records needed to decide the chain could
+	// not be fetched — the authoritative was unreachable, or the query ran out
+	// of budget. It is not a verdict on the zone: reporting it as Bogus would
+	// tell an operator their signing is broken when the truth is that this node
+	// could not see far enough to judge.
+	ErrEvidenceUnavailable = errors.New("dnssec: evidence for validation could not be fetched")
 	// ErrProofUnsupported means the proof uses parameters we refuse.
 	ErrProofUnsupported = errors.New("dnssec: unsupported denial parameters")
 )

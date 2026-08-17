@@ -1213,6 +1213,7 @@ func registerRecursiveMetrics(reg *metrics.Registry, m *resolver.RecursiveMetric
 		metrics.Source{Name: "cgdns_dnssec_insecure_total", Help: "Answers from provably unsigned zones.", Kind: metrics.Counter, Read: u64(m.Insecure.Load)},
 		// A rising bogus rate is either a broken zone or an attack in progress.
 		metrics.Source{Name: "cgdns_dnssec_bogus_total", Help: "Answers rejected because DNSSEC validation failed.", Kind: metrics.Counter, Read: u64(m.Bogus.Load)},
+		metrics.Source{Name: "cgdns_dnssec_unavailable_total", Help: "Answers withheld because the records needed to validate could not be fetched.", Kind: metrics.Counter, Read: u64(m.ValidationUnavailable.Load)},
 		metrics.Source{Name: "cgdns_infra_servers", Help: "Authoritative server addresses tracked in the infrastructure cache.", Kind: metrics.Gauge, Read: func() float64 { return float64(infra.Len()) }},
 	)
 }

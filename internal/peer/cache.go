@@ -75,6 +75,12 @@ func (c *Cache) PutRRset(k cache.Key, rrs []dns.RR, authenticated bool) {
 	c.offer(k)
 }
 
+// PutValidated caches an answer whose DNSSEC status has been decided.
+func (c *Cache) PutValidated(k cache.Key, rrs []dns.RR, authenticated bool) {
+	c.local.PutValidated(k, rrs, authenticated)
+	c.offer(k)
+}
+
 // PutNegative caches a denial locally and offers it to the sibling.
 //
 // Denials are worth sharing: a random-subdomain flood generates far more

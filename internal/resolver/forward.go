@@ -29,6 +29,7 @@ import (
 type Cache interface {
 	Get(k cache.Key) (cache.Entry, bool)
 	PutRRset(k cache.Key, rrs []dns.RR, authenticated bool)
+	PutValidated(k cache.Key, rrs []dns.RR, authenticated bool)
 	PutNegative(k cache.Key, rcode int, soa []dns.RR, ttl time.Duration, authenticated bool)
 }
 

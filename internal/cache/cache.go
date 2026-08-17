@@ -52,6 +52,15 @@ type Entry struct {
 	// Authenticated records whether the DNSSEC chain validated. Nothing else
 	// may set AD on a response.
 	Authenticated bool
+	// Validated records that validation was actually run, as opposed to an
+	// entry the delegation walk stored on its way past.
+	//
+	// The distinction matters because an entry keeps no signatures. Without it,
+	// "not validated yet" and "validated, turned out insecure" look identical,
+	// and a resolver that re-validates the first case fails for want of
+	// evidence the cache never kept — turning one unvalidated insert into a
+	// permanent SERVFAIL for that name.
+	Validated bool
 	// Stored and Expiry are absolute times.
 	Stored time.Time
 	Expiry time.Time
@@ -338,9 +347,13 @@ func (c *Cache) Put(k Key, e Entry, ttl time.Duration) {
 	}
 }
 
-// PutRRset caches a positive answer, deriving the TTL from the smallest TTL in
-// the set — an RRset is only as fresh as its shortest-lived record.
-func (c *Cache) PutRRset(k Key, rrs []dns.RR, authenticated bool) {
+// PutValidated caches an answer whose DNSSEC status has been decided, secure
+// or insecure. Only this path may mark an entry as validated.
+func (c *Cache) PutValidated(k Key, rrs []dns.RR, authenticated bool) {
+	c.putRRset(k, rrs, authenticated, true)
+}
+
+func (c *Cache) putRRset(k Key, rrs []dns.RR, authenticated, validated bool) {
 	if len(rrs) == 0 {
 		return
 	}
@@ -355,7 +368,14 @@ func (c *Cache) PutRRset(k Key, rrs []dns.RR, authenticated bool) {
 		Kind:          KindAnswer,
 		Rcode:         dns.RcodeSuccess,
 		Authenticated: authenticated,
+		Validated:     validated,
 	}, time.Duration(min)*time.Second)
+}
+
+// PutRRset caches a positive answer, deriving the TTL from the smallest TTL in
+// the set — an RRset is only as fresh as its shortest-lived record.
+func (c *Cache) PutRRset(k Key, rrs []dns.RR, authenticated bool) {
+	c.putRRset(k, rrs, authenticated, false)
 }
 
 // PutNegative caches a denial. ttl is the resolved RFC 2308 §5 negative TTL.

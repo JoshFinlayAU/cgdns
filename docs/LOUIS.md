@@ -124,9 +124,15 @@ benchmark / fuzz functions.
 
 ## 1. The shape of the thing
 
-cgdns is a recursive DNS resolver for a carrier network. One long-running daemon
-(`cgdns`), one operator CLI (`cgdnsctl`), one YAML config file, one management
-REST API that the CLI and the embedded operator console both sit on.
+cgdns is a recursive DNS resolver for a carrier network. Two daemons — `cgdns`,
+which answers queries, and `cgdns-routed`, which installs learned routes — one
+operator CLI (`cgdnsctl`), one YAML config file shared by all three, and one
+management REST API that the CLI and the embedded operator console both sit on.
+
+The split between the two daemons is a privilege boundary, not a packaging
+accident: installing routes needs `CAP_NET_ADMIN`, and **the process answering
+queries from the internet must not also be able to reconfigure the network**
+(§4.9).
 
 It is deployed as **two independent nodes per POP**. There are **two anycast
 service addresses** — the ns1 address and the ns2 address, which is what a
@@ -512,6 +518,7 @@ gives us.
 | `golang.org/x/sys` | `SO_REUSEPORT` | |
 | `golang.org/x/term` | Password prompt in `cgdnsctl` | So a password is never a shell argument |
 | `quic-go/quic-go` | QUIC transport for DoQ (§9.5) | Go has no QUIC in the standard library; this is the only mature pure-Go implementation |
+| `vishvananda/netlink` | Kernel route installation in `cgdns-routed` (§4.9) | Netlink is the only sane way to install a route from Go; the alternative is shelling out to `ip route`, which the project forbids for the same reason it forbids `vtysh` |
 | `google.golang.org/grpc` | Transport for the gobgp client | |
 | `gopkg.in/yaml.v3` | Config parsing | Needed for `KnownFields(true)` — §14.1 |
 
