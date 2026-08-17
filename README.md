@@ -53,7 +53,14 @@ The anycast0 dummy interface was a trial by fire decision that was settled on to
 
 **Recursion** - delegation walk from the root. QNAME minimisation (RFC 9156) and 0x20 mixed-case encoding on by default, both with config escape hatches. Strict jurisdiction checking: out-of-jurisdiction glue is discarded, and a referral must stay inside the referring zone *and* move toward the QNAME. Forwarding mode is available behind the same interface. Per-nameserver RTT and health drive server selection.
 
-**DNSSEC validation** - full chain of trust with IANA root anchors embedded. NSEC and NSEC3 denial of existence, NSEC3 iteration limits per RFC 9276. A broken chain is SERVFAIL with an RFC 8914 extended error; there is no silent downgrade. A stripped DS is *bogus*, not insecure - an unproven insecure delegation is a downgrade attack. `AD` is set only on a chain verified locally.
+**DNSSEC validation** - full chain of trust with IANA root anchors embedded. NSEC and NSEC3 denial of existence, NSEC3 iteration limits per RFC 9276. A broken chain is SERVFAIL with an RFC 8914 extended error; there is no silent downgrade. A stripped DS is *bogus*, not insecure - an unproven insecure delegation is a downgrade attack. `AD` is set only on a chain verified locally. Each RRset is verified against the
+keys of the zone that signed it, not against one zone chosen for the whole
+answer, so a CNAME that crosses a zone boundary validates on both sides of the
+cut. A cached record keeps no signatures and is therefore never re-judged: the
+cache records whether a chain was decided, so an entry the delegation walk
+stored on its way past is resolved again rather than failed on. A DNSKEY or DS
+that could not be fetched is reported as unreachable, not as a bogus zone - the
+answer is still withheld, but the extended error names the real fault.
 
 **Transports** - UDP, TCP, DoT (RFC 7858), DoH (RFC 8484 over HTTP/2), DoQ (RFC 9250). All dual-stack. DoQ shares port 853 with DoT but not the socket - one is TCP, the other UDP - and gives every query its own stream, so a slow answer no longer stalls the ones behind it the way it does on a shared DoT connection. Measured on a dev node: 40 concurrent queries on one connection in 180 ms. It wants a larger UDP receive buffer than the kernel default; raise `net.core.rmem_max` and `net.core.wmem_max` or the QUIC stack will log that it could not. Message IDs must be zero (a stream carries exactly one exchange, so there is nothing to correlate) and `edns-tcp-keepalive` is refused, both per RFC 9250; 0-RTT is left off, since its data is replayable and a resolver would take on that problem to save a round trip. UDP uses `SO_REUSEPORT` per-address sockets so replies leave with the correct anycast source. DoH ignores forwarding headers unless the peer is a configured trusted proxy, because the client address selects subscriber policy.
 
@@ -263,6 +270,7 @@ series worth alerting on:
 | `cgdns_anycast_advertised` | 1 when this node is taking traffic |
 | `cgdns_anycast_flaps_total` | rising means dampening is escalating |
 | `cgdns_dnssec_bogus_total` | broken zone, or an attack |
+| `cgdns_dnssec_unavailable_total` | a chain could not be judged because a DNSKEY or DS was unreachable — a reachability problem here, not a signing problem at the zone |
 | `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
 | `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
