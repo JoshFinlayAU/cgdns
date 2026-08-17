@@ -22,6 +22,12 @@ import (
 // curated elsewhere and will eventually ship something malformed; when that
 // happens filtering must go stale, never resolution.
 type Publisher struct {
+	// refresh carries a request to recompile without the store having moved.
+	refresh chan struct{}
+	// feedPath resolves a feed name to the file the fetcher wrote, for records
+	// that name no file of their own.
+	feedPath func(string) string
+
 	store      *Store
 	classifier *subscriber.Classifier
 	registry   *policy.Registry
@@ -33,7 +39,9 @@ type Publisher struct {
 
 // PublisherOptions configures a Publisher.
 type PublisherOptions struct {
-	Store      *Store
+	Store *Store
+	// FeedPath resolves a feed name to locally fetched content.
+	FeedPath   func(string) string
 	Classifier *subscriber.Classifier
 	Registry   *policy.Registry
 	Log        *slog.Logger
@@ -49,6 +57,8 @@ func NewPublisher(opts PublisherOptions) *Publisher {
 		classifier: opts.Classifier,
 		registry:   opts.Registry,
 		log:        opts.Log,
+		refresh:    make(chan struct{}, 1),
+		feedPath:   opts.FeedPath,
 	}
 }
 
@@ -60,21 +70,53 @@ func (p *Publisher) Run(ctx context.Context) {
 		close(stop)
 	}()
 
-	var known uint64
+	// A store change and a feed refresh both mean "recompile", but only the
+	// first moves the version. Watching the store in its own goroutine lets one
+	// loop serve both without either having to poll.
+	changes := make(chan uint64, 1)
+	go func() {
+		var known uint64
+		for {
+			version := p.store.WaitForChange(known, stop)
+			if ctx.Err() != nil {
+				return
+			}
+			if version == known {
+				continue
+			}
+			known = version
+			select {
+			case changes <- version:
+			default:
+			}
+		}
+	}()
+
 	// Publish once up front so a node that just loaded its store from disk
 	// serves that policy without waiting for the next write.
 	p.publish()
 
 	for {
-		version := p.store.WaitForChange(known, stop)
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		case <-changes:
+			p.publish()
+		case <-p.refresh:
+			p.publish()
 		}
-		if version == known {
-			continue
-		}
-		known = version
-		p.publish()
+	}
+}
+
+// Republish recompiles and swaps in the current state.
+//
+// It exists because feed content can change without the control store moving:
+// the record naming a feed is unchanged, but the file behind it now holds
+// different rules. It never blocks — a refresh already queued is enough.
+func (p *Publisher) Republish() {
+	select {
+	case p.refresh <- struct{}{}:
+	default:
 	}
 }
 
@@ -96,7 +138,7 @@ func (p *Publisher) publish() {
 		return
 	}
 
-	policies, warnings, err := compilePolicies(state)
+	policies, warnings, err := compilePolicies(state, p.feedPath)
 	if err != nil {
 		p.failures.Add(1)
 		p.log.Error("keeping previous policy; the new one did not compile",
@@ -167,23 +209,28 @@ func compileOverrides(state *State) map[string]*policy.Overrides {
 // A feed whose content this node does not hold is reported and skipped rather
 // than failing the whole rebuild: one unfetched feed must not drop every other
 // class's filtering.
-func compilePolicies(state *State) (map[string]*policy.Policy, []string, error) {
+func compilePolicies(state *State, feedPath func(string) string) (map[string]*policy.Policy, []string, error) {
 	var (
 		specs    []policy.FeedSpec
 		warnings []string
 		usable   = map[string]bool{}
 	)
 	for _, f := range state.Feeds() {
-		if f.File == "" {
+		file := f.File
+		if file == "" && feedPath != nil {
+			// No explicit file, so use whatever the fetcher put on disk for it.
+			file = feedPath(f.Name)
+		}
+		if file == "" {
 			warnings = append(warnings, fmt.Sprintf("feed %q has no local content on this node yet", f.Name))
 			continue
 		}
-		if _, err := os.Stat(f.File); err != nil {
-			warnings = append(warnings, fmt.Sprintf("feed %q content %q is not readable: %v", f.Name, f.File, err))
+		if _, err := os.Stat(file); err != nil {
+			warnings = append(warnings, fmt.Sprintf("feed %q content %q is not readable: %v", f.Name, file, err))
 			continue
 		}
 		specs = append(specs, policy.FeedSpec{
-			Name: f.Name, Format: f.Format, File: f.File, RPZZone: f.RPZZone,
+			Name: f.Name, Format: f.Format, File: file, RPZZone: f.RPZZone,
 		})
 		usable[f.Name] = true
 	}

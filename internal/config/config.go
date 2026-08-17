@@ -280,6 +280,18 @@ type Policy struct {
 	// allow list beats every class feed, which is what lets one customer be
 	// unblocked without editing a shared list.
 	OverridesFile string `yaml:"overrides_file"`
+
+	// FeedDir is where fetched feed content is kept, one file per feed.
+	// Empty puts it under node.state_dir.
+	FeedDir string `yaml:"feed_dir"`
+	// FeedRefreshInterval is how often a feed with a URL is re-fetched. Zero
+	// disables fetching entirely, leaving feeds to be delivered by other means.
+	FeedRefreshInterval time.Duration `yaml:"feed_refresh_interval"`
+	// FeedTimeout bounds one fetch.
+	FeedTimeout time.Duration `yaml:"feed_timeout"`
+	// FeedMaxBytes caps one feed. A source that streamed forever would
+	// otherwise fill the disk of every node subscribed to it.
+	FeedMaxBytes int64 `yaml:"feed_max_bytes"`
 }
 
 // PolicyFeed is one blocklist source.
@@ -561,6 +573,11 @@ func Default() Config {
 		},
 		Subscriber: Subscriber{
 			DefaultClass: "default",
+		},
+		Policy: Policy{
+			FeedRefreshInterval: time.Hour,
+			FeedTimeout:         2 * time.Minute,
+			FeedMaxBytes:        256 << 20,
 		},
 		Control: Control{
 			StoreFile: "/var/lib/cgdns/control.json",
@@ -995,6 +1012,18 @@ func (c *Config) Validate() error {
 		}
 		if c.Resolver.AggressiveNSECMaxRecords < 1 {
 			bad("resolver.aggressive_nsec_max_records_per_zone must be > 0")
+		}
+	}
+
+	if c.Policy.Enabled && c.Policy.FeedRefreshInterval > 0 {
+		if c.Policy.FeedRefreshInterval < time.Minute {
+			bad("policy.feed_refresh_interval must be at least 1m: refetching a blocklist more often than that costs the publisher more than it gains anyone")
+		}
+		if c.Policy.FeedTimeout <= 0 {
+			bad("policy.feed_timeout must be > 0")
+		}
+		if c.Policy.FeedMaxBytes <= 0 {
+			bad("policy.feed_max_bytes must be > 0: an uncapped feed can fill the disk of every node subscribed to it")
 		}
 	}
 

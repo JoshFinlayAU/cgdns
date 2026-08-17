@@ -5,6 +5,72 @@ landed where we did. Written to be picked apart.*
 
 ---
 
+## First, the question everyone opens with: why is there filtering in a carrier resolver?
+
+It is the right thing to challenge, so it goes first rather than at §10 where it
+would look buried.
+
+**It was never an architectural ambition.** Nobody set out to build a content
+filter. Filtering is here because of four separate pressures, and only one of
+them is a product someone chose to sell.
+
+**1. Somebody sells it.** "Filtered DNS", "family safe", "secure business DNS" —
+whatever it ends up called, it gets sold as a value-add, and the resolver is the
+only place it can be implemented. The resolver is the single point that sees
+every subscriber's lookups and can already identify who is asking. Once that sale
+happens, the capability either exists here or it does not exist.
+
+**2. A carrier will, at some point, be required not to resolve something.** Court
+orders, regulator directions, upstream security feeds. That obligation lands on
+the carrier regardless of whether anyone bought a filtering product, and a
+resolver with no mechanism to express it means implementing it somewhere worse —
+in the routing layer, or by standing up separate infrastructure under time
+pressure.
+
+**3. The alternative is two resolver platforms, which is strictly worse.**
+Without filtering here, filtered customers need a second platform: two codebases,
+two config surfaces, two sets of failure modes, subscribers split across them by
+product code, and an incident where the first question is "which platform is this
+customer on". One platform with a per-subscriber ACL is a smaller, safer system
+than two platforms without one.
+
+**4. It is off unless you turn it on.** `policy.enabled: false` and the enforcer
+is not in the handler chain at all — not bypassed per query, not present. A
+deployment that never sells a filtered product pays nothing for this, in
+performance or in complexity.
+
+**So what is it, really?** An ACL with a per-subscriber exception list. That
+framing is the whole answer: it is not a content-inspection system, it does not
+look at traffic, and it makes exactly one decision — does this subscriber get an
+answer for this name.
+
+**The risk was never the feature.** It was mutable per-subscriber state landing
+on the query path — because *that* is what could turn a carrier resolver into
+something that stalls on a database, pauses on a policy push, or fails to resolve
+because a blocklist would not download. That risk is contained by three
+boundaries which are treated as contract, not convention (§10.2):
+
+1. **The query path does no I/O for policy.** Lookups are lock-free reads of
+   atomically-swapped structures. A policy push never pauses resolution.
+2. **Only small mutable state replicates** — subscriber prefix map and overrides,
+   roughly 4 MB at 500 k subscribers.
+3. **Feed content is never replicated**, and a feed that fails to load leaves the
+   previous rules serving. **Filtering degrades; resolution does not.**
+
+**And why the per-subscriber allow list is load-bearing rather than a nicety.**
+Every curated blocklist eventually false-positives on some customer's supplier or
+payment gateway. Without a per-subscriber unblock, the only remedies are editing
+a shared feed you may not own, or switching filtering off for that customer and
+losing the revenue. The whitelist is what makes the product supportable at all,
+which is why it is evaluated *before* class feeds and why that order is a
+contract (§10.4).
+
+If the conclusion is still that filtering does not belong in this product, the
+argument to make is that requirements 1 and 2 above are not real — see §2.1,
+where the same two requirements are what decide against buying Unbound.
+
+---
+
 ## How to read this
 
 Each entry follows the same shape:
@@ -1455,15 +1521,30 @@ answer stalls everything behind it on the same TCP connection.
 
 ### 10.1 Why a carrier resolver has per-subscriber policy at all
 
-**The objection, stated fairly:** per-subscriber filtering is not a carrier
-resolver feature, and building it risks turning a piece of infrastructure into a
-product with a support burden.
+**Answered at the top of this document**, since it is the first thing anyone
+challenges: a product someone sells, an obligation a carrier gets handed anyway,
+and the fact that the alternative is two resolver platforms rather than one with
+an ACL.
 
-**The answer.** It stays off unless someone turns it on (`policy.enabled`), and
-when off it is not on the query path at all. It exists because the moment
-someone sells a "filtered DNS" or "family safe" product, the alternative is a
-second resolver platform. The boundaries in §10.2 are what keep the feature from
-compromising the resolver.
+Two implementation facts that back the "it costs nothing when unused" claim,
+since it is the part most worth verifying rather than believing:
+
+- **The enforcer is conditionally constructed, not conditionally executed.**
+  `buildPolicy` returns a nil classifier when `policy.enabled` is false, and the
+  handler chain only wraps `policy.NewEnforcer` when that classifier is non-nil
+  (`cmd/cgdns/main.go:266-274`). With filtering off there is no policy frame on
+  the stack, no branch per query, and no metrics to maintain.
+- **Nothing about policy is reachable from the query path except memory.** See
+  §10.2 — that is the property that makes the feature safe to ship in a carrier
+  resolver at all.
+
+**Where the boundary sits with the rest of the business.** The local control
+store is authoritative at runtime, but records are created and edited by the
+existing OSS/BSS over the management API. The resolver *consumes* policy and
+never owns subscriber lifecycle — no billing sync, no customer records, no
+retention obligations. That is deliberate: it keeps CRM concerns out of a daemon
+whose job is to answer queries, and it is consistent with the operator-only
+tenancy decision in §13.10.
 
 ### 10.2 Three boundaries that keep filtering off the critical path
 
@@ -1698,9 +1779,18 @@ mirror image of the rate-limiting self-outage risk in §11.9.
 udp → ratelimit → policy → servestale → resolver
 ```
 
-**Serve-stale sits *inside* policy** so a blocked name stays blocked even when it
-is answered from expired data. Rate limiting sits outermost so an over-limit
-response costs as little as possible.
+Every position in that chain is load-bearing:
+
+- **Serve-stale sits *inside* policy**, so a blocked name stays blocked even when
+  the answer comes from expired data. The other order would let a filtered
+  customer reach a blocked name precisely when upstream is broken.
+- **Rate limiting wraps everything**, so it sees the response actually bound for
+  the client — **including one that policy rewrote**. A device hammering a
+  blocked name is still a device hammering us, and a limiter placed inside policy
+  would never see that traffic.
+- **Policy sits outside the resolver**, so a blocked name is never resolved at
+  all. Filtering that resolved first and discarded the answer would leak the
+  lookup to the authoritative and pay the latency for a result nobody receives.
 
 ### 12.4 Prefetch
 

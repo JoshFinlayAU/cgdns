@@ -257,11 +257,43 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		return err
 	}
 
+	// Feed content is fetched off the query path and written to files the
+	// compiler reads, so a refresh never touches resolution directly.
+	var (
+		fetcher     *policy.Fetcher
+		feedRefresh chan struct{}
+	)
+	fetchMetrics := &policy.FetchMetrics{}
+	if cfg.Policy.Enabled && cfg.Policy.FeedRefreshInterval > 0 {
+		dir := cfg.Policy.FeedDir
+		if dir == "" {
+			dir = filepath.Join(cfg.Node.StateDir, "feeds")
+		}
+		fetcher, err = policy.NewFetcher(policy.FetcherOptions{
+			Dir:      dir,
+			MaxBytes: cfg.Policy.FeedMaxBytes,
+			Timeout:  cfg.Policy.FeedTimeout,
+			Log:      log,
+			Metrics:  fetchMetrics,
+		})
+		if err != nil {
+			return err
+		}
+		feedRefresh = make(chan struct{}, 1)
+		log.Info("feed fetching enabled",
+			slog.String("dir", dir),
+			slog.Duration("interval", cfg.Policy.FeedRefreshInterval))
+	}
+
 	var publisher *control.Publisher
 	if classifier != nil {
-		publisher = control.NewPublisher(control.PublisherOptions{
+		opts := control.PublisherOptions{
 			Store: store, Classifier: classifier, Registry: registry, Log: log,
-		})
+		}
+		if fetcher != nil {
+			opts.FeedPath = fetcher.Path
+		}
+		publisher = control.NewPublisher(opts)
 	}
 	if classifier != nil {
 		handler = policy.NewEnforcer(policy.Options{
@@ -487,6 +519,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if cfg.Resolver.AggressiveNSEC && cfg.Resolver.DNSSEC {
 		registerAggressiveMetrics(reg, nsecMetrics)
 	}
+	if fetcher != nil {
+		registerFeedMetrics(reg, fetchMetrics)
+	}
 
 	var (
 		mgmt     *management.Server
@@ -507,6 +542,14 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			Issuer:     "cgdns " + cfg.Node.ID,
 			UI:         cfg.Management.UI,
 			Metrics:    reg.Snapshot,
+			RefreshFeeds: func() {
+				if feedRefresh != nil {
+					select {
+					case feedRefresh <- struct{}{}:
+					default:
+					}
+				}
+			},
 			Status: func() management.Status {
 				s := management.Status{
 					NodeID:  cfg.Node.ID,
@@ -588,6 +631,13 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if publisher != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); publisher.Run(ctx) }()
+	}
+	if fetcher != nil && publisher != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runFeedRefresh(ctx, cfg, store, fetcher, publisher, feedRefresh, log)
+		}()
 	}
 	if mgmt != nil {
 		wg.Add(1)
@@ -1254,5 +1304,81 @@ func registerAggressiveMetrics(reg *metrics.Registry, m *aggressive.Metrics) {
 		metrics.Source{Name: "cgdns_nsec_misses_total", Help: "Lookups with no cached NSEC proof covering the name.", Kind: metrics.Counter, Read: u64(m.Misses.Load)},
 		metrics.Source{Name: "cgdns_nsec_zones", Help: "Zones with NSEC records cached.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.Zones.Load()) }},
 		metrics.Source{Name: "cgdns_nsec_records", Help: "NSEC records held.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.Records.Load()) }},
+	)
+}
+
+// runFeedRefresh keeps locally fetched feed content current.
+//
+// It runs once at startup so a node that has been down comes back with fresh
+// lists rather than whatever it had when it stopped, then on the configured
+// interval. A refresh that changes nothing does not republish: recompiling
+// identical rules would swap the query path's tables for no reason.
+func runFeedRefresh(
+	ctx context.Context,
+	cfg config.Config,
+	store *control.Store,
+	fetcher *policy.Fetcher,
+	publisher *control.Publisher,
+	now <-chan struct{},
+	log *slog.Logger,
+) {
+	refresh := func() {
+		state, _ := store.State()
+		feeds := make([]policy.Feed, 0, len(state.Feeds()))
+		for _, f := range state.Feeds() {
+			if f.URL == "" {
+				continue
+			}
+			feeds = append(feeds, policy.Feed{Name: f.Name, URL: f.URL, SHA256: f.SHA256})
+		}
+		if len(feeds) == 0 {
+			return
+		}
+
+		changed := 0
+		for _, r := range fetcher.Refresh(ctx, feeds) {
+			if r.Updated {
+				changed++
+			}
+		}
+		if changed > 0 {
+			log.Info("feed content changed, recompiling policy", slog.Int("feeds", changed))
+			publisher.Republish()
+		}
+	}
+
+	refresh()
+
+	t := time.NewTicker(cfg.Policy.FeedRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refresh()
+		case <-now:
+			// An operator asked for it, usually because they just added a feed
+			// and would rather not wait an hour to see whether it works.
+			refresh()
+		}
+	}
+}
+
+func registerFeedMetrics(reg *metrics.Registry, m *policy.FetchMetrics) {
+	u64 := func(f func() uint64) func() float64 {
+		return func() float64 { return float64(f()) }
+	}
+	reg.Register(
+		metrics.Source{Name: "cgdns_feed_fetch_attempts_total", Help: "Feed fetches attempted.", Kind: metrics.Counter, Read: u64(m.Attempts.Load)},
+		metrics.Source{Name: "cgdns_feed_fetch_updated_total", Help: "Feed fetches that changed the local content.", Kind: metrics.Counter, Read: u64(m.Updated.Load)},
+		metrics.Source{Name: "cgdns_feed_fetch_unchanged_total", Help: "Feed fetches that found no change.", Kind: metrics.Counter, Read: u64(m.Unchanged.Load)},
+		// Rising means filtering is going stale: the previous content is still
+		// serving, which is the right failure, but nobody is refreshing it.
+		metrics.Source{Name: "cgdns_feed_fetch_failures_total", Help: "Feed fetches that failed, leaving the previous content in place.", Kind: metrics.Counter, Read: u64(m.Failures.Load)},
+		// Any of these is worth an alert: a feed was tampered with in transit,
+		// or its publisher changed it without telling the control plane.
+		metrics.Source{Name: "cgdns_feed_hash_mismatches_total", Help: "Feed content that did not match its pinned sha256.", Kind: metrics.Counter, Read: u64(m.HashMismatches.Load)},
+		metrics.Source{Name: "cgdns_feed_last_success_timestamp", Help: "Unix time of the last successful feed fetch.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.LastSuccess.Load()) }},
 	)
 }

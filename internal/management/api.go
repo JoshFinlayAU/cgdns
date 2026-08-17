@@ -48,6 +48,7 @@ type API struct {
 	issuer   string
 	ui       bool
 	metrics  func() map[string]float64
+	refresh  func()
 }
 
 // APIOptions configures the API.
@@ -64,6 +65,10 @@ type APIOptions struct {
 	// Metrics snapshots the registry for the console, which is served from
 	// this listener and so cannot reach the metrics one.
 	Metrics func() map[string]float64
+	// RefreshFeeds re-fetches feed content and recompiles policy. Without it a
+	// newly added feed waits for the next scheduled refresh, which is an odd
+	// thing to explain to someone who has just pressed save.
+	RefreshFeeds func()
 	// Issuer names this node in an authenticator app.
 	Issuer string
 }
@@ -94,6 +99,7 @@ func NewAPI(opts APIOptions) (*API, error) {
 		issuer:   opts.Issuer,
 		ui:       opts.UI,
 		metrics:  opts.Metrics,
+		refresh:  opts.RefreshFeeds,
 	}, nil
 }
 
@@ -137,6 +143,8 @@ func (a *API) Handler() http.Handler {
 	mux.Handle("POST /api/v1/users", a.guard(ScopeAdmin, a.handleCreateUser))
 	mux.Handle("DELETE /api/v1/users/{name}", a.guard(ScopeAdmin, a.handleDeleteUser))
 
+	mux.Handle("POST /api/v1/policy/refresh", a.guard(ScopeWrite, a.handleRefresh))
+
 	mux.Handle("GET /api/v1/tokens", a.guard(ScopeAdmin, a.handleListTokens))
 	mux.Handle("POST /api/v1/tokens", a.guard(ScopeAdmin, a.handleCreateToken))
 	mux.Handle("DELETE /api/v1/tokens/{id}", a.guard(ScopeAdmin, a.handleRevokeToken))
@@ -169,6 +177,20 @@ func securityHeaders(next http.Handler) http.Handler {
 		setSecurityHeaders(w)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleRefresh re-fetches feeds now rather than at the next interval.
+//
+// It returns as soon as the refresh is queued. A feed fetch can take a while,
+// and holding an operator's request open for it would only invite a timeout.
+func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if a.refresh == nil {
+		writeError(w, http.StatusNotImplemented, "feed fetching is not enabled on this node")
+		return
+	}
+	a.refresh()
+	a.log.Info("feed refresh requested", slog.String("remote", r.RemoteAddr))
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "refresh queued"})
 }
 
 func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {

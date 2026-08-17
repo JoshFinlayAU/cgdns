@@ -121,6 +121,23 @@ rate_limit:
   max_buckets: 100000
   # exempt_clients: ["<monitoring-prefix>"]
 
+# Subscriber policy. Feeds, classes and per-subscriber overrides are pushed
+# through the API; this section turns the machinery on and says how feed
+# content is fetched.
+policy:
+  enabled: false
+  # How often a feed carrying a URL is re-fetched. A fetch that fails, times
+  # out, overruns its size cap or fails its pinned hash leaves the previous
+  # content serving: filtering goes stale, which beats filtering going wrong.
+  feed_refresh_interval: 1h
+  feed_timeout: 2m
+  feed_max_bytes: 268435456
+  # feed_dir: defaults to <node.state_dir>/feeds
+  #
+  # A feed record may pin a sha256. It is checked whenever present and is
+  # REQUIRED for an http:// URL, because a blocklist decides what subscribers
+  # may resolve and one fetched over plain HTTP can be rewritten in transit.
+
 control:
   store_file: /var/lib/cgdns/control.json
 

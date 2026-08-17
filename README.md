@@ -50,6 +50,10 @@ The anycast0 dummy interface was a trial by fire decision that was settled on to
 
 **Transports** - UDP, TCP, DoT (RFC 7858), DoH (RFC 8484 over HTTP/2), DoQ (RFC 9250). All dual-stack. DoQ shares port 853 with DoT but not the socket - one is TCP, the other UDP - and gives every query its own stream, so a slow answer no longer stalls the ones behind it the way it does on a shared DoT connection. Measured on a dev node: 40 concurrent queries on one connection in 180 ms. It wants a larger UDP receive buffer than the kernel default; raise `net.core.rmem_max` and `net.core.wmem_max` or the QUIC stack will log that it could not. Message IDs must be zero (a stream carries exactly one exchange, so there is nothing to correlate) and `edns-tcp-keepalive` is refused, both per RFC 9250; 0-RTT is left off, since its data is replayable and a resolver would take on that problem to save a round trip. UDP uses `SO_REUSEPORT` per-address sockets so replies leave with the correct anycast source. DoH ignores forwarding headers unless the peer is a configured trusted proxy, because the client address selects subscriber policy.
 
+**Feed fetching and reload** - a feed record carrying a URL is fetched on a schedule, written to disk atomically, and compiled into new rules that are swapped in without a restart. A fetch that fails, times out, overruns its size cap, returns an error or comes back empty leaves the previous content serving; filtering goes stale, which beats filtering going wrong. `POST /api/v1/policy/refresh` forces it, so a newly added feed does not wait for the next interval.
+
+A feed decides what subscribers are allowed to resolve, so it is treated as a control-plane operation wearing the clothes of a download. A record may pin a SHA-256; it is checked whenever present and is **required** for an `http://` URL, because a list fetched over plain HTTP can be rewritten by anyone on the path. Content that fails its digest is refused and counted — `cgdns_feed_hash_mismatches_total` above zero means a feed was tampered with, or its publisher changed it without telling the control plane.
+
 **Subscriber policy** - RPZ zones and plain domain lists, compiled per subscriber class with specificity-ordered matching. Per-subscriber allow and block overrides take precedence over shared class feeds, so one customer can be unblocked without editing a feed you may not own. Blocked answers carry EDE 15 so clients can distinguish policy from a genuine NXDOMAIN. A feed that fails to load leaves the previous rules serving - filtering goes stale, resolution does not.
 
 **Anycast health** - the node owns the decision on whether it belongs in the anycast set, and drives GoBGP (it just made sense.. go project.. gRPC..) over its gRPC API. `gobgpd` runs as a separate unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a resolver restart does not drop the session. Checks run through the real serving path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays on stable serving time rather than on recovery. SIGTERM withdraws before the
@@ -112,8 +116,6 @@ Everything on the original list is in. What remains is real work, not polish:
 
 | | Status |
 |---|---|
-| Feed fetching | A feed record carries a URL and a SHA256, but nothing fetches or refreshes one — feeds load from a local file. The scheduler and the hash check are the missing half. |
-| Policy reload | Rules are compiled once at startup. The atomic swap the query path reads from is already there; nothing triggers it yet, so a feed change needs a restart. |
 | Public IPv6 anycast | Deliberately deferred. It needs a routed prefix rather than the on-link /64 the lab has. |
 | Session replication | A WebUI session is node-local, so moving to the sibling means signing in again. That is a considered trade, not an oversight — see the console section. |
 
