@@ -287,15 +287,30 @@ func pathOf(dst *apipb.Destination) (netip.Prefix, netip.Addr, bool) {
 			continue
 		}
 		for _, attr := range path.GetPattrs() {
-			nh := attr.GetNextHop()
-			if nh == nil {
-				continue
+			// IPv4 carries its next hop in the NEXT_HOP attribute, IPv6 in
+			// MP_REACH_NLRI (RFC 4760). Reading only the first quietly works
+			// for v4 and silently ignores every v6 route.
+			var candidates []string
+			if nh := attr.GetNextHop(); nh != nil {
+				candidates = append(candidates, nh.GetNextHop())
 			}
-			addr, err := netip.ParseAddr(nh.GetNextHop())
-			if err != nil || addr.IsUnspecified() {
-				continue
+			if mp := attr.GetMpReach(); mp != nil {
+				candidates = append(candidates, mp.GetNextHops()...)
 			}
-			return prefix, addr, true
+
+			for _, c := range candidates {
+				addr, err := netip.ParseAddr(c)
+				if err != nil || addr.IsUnspecified() {
+					continue
+				}
+				// A link-local next hop is legitimate in MP_REACH alongside a
+				// global one; prefer whatever matches the route's family and
+				// is routable from here.
+				if addr.Is4() != prefix.Addr().Is4() {
+					continue
+				}
+				return prefix, addr, true
+			}
 		}
 	}
 	return netip.Prefix{}, netip.Addr{}, false

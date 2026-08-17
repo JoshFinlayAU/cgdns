@@ -3,6 +3,8 @@ package routeagent
 import (
 	"net/netip"
 	"testing"
+
+	apipb "github.com/osrg/gobgp/v4/api"
 )
 
 func prefixes(t *testing.T, in ...string) []netip.Prefix {
@@ -127,5 +129,63 @@ func TestRouteFor_StampsThePreferredSource(t *testing.T) {
 	none := &Agent{opts: Options{Metric: 5}}
 	if r := none.routeFor(netip.MustParsePrefix("0.0.0.0/0"), netip.MustParseAddr("10.255.255.3")); r.Src != nil {
 		t.Fatalf("an unconfigured source produced %v", r.Src)
+	}
+}
+
+// IPv4 carries its next hop in the NEXT_HOP attribute and IPv6 in
+// MP_REACH_NLRI (RFC 4760). Reading only the first quietly works for v4 and
+// ignores every v6 route, which is exactly how it failed on the lab.
+func TestPathOf_ReadsBothNextHopEncodings(t *testing.T) {
+	v4 := &apipb.Destination{
+		Prefix: "0.0.0.0/0",
+		Paths: []*apipb.Path{{
+			SourceAsn: 65000,
+			Pattrs: []*apipb.Attribute{{
+				Attr: &apipb.Attribute_NextHop{
+					NextHop: &apipb.NextHopAttribute{NextHop: "10.255.255.3"},
+				},
+			}},
+		}},
+	}
+	p, nh, ok := pathOf(v4)
+	if !ok || p.String() != "0.0.0.0/0" || nh.String() != "10.255.255.3" {
+		t.Fatalf("v4: got %v %v %v", p, nh, ok)
+	}
+
+	v6 := &apipb.Destination{
+		Prefix: "::/0",
+		Paths: []*apipb.Path{{
+			SourceAsn: 65000,
+			Pattrs: []*apipb.Attribute{{
+				Attr: &apipb.Attribute_MpReach{
+					MpReach: &apipb.MpReachNLRIAttribute{NextHops: []string{"fd51:13:1::3"}},
+				},
+			}},
+		}},
+	}
+	p, nh, ok = pathOf(v6)
+	if !ok {
+		t.Fatal("v6: no next hop found; MP_REACH_NLRI is not being read")
+	}
+	if p.String() != "::/0" || nh.String() != "fd51:13:1::3" {
+		t.Fatalf("v6: got %v %v", p, nh)
+	}
+}
+
+// A next hop of the wrong family must not be paired with a route.
+func TestPathOf_IgnoresAMismatchedFamily(t *testing.T) {
+	d := &apipb.Destination{
+		Prefix: "::/0",
+		Paths: []*apipb.Path{{
+			SourceAsn: 65000,
+			Pattrs: []*apipb.Attribute{{
+				Attr: &apipb.Attribute_NextHop{
+					NextHop: &apipb.NextHopAttribute{NextHop: "10.255.255.3"},
+				},
+			}},
+		}},
+	}
+	if _, _, ok := pathOf(d); ok {
+		t.Fatal("a v4 next hop was accepted for a v6 route")
 	}
 }
