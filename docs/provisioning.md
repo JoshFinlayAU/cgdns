@@ -1,99 +1,140 @@
 # Provisioning a POP pair
 
-How to bring up two resolver nodes and their BGP sessions from nothing. Every
-config below is what the lab pair actually runs.
+Two resolver nodes, their addressing, and their BGP sessions, from nothing.
 
-## The address plan comes first
+## The deployment model
 
-Four roles per node, and keeping them apart is what makes the rest work.
+Four interfaces per node, one job each.
 
-| Role | Example (ns1) | Announced? | Purpose |
-|---|---|---|---|
-| peering | `10.255.255.1/29`, `fd51:13:1::1/64` | no, connected | reaches the router's peering address |
-| `loopback0` | `10.255.0.1/32`, `fd51:13::1/128` | see below | the node's identity — outbound queries are sourced here |
-| `anycast0` | `10.255.0.53/32`, `fd51:13:53::53/128` | yes, health-gated | the service address subscribers query |
-| management | `10.51.13.146` | no | operator API, metrics, SSH |
+| Interface | Carries | Addressing |
+|---|---|---|
+| `eth0` | eBGP session to the PE, **and** the source address for outbound queries | public v4 + v6, sized to the PE link — a /31 (RFC 3021) or /30, and a /127 (RFC 6164) or /64 |
+| `eth1` | pair link to the sibling: config replication and cache sharing | /31 or /30 and /127 or /64, private is fine — it never leaves the pair |
+| `eth2` | management: operator API, metrics, SSH | management prefix and gateway, **no default route** |
+| `anycast0` | the service address subscribers query | `/32` + `/128` on a dummy device |
 
-The two dummy interfaces exist for different reasons and must not be merged.
+Worked example for one POP:
 
-`anycast0` is the service address. It is identical in role across every POP —
-though **each node owns a distinct one** (ns1 `.53`, ns2 `.54`), so BGP can
-steer a subscriber to the nearer node rather than to a coin flip. It is
-announced only while the node is healthy, and withdrawn the moment it is not.
+```
+ns1   anycast0  160.30.37.100/32          <- announced, health-gated
+      eth0      160.30.37.200/31          <- peers with PE1 at .201, and is
+                                             the source of every outbound query
 
-`loopback0` is unique per node and is never anycast. Outbound queries source
-from it, and that is the whole point: a query sourced from an anycast address
-invites the reply back to whichever node the return path happens to pick, which
-is not necessarily the one that asked.
+ns2   anycast0  160.30.37.101/32
+      eth0      160.30.37.202/31          <- peers with PE2 at .203
+```
 
-The eBGP sessions run over the peering addresses, **not** over `loopback0`.
+The default route is learned over eth0 from the PE. Nothing else supplies one.
 
-How that segment is addressed does not matter. A /30, a /31 (RFC 3021), a
-shared /29, a VLAN with both nodes and the router on it, or IPv6 link-local
-peering — all fine. The only requirement is that each node can reach the
-router's peering address, and for single-hop eBGP that it is a connected
-route. If the router is not adjacent, the session needs `ebgp-multihop` and a
-route to reach it, which is a different setup rather than a bigger prefix.
+### Why each address exists
 
-The lab uses a shared /29 (`.1` ns1, `.2` ns2, `.3` router) because one VLAN
-was less to build than two point-to-point links. Nothing depends on that
-choice. The one thing worth deciding deliberately is whether the two nodes
-share the segment: on a shared VLAN they can reach each other over it, which
-is either convenient or an extra path you did not intend, depending on how you
-feel about the pair link being the only thing between them.
+**`anycast0` is inbound only.** It is what subscribers resolve against, it is
+announced from every POP, and each node owns a distinct one — ns1 holds `.100`
+in Brisbane, Sydney and Perth alike, ns2 holds `.101`. A Brisbane subscriber
+reaches Brisbane's ns1; if that node withdraws, the same address is still live
+in Sydney and BGP carries them there. The prefix stays inside your own routing
+domain: subscribers are internal, so a `/32` in iBGP is exactly right and never
+needs to survive public-internet filtering.
+
+**`eth0` is outbound.** Queries must never be sourced from `anycast0`. That
+address exists in every POP, so a reply addressed to it follows BGP to whichever
+POP is nearest *the authoritative server*, which is not necessarily the one that
+asked:
+
+```
+ns1 @ POP-A  --query, src 160.30.37.100-->  root server
+             <--reply, dst 160.30.37.100--  routed to POP-C, not POP-A
+POP-C's ns1: never asked -> dropped.  POP-A's ns1: times out.
+```
+
+Sourcing from `eth0` makes the address unique to one node, so the reply comes
+back to the node that asked. This is the one leg of the system that touches the
+public internet — the resolver walks the delegation chain itself and talks to
+root, TLD and authoritative servers directly, and they reply to whatever source
+the query carried. So `eth0` must be covered by an aggregate your AS announces
+globally, even though no subscriber ever addresses it. The `/31` itself never
+leaves your network; longest-match sorts out the rest:
+
+```
+dst 160.30.37.200  -> the /31, carried from POP-A only    -> POP-A's ns1  ✓
+dst 160.30.37.100  -> the /32, announced from every POP   -> nearest POP  ✓
+```
+
+### There is no loopback here, deliberately
+
+A loopback earns its place when an address must outlive any single interface —
+a node dual-homed to PE1 *and* PE2 cannot source from either link's address,
+because that address dies with its link. With one uplink per node, eth0 going
+down takes the node with it regardless, so a separate loopback buys nothing.
+
+Add one the day a node gets a second uplink, and not before. The eBGP session
+itself never needs it either way: single-hop eBGP peers over the interface.
+
+### Peering is one node to one PE
+
+Give each node its own PE where the topology allows. Two nodes peering with the
+same router means that router is a single point of failure for the whole POP —
+it dies, both anycast addresses withdraw together, and the second node bought
+you nothing.
+
+The segment's addressing is not a requirement. A /31, /30, a shared VLAN, or
+IPv6 link-local peering all work. What matters is that the node can reach the
+PE's peering address, and that it is a connected route for single-hop eBGP. A
+non-adjacent PE needs `ebgp-multihop` and a route to reach it — a different
+setup, not a bigger prefix.
 
 ## 1. Interfaces
-
-`/etc/netplan/60-cgdns.yaml` on ns1. ns2 is the same with `.2`/`::2` and
-`.54`/`::54`.
 
 ```yaml
 network:
   version: 2
   ethernets:
-    eth0:                                    # management, kept off the service path
+    eth0:                                    # to the PE; also the query source
+      addresses: ["160.30.37.200/31", "2404:xxxx:xxxx::200/127"]
+    eth1:                                    # pair link
+      addresses: ["100.127.255.1/31", "fd51:13:2::1/127"]
+    eth2:                                    # management
+      addresses: ["10.51.13.146/24"]
       routes:
       - {to: "default", via: "10.51.13.254", table: 100}
       routing-policy:
       - {from: "10.51.13.146/32", table: 100}
-    eth1:                                    # pair link to the sibling
-      addresses: ["100.127.255.1/30", "fd51:13:2::1/64"]
-    eth2:                                    # BGP VLAN
-      addresses: ["10.255.255.1/29", "fd51:13:1::1/64"]
-      routes:
-      - {to: "default", via: "10.255.255.3", from: "10.255.0.1", metric: 10}
   dummy-devices:
-    loopback0:
-      addresses: ["10.255.0.1/32", "fd51:13::1/128"]
     anycast0:
-      addresses: ["10.255.0.53/32", "fd51:13:53::53/128"]
+      addresses: ["160.30.37.100/32", "2404:xxxx:xxxx:53::100/128"]
 ```
 
-Two details that are easy to get wrong:
+`anycast0` is a dummy device for the same reason `systemd-resolved` binds
+`127.0.0.53` to one: somewhere to bind that never goes down and never ARPs. The
+similarity ends at the mechanism — `127.0.0.53` needs no coordination because
+it is host-local, whereas an anycast address is announced into BGP and is what
+subscriber DHCP hands out, so it is a service contract and must be chosen.
 
-- Management needs its own routing table and a policy rule, or replies to
-  management traffic take the service path out and arrive from the wrong
-  address.
-- The static default on `eth2` carries `metric: 10` and pins `from:`. It is the
-  fallback beneath the BGP-learned default, which installs at metric 5.
+**Management must not supply a default.** Take a prefix and a gateway, and put
+that gateway in its own table rather than the main one — the only default in the
+main table should be the one BGP learns. Accepting a DHCP default and relying on
+metrics to make it lose is a trap: it works until BGP drops, and then management
+silently becomes the service path.
+
+The policy rule solves a second, separate problem: management traffic *sourced*
+from `eth2` must reply out `eth2`. Without it, SSH from off-subnet arrives on
+management and leaves via the BGP default, and the asymmetry breaks the session.
 
 ## 2. gobgpd on the node
 
-One session per address family. The import filter accepts only a default and
-the sibling's loopback — everything else the upstream might send is rejected
-before it can reach the agent that installs routes.
+One session per address family, to this node's PE.
 
 ```toml
 [global.config]
   as = 65001
-  router-id = "10.255.255.1"
+  router-id = "160.30.37.200"
 
 [[neighbors]]
   [neighbors.config]
-    neighbor-address = "10.255.255.3"
+    neighbor-address = "160.30.37.201"
     peer-as = 65000
   [neighbors.transport.config]
-    local-address = "10.255.255.1"
+    local-address = "160.30.37.200"
   [neighbors.timers.config]
     hold-time = 9
     keepalive-interval = 3
@@ -104,17 +145,14 @@ before it can reach the agent that installs routes.
     [neighbors.afi-safis.config]
       afi-safi-name = "ipv4-unicast"
 
-# ... the v6 neighbour is the same shape: fd51:13:1::3, local fd51:13:1::1,
-#     ipv6-unicast, same apply-policy block.
+# ... the v6 neighbour is the same shape, ipv6-unicast, same apply-policy block.
 
 [[defined-sets.prefix-sets]]
   prefix-set-name = "upstream-v4"
   [[defined-sets.prefix-sets.prefix-list]]
     ip-prefix = "0.0.0.0/0"
-  [[defined-sets.prefix-sets.prefix-list]]
-    ip-prefix = "10.255.0.2/32"        # the sibling's loopback
 
-# ... upstream-v6 likewise: "::/0" and "fd51:13::2/128"
+# ... upstream-v6 likewise with "::/0"
 
 [[policy-definitions]]
   name = "import-upstream"
@@ -132,8 +170,8 @@ before it can reach the agent that installs routes.
 `[global.apply-policy]` with `default-import-policy = "reject-route"` also
 judges the routes this node originates, so the anycast prefix never enters the
 RIB. Both the gRPC API and `gobgp global rib add` return success having done
-nothing, and the node reports itself advertised while the router has no route
-to it at all.
+nothing, and the node reports itself advertised while the PE has no route to it
+at all.
 
 Nothing here originates the anycast prefix — cgdns does that over gobgpd's gRPC
 API, so the advertisement follows health rather than the config file.
@@ -142,86 +180,56 @@ API, so the advertisement follows health rather than the config file.
 
 ```yaml
 resolver:
-  outbound_source_v4: "10.255.0.1"           # loopback0, never anycast0
-  outbound_source_v6: "fd51:13::1"
+  outbound_source_v4: "160.30.37.200"         # eth0, never anycast0
+  outbound_source_v6: "2404:xxxx:xxxx::200"
 
 health:
-  anycast_prefixes:                          # what gets announced when healthy
-    - "10.255.0.53/32"
-    - "fd51:13:53::53/128"
+  anycast_prefixes:                           # announced while healthy
+    - "160.30.37.100/32"
+    - "2404:xxxx:xxxx:53::100/128"
   gobgp_target: "127.0.0.1:50051"
 
-route_agent:                                 # installs what gobgpd learns
+route_agent:                                  # installs what gobgpd learns
   gobgp_target: "127.0.0.1:50051"
-  accept:                                    # matched exactly
+  accept:                                     # matched exactly
     - "0.0.0.0/0"
     - "::/0"
-    - "10.255.0.2/32"
-    - "fd51:13::2/128"
-  source_v4: "10.255.0.1"                    # prefsrc on the installed route
-  source_v6: "fd51:13::1"
-  metric: 5                                  # beats the static fallback at 10
+  source_v4: "160.30.37.200"                  # prefsrc on the installed route
+  source_v6: "2404:xxxx:xxxx::200"
+  metric: 5
 ```
 
 `route_agent` exists because gobgpd is a BGP speaker, not a routing daemon: it
 holds a learned route in its RIB and never puts it in the forwarding table.
 
-`source_v4`/`source_v6` must match what the resolver sources from. A learned
+`source_v4`/`source_v6` must match what the resolver sources from, or a learned
 default that wins without a matching preferred source silently moves the node's
-egress address off the loopback.
+egress address somewhere else.
 
-## 4. The router
+## 4. The PE
 
-Sessions, one per node per family:
+A session per node per family, originating a default and accepting only the
+anycast prefix:
 
 ```
 /routing bgp connection add name=ns1-v4 instance=cgdns as=65000 \
-  remote.address=10.255.255.1 .as=65001 local.address=10.255.255.3 .role=ebgp \
+  remote.address=160.30.37.200 .as=65001 local.address=160.30.37.201 .role=ebgp \
   output.default-originate=always input.filter=cgdns-in
-```
 
-…and the same for `ns1-v6` (`fd51:13:1::1`), `ns2-v4`, `ns2-v6`.
-
-Accept only what these nodes should ever announce, and keep it local:
-
-```
 /routing filter rule add chain=cgdns-in \
-  rule="if (dst in 10.255.0.0/24 && dst-len==32) { set bgp-communities no-export; accept; }"
-/routing filter rule add chain=cgdns-in \
-  rule="if (dst in fd51:13::/32 && dst-len==128) { set bgp-communities no-export; accept; }"
+  rule="if (dst in 160.30.37.96/28 && dst-len==32) { set bgp-communities no-export; accept; }"
 /routing filter rule add chain=cgdns-in rule="reject;"
 ```
 
-`no-export` matters: an anycast address is only meaningful inside the POP's
-routing domain, and leaking it further draws traffic toward a node that may not
-be the nearest one.
-
-### The router must be able to reach the loopbacks
-
-Whatever the node sources queries from, the upstream needs a route back to it.
-In production the node announces its own loopback and this is automatic. Where
-the loopbacks are private and NATed, add explicit routes:
-
-```
-/ip route add dst-address=10.255.0.1/32 gateway=10.255.255.1
-/ip route add dst-address=10.255.0.2/32 gateway=10.255.255.2
-/ipv6 route add dst-address=fd51:13::1/128 gateway=fd51:13:1::1
-/ipv6 route add dst-address=fd51:13::2/128 gateway=fd51:13:1::2
-```
-
-Omit these and the failure is quiet and confusing: queries leave, the NAT
-counter climbs, and no reply ever returns, because each one is un-NATed to a
-destination the router cannot reach and dropped.
+`no-export` keeps the anycast address inside your routing domain. Leaking it
+further draws traffic toward a node that may not be the nearest one.
 
 ## 5. Order of operations
 
-1. Interfaces, both nodes. Confirm each node can reach the router over the BGP
-   VLAN in both families.
-2. Router sessions and filter.
-3. gobgpd on the nodes. Sessions should establish and each node should learn a
-   default per family.
-4. Return routes to the loopbacks (or loopback announcements).
-5. cgdns. It advertises the anycast prefixes once its health checks pass.
+1. Interfaces on both nodes. Confirm each reaches its PE in both families.
+2. PE sessions and filter.
+3. gobgpd. Sessions establish; each node learns a default per family.
+4. cgdns. It announces the anycast prefixes once health checks pass.
 
 ## 6. Verify at the far end, not the near end
 
@@ -230,7 +238,7 @@ itself. `cgdns_anycast_advertised` reports the node's internal health decision
 and says nothing about whether a route ever left the box.
 
 ```bash
-# on the router — the only place that proves the announcement landed
+# on the PE — the only place that proves the announcement landed
 /ip route print where bgp
 /ipv6 route print where bgp                  # expect one /32 and one /128 per node
 
@@ -239,11 +247,11 @@ gobgp neighbor
 ip -4 route show default proto bgp
 ip -6 route show default proto bgp
 
-# on the wire — which family and source address are really being used
-tcpdump -ni eth2 'udp port 53 and not host 10.255.255.3'
+# on the wire — which family and source address are really in use
+tcpdump -ni eth0 'udp port 53'
 
 # withdrawal actually works
-systemctl stop cgdns                         # the router should lose exactly
+systemctl stop cgdns                         # the PE should lose exactly
                                              # this node's two prefixes
 ```
 
@@ -251,11 +259,19 @@ A packet capture is the only honest answer to "which path is it using". A `dig`
 against the anycast address proves an answer came back, not which family or
 source address produced it.
 
-## Lab shortcuts, and what production does instead
+## How the lab differs
 
-| Lab | Production |
+The lab pair predates this model and reaches the same behaviour by other means.
+Read it as one worked example, not as the reference.
+
+| Lab | This model |
 |---|---|
-| ULA (`fd51:13::/48`) and RFC1918 loopbacks | publicly routable loopbacks |
-| Router masquerades both families out | no NAT; loopbacks route natively |
-| Static return routes to each loopback | the node announces its own loopback |
-| One POP | the same anycast address announced from every POP |
+| Both nodes peer with one CHR over a shared /29 | one node per PE |
+| A separate `loopback0` holds the query source | `eth0` is the query source; no loopback |
+| ULA and RFC1918 addressing, masqueraded out by the router | public space, no NAT |
+| Static return routes on the router to each loopback | not needed — eth0 is natively routed |
+| `eth3` carries v6 on its own VLAN | v6 rides eth0 alongside v4 |
+| One POP | the same anycast addresses announced from every POP |
+
+The lab's `eth3` was a workaround for that environment having no v6 on the BGP
+path, not a part of the design.

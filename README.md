@@ -41,11 +41,15 @@ The reason for two addresses rather than one shared between the pair is what hap
 
 | Interface | Carries |
 |---|---|
-| management | operator API, metrics, SSH |
-| pair link | config replication and cache sharing to the sibling node |
-| peering | reaches the nearest BGP router; the eBGP sessions are sourced from this interface rather than from a loopback. Any addressing that gets the node to the router's peering address will do - the lab happens to use a shared /29 |
+| `eth0` | eBGP session to this node's PE, and the source address for every outbound query. Public space in both families, because authoritative servers on the internet reply to it |
+| `eth1` | pair link: config replication and cache sharing to the sibling |
+| `eth2` | management: operator API, metrics, SSH. Supplies no default route |
 | `anycast0` | this node's service address - DNS listeners bind here (read below) |
-| `loopback0` | unique per node, never anycast - the address outbound queries are sourced from |
+
+Each node peers with its own PE where the topology allows, so one router failing
+does not withdraw both nodes at once. There is no loopback interface: it would
+earn its place only once a node is dual-homed and needs an address that outlives
+any single link.
 
 Setting all of this up from scratch - addressing, gobgpd, the router side, and
 what to check where - is written up in [docs/provisioning.md](docs/provisioning.md).
