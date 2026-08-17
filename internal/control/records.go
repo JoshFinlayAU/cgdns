@@ -34,8 +34,8 @@ type OverrideRecord struct {
 	Block        []string `json:"block,omitempty"`
 }
 
-// FeedRecord is a blocklist's metadata. Content lives outside raft; SHA256 is
-// what lets a node verify the copy it fetched is the one the cluster agreed on.
+// FeedRecord is a blocklist's metadata. Content is never replicated; SHA256 is
+// what lets a node verify the copy it fetched is the one this record names.
 type FeedRecord struct {
 	Name    string `json:"name"`
 	Format  string `json:"format"`

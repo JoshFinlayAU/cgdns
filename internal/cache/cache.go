@@ -3,7 +3,7 @@
 //
 // Entries are sharded, each shard with its own mutex and LRU list, and store an
 // absolute expiry so an entry can be shared with a peer carrying its remaining
-// TTL. The cache is node-local and never replicated through raft.
+// TTL. Cached data is never part of the replicated control plane.
 package cache
 
 import (

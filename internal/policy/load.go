@@ -11,8 +11,9 @@ import (
 // FeedSpec describes one blocklist source.
 //
 // File is the dev path. In production a feed's content is fetched out-of-band
-// and hash-verified; raft carries only the metadata naming it, because feed
-// content runs to millions of rows and would stall raft snapshots.
+// and hash-verified; the control store carries only the metadata naming it,
+// because feed content runs to millions of rows and replicating it would
+// dominate the pair link.
 type FeedSpec struct {
 	Name   string
 	Format string

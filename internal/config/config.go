@@ -248,7 +248,8 @@ type InfraCache struct {
 // Subscriber configures how a client address maps to a policy class.
 //
 // Identity is by source prefix: a longest-prefix match over a v4+v6 trie. In
-// production the trie is populated from raft; PrefixFile is the dev path in.
+// production the trie is populated from the control store; PrefixFile is the
+// dev path in.
 type Subscriber struct {
 	// DefaultClass applies to any client that matches no configured prefix.
 	DefaultClass string `yaml:"default_class"`
@@ -258,9 +259,10 @@ type Subscriber struct {
 
 // Policy configures subscriber content filtering.
 //
-// Feed content is never carried in raft: it runs to millions of rows and would
-// stall snapshots. Raft holds only the metadata naming a feed and the classes
-// subscribed to it; each node fetches the content and verifies it.
+// Feed content is never replicated: it runs to millions of rows and would
+// dominate the pair link. The control store holds only the metadata naming a
+// feed and the classes subscribed to it; each node fetches the content and
+// verifies it against the recorded hash.
 type Policy struct {
 	Enabled bool          `yaml:"enabled"`
 	Feeds   []PolicyFeed  `yaml:"feeds"`

@@ -109,15 +109,15 @@ cache:
 
 subscriber:
   default_class: default
-  # Maps client prefixes to a subscriber and their class. Pushed via raft in
-  # production; a file is the dev path in.
+  # Maps client prefixes to a subscriber and their class. Pushed to the control
+  # store in production; a file is the dev path in.
   prefix_file: deploy/dev/subscribers.txt
 
 policy:
   enabled: true
 
   # Feed content is fetched out-of-band and hash-verified in production, never
-  # carried in raft — these run to millions of rows and would stall snapshots.
+  # replicated — these run to millions of rows and would dominate the pair link.
   feeds:
     - name: curated-rbl
       format: domain-list

@@ -234,24 +234,6 @@ func TestUsesTheDeepestEnclosingZone(t *testing.T) {
 	}
 }
 
-// A zone using NSEC3 must fall through to a normal lookup rather than be
-// answered from records this package does not understand.
-func TestIgnoresNSEC3(t *testing.T) {
-	now := time.Now()
-	s := testStore(t, now)
-	s.Put([]dns.RR{
-		rr(t, "example.com. 3600 IN SOA ns.example.com. hm.example.com. 1 2 3 4 3600"),
-		rr(t, "abcdef.example.com. 3600 IN NSEC3 1 0 10 aabbccdd ghijkl A RRSIG"),
-	}, now)
-
-	if n := s.Len(); n != 0 {
-		t.Fatalf("stored %d NSEC3 records, want 0", n)
-	}
-	if _, ok := s.ProveNXDOMAIN("beta.example.com.", now); ok {
-		t.Fatal("synthesised a denial for an NSEC3 zone")
-	}
-}
-
 // The table must stay bounded: a resolver sees denials from every zone its
 // subscribers mistype.
 func TestBoundsMemory(t *testing.T) {

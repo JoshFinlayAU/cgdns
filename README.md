@@ -12,7 +12,7 @@ I don't want this to be a repo/product that gets lots of feature ideas from the 
 
 ## LOUIS
 
-Louis read this before you comment. [[docs/LOUIS.md]]
+Louis read this before you comment. [docs/LOUIS.md](docs/LOUIS.md)
 
 ## Deployment model
 
@@ -71,7 +71,18 @@ Every Nth over-limit response is sent truncated instead of dropped, so a legitim
 
 Measured on the lab: 15,000 queries at 500/s against a 50/s denial limit collapsed to a single bucket, 1,547 answered (the configured rate), and the node stayed healthy and in the anycast set throughout. A resolver that limits itself out of the anycast set has turned an attack into an outage.
 
-**Aggressive NSEC** - a signed denial does not only say "this name does not exist", it says "nothing exists between these two names". Ordinary caching throws that away and re-asks for every new name in the gap; keeping it lets one denial answer for all of them (RFC 8198). Against a random-subdomain flood aimed at a signed zone this is the strongest defence there is: measured on the lab, 100 made-up names produced 99 answers from cache and **zero** outbound queries, so the authoritative under attack saw nothing from us. Only validated denials are reused - an unvalidated NSEC is an attacker's claim about what does not exist - and an NSEC is only ever used inside the zone its own SOA names. NSEC3 zones fall through to a normal lookup rather than being answered from records this does not understand.
+**Aggressive NSEC / NSEC3** - a signed denial does not only say "this name does not exist", it says "nothing exists between these two names". Ordinary caching throws that away and re-asks for every new name in the gap; keeping it lets one denial answer for all of them (RFC 8198). Only validated denials are reused - an unvalidated NSEC is an attacker's claim about what does not exist - and a record is only ever used inside the zone its own SOA names.
+
+How much it helps depends on how the zone is signed, and the difference is large. NSEC gaps are contiguous in *name* space, so one cached gap often covers a whole flood of made-up names. NSEC3 gaps are contiguous in *hash* space, and hashing scatters random names uniformly, so coverage grows only as the chain is cached. Measured against 50 random names per zone:
+
+| Zone | Signing | Answered from cache | Outbound queries |
+|---|---|---|---|
+| `nlnetlabs.nl` | NSEC | 49 / 50 | 6 |
+| `isc.org` | NSEC3 | 49 / 50 | 6 |
+| `debian.org` | NSEC3, large zone | 4 / 50 rising to 22 / 50 as the chain cached | 294 falling to 234 |
+| `google.com` | unsigned | 0 / 50 | 250 |
+
+So it is close to total against a small or NSEC-signed zone, and a gradual saving against a large NSEC3 one - never nothing, and never a correctness risk either way. NSEC3 opt-out spans are never used: they may contain unsigned delegations, so they prove only that nothing *signed* is there.
 
 **Denial validation** - a denial is validated like an answer. An unvalidated NXDOMAIN is an assertion that a name does not exist, and taking one on trust lets anyone who can answer for a zone erase a name for as long as it stays cached. `AD` is now set on proven denials, and a denial that validates is cached as authenticated: negative caching keeps only the SOA (RFC 2308), so re-proving a cached denial would fail for want of evidence deliberately not kept.
 
@@ -100,7 +111,6 @@ cgdnsctl user create josh admin      # prompts for the password, never an argume
 | | Status |
 |---|---|
 | DoQ | RFC 9250. |
-| Aggressive NSEC3 | NSEC is done. NSEC3 means hashing each candidate with the zone's parameters and reasoning about the closest encloser; those zones fall through to a normal lookup for now. |
 
 
 ## Design constraints

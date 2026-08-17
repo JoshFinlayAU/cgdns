@@ -11,10 +11,9 @@
 // locally and never leaves the building — the authoritative under attack sees
 // nothing from us, and neither does our own outbound capacity.
 //
-// Only NSEC is handled, not NSEC3. Synthesising from NSEC3 means hashing each
-// candidate with the zone's parameters and reasoning about the closest
-// encloser, which is a different piece of work; a zone using NSEC3 simply falls
-// through to a normal lookup rather than being answered wrongly.
+// Both NSEC and NSEC3 are handled. They need different proofs: an NSEC records
+// a gap between names and can be checked directly, while an NSEC3 records a gap
+// between hashes and takes three records working together. See nsec3.go.
 package aggressive
 
 import (
@@ -58,6 +57,7 @@ type record struct {
 type zone struct {
 	mu      sync.RWMutex
 	records []record
+	nsec3   []n3record
 	soa     []dns.RR
 }
 
@@ -120,6 +120,15 @@ func (s *Store) Put(denial []dns.RR, now time.Time) {
 	soa := recordsFor(denial, apex, dns.TypeSOA)
 
 	for _, rr := range denial {
+		if n3, ok := rr.(*dns.NSEC3); ok {
+			ttl := time.Duration(n3.Hdr.Ttl) * time.Second
+			if ttl <= 0 || !dns.IsSubDomain(apex, dns.CanonicalName(n3.Hdr.Name)) {
+				continue
+			}
+			s.putNSEC3(apex, n3,
+				recordsFor(denial, dns.CanonicalName(n3.Hdr.Name), dns.TypeNSEC3), soa, now.Add(ttl))
+			continue
+		}
 		n, ok := rr.(*dns.NSEC)
 		if !ok {
 			continue
@@ -215,6 +224,12 @@ func (s *Store) ProveNXDOMAIN(name string, now time.Time) (Denial, bool) {
 
 	covering, z, ok := s.covering(name, now)
 	if !ok {
+		// No NSEC gap covers it. The zone may be signed with NSEC3, which is a
+		// different and stricter proof.
+		if d, ok := s.proveNSEC3ForName(name, now); ok {
+			s.opts.Metrics.Synthesised.Add(1)
+			return d, true
+		}
 		s.opts.Metrics.Misses.Add(1)
 		return Denial{}, false
 	}
@@ -261,6 +276,30 @@ func (s *Store) ProveNXDOMAIN(name string, now time.Time) (Denial, bool) {
 
 	s.opts.Metrics.Synthesised.Add(1)
 	return Denial{Authority: withTTL(append(soa, authority...), ttl), TTL: ttl}, true
+}
+
+// proveNSEC3ForName tries the NSEC3 proof in the deepest cached zone enclosing
+// the name.
+func (s *Store) proveNSEC3ForName(name string, now time.Time) (Denial, bool) {
+	for suffix := name; suffix != ""; {
+		s.mu.RLock()
+		z, ok := s.zones[suffix]
+		s.mu.RUnlock()
+		if ok {
+			if d, found := s.proveNSEC3(z, suffix, name, now); found {
+				return d, true
+			}
+		}
+		if suffix == "." {
+			break
+		}
+		i, end := dns.NextLabel(suffix, 0)
+		if end {
+			break
+		}
+		suffix = suffix[i:]
+	}
+	return Denial{}, false
 }
 
 // covering finds a live NSEC whose range covers name, in the deepest cached
@@ -358,7 +397,18 @@ func (s *Store) Sweep(now time.Time) int {
 			removed++
 		}
 		z.records = kept
-		empty := len(z.records) == 0
+
+		kept3 := z.nsec3[:0]
+		for _, r := range z.nsec3 {
+			if now.Before(r.expiry) {
+				kept3 = append(kept3, r)
+				continue
+			}
+			removed++
+		}
+		z.nsec3 = kept3
+
+		empty := len(z.records) == 0 && len(z.nsec3) == 0
 		z.mu.Unlock()
 
 		if empty {
@@ -378,7 +428,7 @@ func (s *Store) Len() int {
 	n := 0
 	for _, z := range s.zones {
 		z.mu.RLock()
-		n += len(z.records)
+		n += len(z.records) + len(z.nsec3)
 		z.mu.RUnlock()
 	}
 	return n

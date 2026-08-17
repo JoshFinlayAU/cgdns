@@ -60,22 +60,46 @@ benchmark / fuzz functions.
 
 cgdns is a recursive DNS resolver for a carrier network. One long-running daemon
 (`cgdns`), one operator CLI (`cgdnsctl`), one YAML config file, one management
-REST API that the CLI and the (not yet built) WebUI both sit on.
+REST API that the CLI and the embedded operator console both sit on.
 
-It is deployed as **two independent nodes per POP**, both announcing the same
-anycast address by BGP. There is no cluster spanning POPs and no quorum
-anywhere. Failure handling is routing: a sick node withdraws its prefix and
-traffic moves to its sibling, or to the next POP.
+It is deployed as **two independent nodes per POP**. There are **two anycast
+service addresses** — the ns1 address and the ns2 address, which is what a
+subscriber receives as their primary and secondary resolver over DHCP/PPPoE.
+**Each node announces one of them, and every POP repeats the same pattern.**
+There is no cluster spanning POPs and no quorum anywhere. Failure handling is
+routing: a sick node withdraws its prefix, and that address is then served by
+the node holding the same role in the next-closest POP.
 
 ```
-POP (BNE, SYD, MEL, …)
+POP (BNE, SYD, MEL, …) — every POP identical
 
   ns1 ──────── pair link ──────── ns2      config replication + POP-local cache sharing
    │                               │
-   └── eBGP /30 ── router ── eBGP ─┘       each announces the anycast /32 + /128
+   │  announces ANY-A              │  announces ANY-B
+   │  (/32 + /128)                 │  (/32 + /128)
+   │                               │
+   └── eBGP /30 ── router ── eBGP ─┘
+
+  Subscriber gets:  primary = ANY-A,  secondary = ANY-B
 
 Between POPs: nothing at all.
 ```
+
+**Why one address each rather than both on both.** A subscriber's primary and
+secondary then always resolve to **different physical machines**. A node-level
+fault that is not a full failure — a bad build, a policy bug, a wedged process
+still passing its own health checks — cannot take out both of a subscriber's
+configured resolvers at once. Putting both addresses on both nodes would allow
+the router to land both on the same box, which quietly turns two configured
+resolvers into one point of failure.
+
+**What it costs, and this is the trade to be clear about.** A single node
+failure is **not** absorbed inside the POP. When BNE ns1 withdraws ANY-A, BNE
+subscribers' *primary* is served by SYD ns1 — a cross-state path — while their
+secondary stays local on BNE ns2. So a single node loss means: added latency on
+one of the subscriber's two resolvers, and the remote same-role node carrying
+two states' primary load until the local node returns. That is the accepted
+price of never having both addresses on one box.
 
 Everything else in this document is a consequence of that shape, or of the rule
 that **the query path must keep serving when every other part of the system is
@@ -220,9 +244,16 @@ provisioning push reaches Sydney and not Melbourne, nothing in the system
 notices automatically — which is exactly why `cgdnsctl drift` and the store hash
 exist (§5.4), and why they are the thing to alert on.
 
-**Failure behaviour, stated plainly.** A POP going completely dark is not an
-outage: BGP withdraws and subscribers are routed to the next-closest POP. That
-is a latency change, not a service loss, and it is the accepted design.
+**Failure behaviour, stated plainly.**
+
+| Failure | What happens |
+|---|---|
+| One node (say BNE ns1) | ANY-A withdraws from BNE. Subscribers' primary is served by SYD ns1; their secondary stays local on BNE ns2. Added latency on one of their two resolvers; SYD ns1 carries two states' primary load |
+| Both nodes in a POP | Both addresses withdraw. Every subscriber of that POP is served by the next-closest POP, on both resolvers |
+| A whole POP dark (power, transit) | Same as above — BGP withdraws and subscribers route to the next-closest POP |
+
+None of these is an outage. They are latency changes and load shifts, and that
+is the accepted design.
 
 ### 3.2 Cache is shared within a POP and never between POPs
 
@@ -270,17 +301,53 @@ thing from a resolution cluster), it is a starting point.
 
 | Interface | Role |
 |---|---|
-| `anycast0` (a netplan dummy device) | the shared anycast /32 + /128 — DNS listeners bind here |
+| `anycast0` (a netplan dummy device) | **this node's** anycast /32 + /128 — ANY-A on ns1, ANY-B on ns2. DNS listeners bind here |
 | `loopback0` | unique per node — outbound recursion sources from here |
 | pair VLAN | pair link + management API |
 | p2p /30 | eBGP session to the nearest router, nothing else |
 
 **Why two loopbacks.** If outbound recursion sourced from the *anycast* address,
 the authoritative's reply would be routed to whichever node the return path
-picks — possibly the sibling, which has no matching outstanding query. That
-produces intermittent, load-dependent failures that only appear in production.
-Sourcing from a unique per-node address makes replies come home, and gives
-upstream filters a single address to permit.
+picks — and since every POP announces that same address from its own same-role
+node, the reply can land on **a different POP's node entirely**, which has no
+matching outstanding query. That produces intermittent, load-dependent failures
+that only appear in production. Sourcing from a unique per-node address makes
+replies come home, and gives upstream filters a single address to permit.
+
+### 3.4a Where the lab differs from the production model — stated, not glossed
+
+**The lab runs a single shared anycast address, on both nodes.** `deploy/lab/ns1.yaml`
+and `ns2.yaml` are byte-identical in their listeners:
+
+```yaml
+listen:
+  # The anycast address, identical on both nodes.
+  udp:
+    - "10.255.0.53:53"
+    - "[fd51:13:53::53]:53"
+```
+
+That is **not** the two-address model in §1. It was built to prove recursion,
+DNSSEC validation, health-driven withdraw/advertise, anycast failover and the
+pair link — all of which it proved. But the failover it demonstrated was
+*within* the POP (withdrawing ns1 moved the router's active gateway to ns2 for
+the same address), which is precisely the behaviour the production model does
+**not** have.
+
+**What this means concretely:** the properties in §1 that follow from one address
+per node — a subscriber's two resolvers never landing on one box, and a single
+node failure moving one address to the next POP — have been reasoned about but
+**not exercised end to end.** Two things need proving before the first
+production POP:
+
+1. A second anycast address, with each node announcing only its own, and the
+   router selecting correctly for both.
+2. That withdrawing one node moves *only* its address, out of the POP, while the
+   sibling's address stays put and keeps serving.
+
+Nothing in the daemon blocks this — `health.anycast_prefixes` is a list and each
+node reads its own config — but "nothing blocks it" is not the same as "it has
+been run".
 
 **Why a `dummy` device and not `lo`.** We need an address that never goes down,
 is not attached to a physical link, and never ARPs — the same trick
@@ -372,10 +439,19 @@ ns1 re-advertises on restart.
 **Decision.** `failure_threshold` 2, `success_threshold` 3, `min_hold` 30 s,
 `max_hold` 5 min, penalty doubling on each flap.
 
-**Why asymmetric.** Withdrawing a healthy node is cheap — anycast sends its
-traffic to a sibling. A flapping prefix is expensive to *every* node in the
-anycast set, because each withdrawal reconverges the network and in-flight
-queries are lost. So: fail fast, recover slowly.
+**Why asymmetric.** Withdrawing is cheap *relative to serving badly*: the
+address is picked up by the same-role node in the next-closest POP, so
+subscribers keep resolving on it, just further away — and their secondary is
+untouched and still local. A flapping prefix is expensive to *every* POP that
+carries the address, because each withdrawal reconverges the path and in-flight
+queries are lost, and each move shifts a state's worth of primary load onto a
+remote node. So: fail fast, recover slowly.
+
+**Note that withdrawal is not free here**, and it is more costly than it would be
+if both nodes carried both addresses (§1). A withdrawal always leaves the POP.
+That is an argument for withdrawing on genuine failure and not on noise —
+which is what `failure_threshold` 2 and the check design in §4.2 are for — not
+an argument for withdrawing slowly.
 
 **Enforced.** Config validation refuses `success_threshold < failure_threshold`
 with the reason in the message: *"recovery must be harder than failure, or the
@@ -483,6 +559,17 @@ digests, diff them, and pull only the payloads where the peer is newer
 
 **Why.** Sending the whole store on every reconnect would be wasteful and would
 scale badly with the subscriber count. Digests are small and the diff is exact.
+
+**Record kinds are numbered and never renumbered.** `RecordKind` values are
+persisted and replicated, so changing one would make a node read every existing
+record of that kind as something else.
+
+**This bought a real mixed-version property, observed rather than assumed.** When
+operator accounts (`KindUser`, 6) were added, ns2 ran the new build and ns1 ran a
+build that predated the record kind entirely. ns1 **stored the unknown record
+faithfully, rendered it as "unknown", and still agreed on the store hash.** That
+is the behaviour a rolling upgrade across a pair needs: an older node must not
+drop, mangle or diverge on a record type it does not understand.
 
 ### 5.4 `Store.Hash()` is the drift detector that replaces consensus
 
@@ -1396,6 +1483,77 @@ management server or not at all.
 source ACL automatically. A UI with its own listener is a second thing to get
 wrong, and it would be got wrong eventually.
 
+### 13.3a The operator console: no framework, no build step, embedded
+
+**Decision.** Three files — `index.html`, `app.js`, `style.css` — embedded in the
+binary with `go:embed` (`internal/management/ui.go`). No React, no bundler, no
+npm, no build step in the release pipeline.
+
+**Alternatives.** A single-page app in a framework, built by a Node toolchain and
+shipped as compiled assets; or a separately deployed UI talking to the API.
+
+**Why this one.**
+
+- **Nothing is fetched from a CDN**, so the content-security policy needs no
+  exception for one. A management console that pulls script from a third party
+  makes that third party an admin of your resolver.
+- **Embedded rather than read from disk**: a node has one binary and one config.
+  A UI that could be swapped out underneath the management plane would be a way
+  to serve attacker script from a privileged origin.
+- **No build step** means the release artifact is `go build`, and there is no
+  second toolchain to keep patched.
+
+**What it costs.** The console is deliberately plain, and it will stay plain. It
+covers status, the resolution and defence counters, and editors for subscribers,
+overrides, classes, feeds, tokens and operator accounts. Anything richer than
+that is a job for something reading the API, not for this.
+
+### 13.3b `unsafe-inline` is absent, and every value renders with `textContent`
+
+**Decision.** CSP is `default-src 'none'` with `script-src 'self'`,
+`style-src 'self'`, `form-action 'none'`, `frame-ancestors 'none'`,
+`base-uri 'none'`. The console renders every value with `textContent`, never
+`innerHTML`.
+
+**Why the two go together.** `'unsafe-inline'` is what turns an injected record
+value into executing script. Because the console never builds markup from data,
+it never needs the exception — so the policy can forbid it outright. A subscriber
+ID or feed name containing markup is displayed as text, not parsed.
+
+**The other headers, each with a reason:**
+
+| Header | Why |
+|---|---|
+| `X-Content-Type-Options: nosniff` | Without it, a response the browser decides is HTML — a record value, an error string — could render as a page from this origin |
+| `X-Frame-Options: DENY` | The admin plane has nothing to gain from being framed, and being framed is how clickjacking works |
+| `Referrer-Policy: no-referrer` | |
+| `Cross-Origin-Opener-Policy: same-origin` | |
+
+**These headers apply to API responses too, not just the console.** An error body
+is still something a browser could be talked into rendering.
+
+**Enforced by.** `internal/management/ui_test.go` asserts the CSP is present and
+each header has its exact expected value.
+
+### 13.3c The console loads without a session; everything behind it does not
+
+**Decision.** `GET /` serves the page unauthenticated, with `Cache-Control:
+no-store`. Every API call it then makes requires a session or token.
+
+**Why.** The page holds no data — it is markup, script and stylesheet. Gating it
+behind a login would mean the login form itself needs an exemption, which is the
+same surface with more moving parts. What matters is that the *data* behind it is
+gated, and there is a test for exactly that.
+
+### 13.3d Metrics for the console come through the management listener
+
+**Decision.** The console reads counters via the management listener, not by
+reaching across to `metrics.listen`.
+
+**Why.** Those are deliberately separate sockets with separate ACLs (§13.1).
+Punching a hole between them so a dashboard could read one from the other would
+undo the separation. If the console needs a number, the management API serves it.
+
 ### 13.4 API tokens are stored as a plain SHA-256, deliberately not a slow KDF
 
 **Decision.** A token is a 256-bit random secret, presented as `id.secret`, and
@@ -1754,6 +1912,8 @@ Everything we chose to live with, in one place.
 | 4 | **Pair-link failure detection on an idle link takes up to 30 s** | There is no keepalive; nothing on the query path waits on the link | `cgdns_peer_outbound_up` / `_inbound_up`; a link carrying queries detects within `fetch_timeout` |
 | 5 | **Health dampening state is lost on process restart** | Keeping it on disk adds a durability problem to a decision that should be fast | `StartLimitBurst=5` / `StartLimitIntervalSec=300` in the unit |
 | 6 | **A POP going dark sends its subscribers to the next-closest POP** | This is the design, not a failure — anycast doing its job | Latency change only; `cgdns_anycast_advertised` per node |
+| 6b | **A single node failure leaves the POP**, rather than being absorbed by the sibling: that address is then served from another state, and the remote same-role node carries two states' primary load | The price of never putting both of a subscriber's resolvers on one box (§1). The subscriber's other resolver stays local throughout | `cgdns_anycast_advertised` per node; capacity planning must assume a same-role node can inherit a neighbouring state's primary load |
+| 6c | **The lab implements one shared anycast address on both nodes, not the two-address production model** | It was built to prove recursion, DNSSEC, failover and the pair link, all of which it did | Real, and called out in §3.4a — the two-address model has **not** been exercised end to end |
 | 7 | **Nothing detects config drift between POPs automatically** | There is deliberately no cross-POP control plane | `cgdnsctl drift` is per-pair; cross-POP consistency is the provisioning system's job |
 | 8 | **We own DNS correctness** rather than inheriting Unbound's two decades of hardening | The three features that justify the product all need to be inside the resolver | Named regression tests for every security invariant; RFC + section cited in source; live and lab verification |
 | 9 | **NSEC3 zones get no aggressive-denial protection** | NSEC3 needs closest-encloser reasoning and per-candidate hashing; not yet built | Falls through to a normal lookup — correct, just not optimised. RRL still applies |
@@ -1767,7 +1927,6 @@ Everything we chose to live with, in one place.
 
 | Item | Status and reasoning |
 |---|---|
-| **WebUI** | The API it sits on is complete, and operator accounts with argon2id + TOTP landed specifically to support it. The UI itself is the remaining piece. It will be served by the management listener or not at all. |
 | **DoQ (RFC 9250)** | Lowest-value transport for this deployment — subscribers reach us over the carrier's own network, where DoQ's advantage over DoT is smallest. |
 | **Aggressive NSEC3** | NSEC is done. NSEC3 means hashing each candidate with the zone's parameters and reasoning about the closest encloser. Those zones fall through to a normal lookup, which is correct but unoptimised. |
 | **Config anti-entropy proven on live nodes** | Unit-tested, and the management API now makes runtime writes possible; the full multi-day live soak has not been run. |
@@ -1808,6 +1967,27 @@ became two nodes per POP: raft at N=2 has a quorum of 2, so a single node failur
 freezes the control plane — strictly worse than LWW replication, which keeps
 accepting writes. The code is shelved, not lost, and `internal/control` kept the
 record types and publisher from it.
+
+**"If ns1 dies, why doesn't ns2 just pick up its address? It's right there."**
+Because then both of a subscriber's resolvers could be served by one machine,
+and a node-level fault would take out both at once. Each node announces one of
+the two service addresses, in every POP, so the primary and secondary are always
+different hardware (§1). The cost is real and we accept it knowingly: BNE ns1
+failing means BNE subscribers' primary is answered by SYD ns1 until it returns,
+and SYD ns1 carries two states' primary load meanwhile — so capacity planning
+has to assume a same-role node can inherit a neighbouring state. Their secondary
+never moves. If that trade is ever judged wrong, §1 sets out the alternative
+(both addresses on both nodes, optionally with MED so each is preferred on its
+own node) — it would need BGP attributes `internal/health/gobgp.go` does not set
+today.
+
+**"Has the two-address model actually been run?"**
+No, and §3.4a says so. The lab proved recursion, DNSSEC, health-driven
+withdraw/advertise and the pair link — but on a *single shared* anycast address,
+so the failover it demonstrated was within the POP, which is the behaviour
+production will not have. The daemon does not block the real model
+(`anycast_prefixes` is a list, each node reads its own config), but it needs
+proving before the first production POP.
 
 **"What happens if the link between ns1 and ns2 goes down?"**
 Lab-verified with iptables DROP in both directions: both halves report the link
@@ -1921,7 +2101,13 @@ Genuinely undecided, flagged rather than hidden:
 5. **Canary check target.** `health.canary` is optional and currently unset.
    Pointing it at a third party means *their* outage withdraws our node — so if
    it is used, it must be something we operate.
-6. **RFC 8326 `GRACEFUL_SHUTDOWN` community on planned maintenance.** Today a
+6. **Prove the two-address anycast model in the lab** (§3.4a). The lab runs one
+   shared address on both nodes; production gives each node its own. Needs a
+   second address configured, each node announcing only its own, and a
+   demonstration that withdrawing one node moves only that address, out of the
+   POP, while the sibling keeps serving the other. This should happen before the
+   first production POP, not during it.
+7. **RFC 8326 `GRACEFUL_SHUTDOWN` community on planned maintenance.** Today a
    planned restart does a plain withdraw before the listeners stop, which works
    but drops whatever was in flight at the moment the route disappears. Tagging
    the routes with the well-known community first would let the adjacent router
@@ -1938,8 +2124,10 @@ generally also in the source at the point it constrains behaviour — the config
 validator's error messages in particular are written to explain *why* a
 configuration is refused, not just that it was.
 
-Three stale references to the removed raft implementation still sit in doc
-comments (`internal/config/config.go` on `Subscriber` and `Policy`, and the
-`internal/cache` package doc). They describe replication that no longer works
-that way. They are cosmetic and do not affect behaviour, but they should be
-corrected so the source does not contradict this document.
+Seven doc comments and config comments still described replication as going
+through raft (`internal/config/config.go` on `Subscriber` and `Policy`,
+`internal/control/records.go`, `internal/policy/load.go`, the `internal/cache`
+package doc, and two comments in `deploy/dev/cgdns-recursive.yaml`). They were
+cosmetic — no behaviour depended on them — but they contradicted both the code
+and this document, so they have been corrected to describe the control store as
+it actually works.
