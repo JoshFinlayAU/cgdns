@@ -55,7 +55,7 @@ func TestValidate_Rejects(t *testing.T) {
 		{
 			name:    "no listeners at all",
 			mutate:  func(c *Config) { c.Listen.UDP = nil; c.Listen.TCP = nil },
-			wantErr: "at least one of listen.udp, listen.tcp, listen.dot or listen.doh",
+			wantErr: "at least one of listen.udp, listen.tcp, listen.dot, listen.doh or listen.doq",
 		},
 		{
 			// An open recursive resolver is an amplification source. There is

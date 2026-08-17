@@ -48,7 +48,7 @@ The anycast0 dummy interface was a trial by fire decision that was settled on to
 
 **DNSSEC validation** - full chain of trust with IANA root anchors embedded. NSEC and NSEC3 denial of existence, NSEC3 iteration limits per RFC 9276. A broken chain is SERVFAIL with an RFC 8914 extended error; there is no silent downgrade. A stripped DS is *bogus*, not insecure - an unproven insecure delegation is a downgrade attack. `AD` is set only on a chain verified locally.
 
-**Transports** - UDP, TCP, DoT (RFC 7858), DoH (RFC 8484 over HTTP/2). All dual-stack. UDP uses `SO_REUSEPORT` per-address sockets so replies leave with the correct anycast source. DoH ignores forwarding headers unless the peer is a configured trusted proxy, because the client address selects subscriber policy.
+**Transports** - UDP, TCP, DoT (RFC 7858), DoH (RFC 8484 over HTTP/2), DoQ (RFC 9250). All dual-stack. DoQ shares port 853 with DoT but not the socket - one is TCP, the other UDP - and gives every query its own stream, so a slow answer no longer stalls the ones behind it the way it does on a shared DoT connection. Measured on a dev node: 40 concurrent queries on one connection in 180 ms. It wants a larger UDP receive buffer than the kernel default; raise `net.core.rmem_max` and `net.core.wmem_max` or the QUIC stack will log that it could not. Message IDs must be zero (a stream carries exactly one exchange, so there is nothing to correlate) and `edns-tcp-keepalive` is refused, both per RFC 9250; 0-RTT is left off, since its data is replayable and a resolver would take on that problem to save a round trip. UDP uses `SO_REUSEPORT` per-address sockets so replies leave with the correct anycast source. DoH ignores forwarding headers unless the peer is a configured trusted proxy, because the client address selects subscriber policy.
 
 **Subscriber policy** - RPZ zones and plain domain lists, compiled per subscriber class with specificity-ordered matching. Per-subscriber allow and block overrides take precedence over shared class feeds, so one customer can be unblocked without editing a feed you may not own. Blocked answers carry EDE 15 so clients can distinguish policy from a genuine NXDOMAIN. A feed that fails to load leaves the previous rules serving - filtering goes stale, resolution does not.
 
@@ -108,10 +108,14 @@ cgdnsctl user create josh admin      # prompts for the password, never an argume
 
 ## Not yet implemented
 
+Everything on the original list is in. What remains is real work, not polish:
+
 | | Status |
 |---|---|
-| DoQ | RFC 9250. |
-
+| Feed fetching | A feed record carries a URL and a SHA256, but nothing fetches or refreshes one — feeds load from a local file. The scheduler and the hash check are the missing half. |
+| Policy reload | Rules are compiled once at startup. The atomic swap the query path reads from is already there; nothing triggers it yet, so a feed change needs a restart. |
+| Public IPv6 anycast | Deliberately deferred. It needs a routed prefix rather than the on-link /64 the lab has. |
+| Session replication | A WebUI session is node-local, so moving to the sibling means signing in again. That is a considered trade, not an oversight — see the console section. |
 
 ## Design constraints
 

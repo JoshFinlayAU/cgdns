@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/quic-go/quic-go v0.61.0 // indirect
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

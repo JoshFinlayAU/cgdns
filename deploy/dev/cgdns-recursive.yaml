@@ -23,6 +23,13 @@ listen:
 
   # DNS over TLS (RFC 7858) and DNS over HTTPS (RFC 8484). Production ports are
   # 853 and 443; these are unprivileged so dev needs no capabilities.
+  # DNS over QUIC (RFC 9250). Same port number as DoT but a different socket:
+  # one is TCP, the other UDP.
+  doq:
+    - "127.0.0.1:8853"
+  doq_max_idle_timeout: 30s
+  doq_max_streams_per_conn: 256
+
   dot:
     - "127.0.0.1:8853"
     - "[::1]:8853"

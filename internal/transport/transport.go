@@ -29,6 +29,7 @@ const (
 	ProtoTCP
 	ProtoDoT
 	ProtoDoH
+	ProtoDoQ
 )
 
 // String implements fmt.Stringer.
@@ -42,6 +43,8 @@ func (p Proto) String() string {
 		return "dot"
 	case ProtoDoH:
 		return "doh"
+	case ProtoDoQ:
+		return "doq"
 	default:
 		return "unknown"
 	}
@@ -89,6 +92,9 @@ type Metrics struct {
 	Dropped     atomic.Uint64
 	TCPAccepted atomic.Uint64
 	TCPRefused  atomic.Uint64
+	// DoQRefused counts QUIC connections closed because the source is not
+	// permitted by listen.allow_query.
+	DoQRefused atomic.Uint64
 }
 
 // minUDPSize is the largest response we may send to a client that offered no

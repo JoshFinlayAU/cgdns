@@ -24,6 +24,17 @@ listen:
   # dot: ["<anycast-v4>:853", "[<anycast-v6>]:853"]
   # doh: ["<anycast-v4>:443", "[<anycast-v6>]:443"]
 
+  # DNS over QUIC (RFC 9250). The same port number as DoT but a different
+  # socket: one is TCP, the other UDP, so both can run on 853 at once.
+  #
+  # QUIC gives every query its own stream, so a slow answer no longer stalls the
+  # ones behind it the way it does on a shared DoT connection. It wants a larger
+  # UDP receive buffer than the kernel default -- raise net.core.rmem_max and
+  # net.core.wmem_max to a few MB or the stack will log that it could not.
+  # doq: ["<anycast-v4>:853", "[<anycast-v6>]:853"]
+  doq_max_idle_timeout: 30s
+  doq_max_streams_per_conn: 256
+
   # SO_REUSEPORT sockets per UDP address, and handler goroutines per socket.
   # Together they bound in-flight queries. 0 means one socket per CPU and the
   # built-in worker default.

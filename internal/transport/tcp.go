@@ -261,6 +261,12 @@ func addrPortOf(a net.Addr) (netip.AddrPort, bool) {
 			return netip.AddrPortFrom(ap.Unmap(), uint16(ta.Port)), true
 		}
 	}
+	// QUIC connections report a UDP address.
+	if ua, ok := a.(*net.UDPAddr); ok {
+		if ap, ok := netip.AddrFromSlice(ua.IP); ok {
+			return netip.AddrPortFrom(ap.Unmap(), uint16(ua.Port)), true
+		}
+	}
 	ap, err := netip.ParseAddrPort(a.String())
 	if err != nil {
 		return netip.AddrPort{}, false

@@ -48,7 +48,7 @@ benchmark / fuzz functions.
 13. [The management plane](#13-the-management-plane)
 14. [Configuration philosophy](#14-configuration-philosophy)
 15. [Packaging and deployment](#15-packaging-and-deployment)
-16. [Performance and the query path](#16-performance-and-the-query-path)
+16. [Performance, privacy and telemetry](#16-performance-privacy-and-telemetry)
 17. [Accepted risk register](#17-accepted-risk-register)
 18. [Not built yet, and why that order](#18-not-built-yet-and-why-that-order)
 19. [Questions you are going to ask](#19-questions-you-are-going-to-ask)
@@ -115,27 +115,233 @@ broken**.
 itself: it asks a root server, follows referrals, handles glue, chases CNAMEs,
 and validates DNSSEC — all in our process.
 
-**Alternatives considered.**
+#### The four requirements every candidate was measured against
 
-| Option | Why not |
-|---|---|
-| Wrap **Unbound** in a supervisor and drive its control socket | The product's value is per-subscriber policy, pair replication and the anycast health decision. All three would become "shell out and hope": policy via generated config files and a reload, health via parsing `unbound-control stats`, cache sharing not possible at all. Unbound's cache is not addressable from outside the process. |
-| Wrap **BIND 9** | Same problem, plus a much larger attack surface and a config language we would be generating rather than validating. |
-| **PowerDNS Recursor** with Lua policy hooks | The closest fit — Lua hooks could express per-subscriber policy. Rejected because it puts a scripting language on the hot path of a carrier resolver, and because the deployment story becomes "our daemon plus their daemon plus a Lua bundle", with two failure domains to reason about during an incident. |
-| **Knot Resolver** with its module system | Same shape of objection as PowerDNS, smaller operator community here. |
+Stating these first is what makes the rejections definitive rather than
+preferences. A candidate had to be able to do all four **without being patched**,
+because a fork of someone else's resolver that we maintain forever is a worse
+position than writing our own, not a better one.
 
-**Why this one.** Three things we need are *inside* the resolver, not beside it:
+| # | Requirement | Why it is not negotiable |
+|---|---|---|
+| **R1** | Per-subscriber policy on the query path, identity by longest-prefix match on the source address, with a per-subscriber allow list beating shared class feeds, **and no I/O, no reload and no cache flush when it changes** | Provisioning events are continuous. A resolver that hiccups on every subscriber change is not carrier-grade (§10.2) |
+| **R2** | Insert and retrieve **individual cache entries** at runtime, carrying remaining TTL and DNSSEC status | This is what push-on-fill and pull-on-miss between the pair are (§6.3) |
+| **R3** | A health probe that traverses the **real serving path** — rate limiter, policy, serve-stale, resolver — whose result drives BGP | A probe of a private path proves the probe works (§4.2) |
+| **R4** | Per-address `SO_REUSEPORT` sockets and per-family outbound source pinning | Anycast reply-source correctness (§3.4, §9.2) |
 
-1. **Per-subscriber policy on the query path with zero I/O.** Our enforcer reads
-   an atomically-swapped in-memory structure. A wrapped resolver would need a
-   config regeneration and reload per policy change, on a box taking production
-   traffic.
-2. **Cache sharing between the pair.** `internal/peer` pushes a filled RRset to
-   the sibling and pulls on a miss. That requires addressing the cache directly.
-3. **The health decision.** `internal/health` probes through the *real serving
-   path* — the same handler chain a subscriber's query traverses — and that
-   result is what drives BGP. Probing a third-party daemon over a control socket
-   tests the control socket.
+**R2 is the one that kills every candidate outright.** Not one of the four
+mainstream recursors exposes per-entry cache insertion. That is not an oversight
+on their part — a resolver's cache is a security boundary, and an API that lets
+anything write into it is a poisoning primitive. Their position is right for
+their product and disqualifying for ours.
+
+#### Unbound — rejected on R1 and R2
+
+The default choice, and the one that needed the most work to rule out.
+
+- **R1: views cannot be created at runtime.** Per-client policy in Unbound is
+  `access-control-view`, binding a source ACL to a named view. Views are declared
+  in `unbound.conf` and read at startup or reload. `unbound-control` can modify
+  an *existing* view's contents (`view_local_data`, `view_local_zone`) but cannot
+  bring a new view into existence. **So a new subscriber with an override means
+  editing a config file and reloading a box that is taking production traffic** —
+  and at 500 k subscribers that is a config file with a view per subscriber.
+- **R1: reload is not free.** `unbound-control reload` re-reads the whole config;
+  historically it also dropped the cache, and while newer versions offer
+  `reload_keep_cache`, the operation is still a stop-the-world re-parse of a
+  file we would be generating. Compare with our atomic pointer swap, which costs
+  the query path nothing and cannot fail halfway.
+- **R2: no per-entry cache access.** `unbound-control` gives `dump_cache` and
+  `load_cache`, which are whole-cache text dumps. There is no "insert this RRset
+  with this remaining TTL". Pair cache sharing is therefore not implementable.
+- **R3: partially achievable** — probing over loopback does traverse Unbound's
+  real path — but the policy and rate-limiting layers would be Unbound's, and the
+  internals we would need for the decision come from parsing
+  `unbound-control stats_noreset`.
+- **R4: achievable.** Unbound has `so-reuseport` and `outgoing-interface`. This is
+  the one requirement it meets cleanly.
+- **The escape hatch, and why it is worse.** Unbound has `dynlibmod`, so per
+  subscriber policy could be a C module inside its event loop. That means writing
+  C against a module ABI, in someone else's memory model, pinned to their
+  internal structures across upgrades — strictly more risk than writing Go, and
+  it still does not solve R2.
+
+Licence (BSD-3) would have been no obstacle. It failed on capability.
+
+#### BIND 9 — rejected on R1, R2 and on surface area
+
+- **R1 and R2:** the same view-and-reload and no-cache-insert problems as
+  Unbound. `rndc reconfig` to add a view.
+- **Surface area is its own disqualifier.** BIND 9 is an authoritative server, a
+  DNSSEC signer, a dynamic-update target, a catalog-zone consumer and a DLZ host,
+  in addition to being a recursor. We need none of that, and every line of it is
+  attack surface on a box reachable by every subscriber. The project's own goal
+  line is "recursive DNS at carrier scale… bug free" — shipping five subsystems
+  we do not use contradicts it directly.
+- **Performance.** It is consistently the slowest of the mainstream recursors on
+  recursion, which is why large recursive deployments have been migrating off it
+  for a decade.
+
+#### PowerDNS Recursor — the strongest candidate, and the closest call
+
+It deserves an honest hearing, because its Lua hooks genuinely could express
+most of R1.
+
+- **What it gets right.** `gettag` is called per query specifically to classify a
+  client cheaply and return a tag that selects downstream policy. With netmask
+  trees for prefix matching, that is very close to `subscriber.Classify`.
+  `preresolve`, `postresolve` and `nxdomain` cover the enforcement points, and
+  RPZ is well supported.
+- **R1 fails on the hot path, not on expressiveness.** `gettag` runs a Lua VM
+  **per query**. Our budget is zero allocations and a 3.6 ns classification
+  (§16.1); a scripting VM invocation per query is orders of magnitude off that,
+  and it introduces a second garbage collector interacting with the process under
+  load. PowerDNS's own documentation warns about the cost of per-query Lua.
+- **R1 also fails on the update path.** Reloading policy means re-running the Lua
+  script. There is no incremental "this one subscriber changed" path, and no
+  replication of that state to a sibling — we would be building §5 and §6
+  regardless.
+- **R2 fails outright.** `rec_control` offers `wipe-cache` and `dump-cache`. There
+  is no insert.
+- **The decisive practical point.** Choosing PowerDNS means writing: a Lua policy
+  layer, an external control-plane store, an external replication daemon, an
+  external health daemon driving BGP — **that is most of this repository** — and
+  at the end of it still not having pair cache sharing. The build is not avoided,
+  only fragmented across two languages and two processes.
+- **Licence: GPLv2.** With the project licence still undecided (§20), building
+  the product on a GPLv2 core constrains that decision permanently. That is a
+  commercial consideration, not a technical one, but it is real and it is
+  irreversible.
+
+#### Knot Resolver — rejected on R1, R2 and licence
+
+- **What it gets right.** The `view` module does per-subnet policy directly, and
+  Knot Resolver 6's declarative config with a management API is architecturally
+  the closest of any candidate to what we built.
+- **Its cache is the only one that is externally addressable at all** — LMDB,
+  memory-mapped and shared between worker processes on one machine. That is worth
+  acknowledging honestly. But it is shared *between processes on a host*, not
+  between hosts: LMDB over a network filesystem is unsafe, and the layout is an
+  internal format with no stability guarantee. **Building pair replication on
+  another project's undocumented on-disk format is a maintenance trap** — every
+  upstream release becomes a risk to our replication.
+- **R1**: per-query Lua policy, same objection as PowerDNS.
+- **Licence: GPLv3**, which constrains the licence decision harder than PowerDNS
+  does.
+- Smaller operator community locally, which matters at 3 a.m.
+
+#### CoreDNS — the "why not extend a Go project" answer
+
+This is the sharpest version of the question, because CoreDNS is Go, has a clean
+plugin chain, and would let us write policy in the same language.
+
+- **It is not a recursive resolver.** CoreDNS forwards; its `forward` plugin
+  sends queries to an upstream. There is no delegation walk, no bailiwick
+  handling, no DNSSEC chain building. The historical way to get recursion under
+  CoreDNS was a plugin wrapping **libunbound via cgo** — which lands us back at
+  Unbound, now with cgo in the build and a third project in the dependency chain.
+- **Its performance model is wrong for this.** The plugin chain and its message
+  handling allocate per query; it is built for Kubernetes service discovery at
+  moderate rates, not carrier recursion with a zero-allocation hot path.
+- So CoreDNS would have given us the language, and none of R1–R4.
+
+#### dnsmasq, systemd-resolved, nscd — category, not capability
+
+All three are stub or forwarding caches for a host or a small network. None
+recurses; each requires a real recursive resolver behind it. They are consumers
+of this product, not alternatives to it. nscd gets its own entry below (§2.1a)
+because it is the one most often raised.
+
+#### Buy rather than build
+
+Commercial carrier DNS platforms exist and do all of this. That is a genuine
+option and was weighed as one. Against it: recurring per-subscriber licensing on
+a function that is pure cost, no ability to change filtering behaviour on our own
+timetable, subscriber query data leaving our control, and an upgrade cadence set
+by a vendor. The build cost here is bounded and now largely spent; the licence
+cost would have compounded for as long as the product existed.
+
+---
+
+### Why we went this way — the positive case in full
+
+The rejections above say what would not work. This is what the chosen approach
+actually buys, beyond avoiding those problems.
+
+**1. All four requirements land in one process, so there is one failure domain.**
+During an incident there is one log stream, one metric namespace, one config
+file, one binary version to confirm. The alternative architectures all end as
+"our daemon plus their daemon plus a glue layer", where the interesting failures
+live in the seams and no single component's logs explain them.
+
+**2. Policy changes cost the query path nothing.** `policy.Registry` and
+`subscriber.Classifier` both swap an atomic pointer. A provisioning push does not
+reload a config, does not regenerate a file, does not flush a cache, and cannot
+pause resolution. Measured: 3.6 ns / 7.0 ns per classification, zero allocations
+(§16.1). No candidate could offer this without a per-query scripting VM or a
+config reload.
+
+**3. Cache sharing is expressible at all.** Push-on-fill and pull-on-miss with
+TTL decremented in transit and DNSSEC status carried alongside (§6.3, §6.4)
+require direct entry access in both directions. Owning the cache is the only way
+to have it, and it is what makes a cold node useful within seconds of joining its
+pair rather than within a TTL cycle.
+
+**4. Health means what it says.** The probe runs
+`udp → ratelimit → policy → servestale → resolver` — the same chain a subscriber
+traverses — so a pass means subscribers are being served, not that a control
+socket answered. This is not theoretical: the probe caught a real
+addressless-delegation bug that every unit test missed (§4.2), and it is what
+lets serve-stale and health interact correctly (§12.2) rather than a cut-off node
+holding its prefix forever.
+
+**5. The client's wall-clock budget threads through everything for free.** Go's
+`context` deadline is derived once from the client budget and carried into every
+outbound query, every glueless nameserver lookup and every DNSSEC chain fetch, so
+one inbound query genuinely cannot exceed its allowance (§7.2). Retrofitting that
+guarantee into an event-loop C daemon's callback structure is exactly the kind of
+change that gets it 95 % right and leaves a path that ignores the deadline.
+
+**6. Every security invariant is ours to test.** Bailiwick rules, the 32-query
+amplification cap, 0x20 verification, stripped-DS-is-bogus — each has a named
+regression test that fails if the property regresses (§7, §8). With a wrapped
+resolver those properties are real but unowned: we would be trusting them, not
+verifying them, and we could not add one the upstream did not already have —
+aggressive NSEC scoped by the SOA's own zone (§8.8) being a concrete example.
+
+**7. Telemetry is defined by us, including what it deliberately omits.** 87
+series, and **no QNAME or client-address label anywhere, by construction**
+(§16.5). With a wrapper, the telemetry is whatever they expose and the privacy
+property is not ours to guarantee — a subscriber browsing history reconstructable
+from a metric series would be our problem and someone else's design.
+
+**8. One static binary, one config file, no runtime dependencies.** Packaging is
+`go build` plus nfpm; upgrade is replacing a file. No shared library ABI, no
+scripting runtime to keep patched, no second daemon whose version must be matched.
+
+**9. The licence stays an open decision.** Not inheriting GPLv2 or GPLv3 from a
+core dependency keeps §20 an actual choice.
+
+**10. The failure modes are ones we can reason about.** Every accepted risk in
+§17 is one we chose and can measure. Wrapping means inheriting a set of failure
+modes that are someone else's design, discovered during incidents.
+
+---
+
+### What would make this decision wrong
+
+Stated plainly, because a decision record that cannot be falsified is marketing.
+
+**If per-subscriber policy and pair cache sharing were both dropped from the
+product, Unbound would be the correct answer and this project would not be
+justified.** R1 and R2 are what carry the decision; R3 and R4 are achievable
+elsewhere with effort. Anyone arguing to buy or wrap should be arguing that those
+two requirements are not real — that is the actual debate, and it is a legitimate
+one to have.
+
+The other way it goes wrong is sustained under-investment: a resolver we own
+needs the invariant tests kept green and the RFC behaviour kept current. That
+obligation does not end, and it is the true cost of the decision.
 
 **What it costs.** This is the single most expensive decision in the project. We
 now own DNS correctness: bailiwick rules, EDNS negotiation, TCP fallback, CNAME
@@ -149,6 +355,49 @@ largest test surface in the repo. Verified live against the real root servers
 (cold 1.1 s, warm 156 ms, cross-TLD CNAME chains, glueless delegations, NXDOMAIN
 with SOA, both address families) and against `dnssec-failed.org` (SERVFAIL, EDE
 9, `AD` unset).
+
+### 2.1a Why nscd is not in that table
+
+It comes up, and it is a fair question to ask, because the name reads as "the
+Linux DNS cache daemon". It is worth answering properly rather than waving away.
+
+**What nscd actually is.** glibc's **Name Service Cache Daemon**. It caches
+**NSS** lookups — `passwd`, `group`, `hosts`, `services`, `netgroup` — on behalf
+of **processes running on the same machine**, reached over a local Unix socket.
+
+**Why it is not a candidate, in order of severity:**
+
+1. **It is not a DNS server.** It does not listen on port 53, does not speak the
+   DNS wire protocol to clients, and cannot answer a subscriber's query. A
+   subscriber's CPE cannot point at it.
+2. **It does not resolve.** nscd caches the *result* of `getaddrinfo()`, which it
+   obtains by asking whatever `/etc/resolv.conf` names. It therefore **requires a
+   real recursive resolver behind it** — it is a consumer of the thing this
+   project builds, not a substitute for it.
+3. **It caches names, not RRsets.** Its `hosts` cache is name→address. There is no
+   MX, TXT, SRV, NS, SOA, CNAME chain or DNSKEY, because NSS has no concept of
+   them.
+4. **It ignores DNS TTLs.** The `hosts` cache expires on a configured
+   `positive-time-to-live` constant, not on the TTL the authoritative published.
+   For a carrier that is disqualifying on its own: CDN and cloud failover *are*
+   TTLs, and a cache that overrides them hands subscribers endpoints that have
+   already moved.
+5. **No DNSSEC, no EDNS, no TCP fallback, no 0x20, no QNAME minimisation.** None
+   of §7 or §8 exists in it, and none of it could.
+6. **Single host, no anycast, no pair, no policy, no operator API**, and no
+   metrics beyond `nscd -g`.
+
+**The correct comparison for nscd is `systemd-resolved`'s cache or a browser's
+DNS cache** — a client-side stub cache — not Unbound or BIND. If anything, nscd
+is what a subscriber's own Linux box might run *in front of* cgdns.
+
+**Its trajectory, for completeness.** nscd is still shipped by glibc upstream and
+still packaged by Debian, so "it was removed" would be wrong. But Fedora
+deprecated it in F34 and dropped the subpackage in F35, pointing users at
+`systemd-resolved` and `sssd`; and glibc 2.40 (July 2024) shipped fixes for four
+nscd CVEs, including a stack-based buffer overflow in the netgroup cache
+(CVE-2024-33599). It is not where the ecosystem is investing. That is a
+supporting argument only — points 1 to 3 above decide it on their own.
 
 ### 2.2 Go
 
@@ -196,6 +445,7 @@ gives us.
 | `golang.org/x/net` | HTTP/2 for DoH | |
 | `golang.org/x/sys` | `SO_REUSEPORT` | |
 | `golang.org/x/term` | Password prompt in `cgdnsctl` | So a password is never a shell argument |
+| `quic-go/quic-go` | QUIC transport for DoQ (§9.5) | Go has no QUIC in the standard library; this is the only mature pure-Go implementation |
 | `google.golang.org/grpc` | Transport for the gobgp client | |
 | `gopkg.in/yaml.v3` | Config parsing | Needed for `KnownFields(true)` — §14.1 |
 
@@ -218,8 +468,7 @@ no primary, no quorum.
 **Alternatives considered.**
 
 - **One cluster spanning all POPs**, with consensus on config and a globally
-  shared cache. This was the original assumption in the project spec, and it was
-  abandoned on 2026-08-16.
+  shared cache.
 - **A VIP inside each POP** with keepalived/VRRP, so one node is active.
 - **N-node clusters per POP** (3 or 5), so quorum survives a single loss.
 
@@ -276,8 +525,8 @@ entry off-POP. The pair link is point-to-point between two configured addresses
 ### 3.3 Raft and memberlist were built, then deleted
 
 **Decision.** `internal/cluster` — an embedded HashiCorp raft FSM with
-raft-boltdb, plus memberlist gossip, roughly 830 lines, working and tested — was
-removed on 2026-08-16.
+raft-boltdb, plus memberlist gossip, roughly 830 lines, working and tested — is
+not part of the product.
 
 **Why.** A two-node raft has a quorum of 2 of 2. A single node failure freezes
 the control plane completely. That is **strictly worse than having no consensus
@@ -1027,9 +1276,34 @@ names", so one denial answers for every name in the gap. `internal/aggressive`
 stores those ranges and synthesises denials from them. On by default.
 
 **Why.** Against a random-subdomain (water-torture) flood aimed at a **signed**
-zone this is the strongest defence available — the flood never leaves this node.
-Measured on the live internet: **100 made-up names produced 99 synthesised
-denials and zero outbound queries.**
+zone this is the strongest defence available, because the denial is answered here
+rather than at the zone being attacked.
+
+**Measured on the live internet, 50 random names per zone:**
+
+| Zone | Denial type | Synthesised | Outbound |
+|---|---|---|---|
+| `nlnetlabs.nl` | NSEC | 49/50 | 6 |
+| `isc.org` | NSEC3 | 49/50 | 6 |
+| `debian.org` | NSEC3, large zone | 4/50, rising to 22/50 as the chain cached | 294, falling to 234 |
+| `google.com` | unsigned (control) | 0/50 | 250 |
+
+**The NSEC/NSEC3 gap is inherent, not an implementation shortfall.** NSEC gaps
+are contiguous in name space, so one denial covers many made-up names at once.
+NSEC3 hashes scatter names uniformly across the chain, so each made-up name tends
+to land in a different gap. The result is close to total protection on a small or
+NSEC-signed zone, and a gradual saving that improves as the chain caches on a
+large NSEC3 one. An unsigned zone gets nothing from this — there is no proof to
+reuse — which is what the `google.com` row is there to show.
+
+**A correction worth recording, because it is a lesson about measurement.** An
+earlier version of this claimed "zero outbound queries". That figure was read
+from `cgdns_recursion_outbound_queries_total`, **which does not exist** — the
+metric is `cgdns_recursion_outbound_total` — so the shell arithmetic subtracted
+two empty strings and produced a zero that meant nothing. The synthesis counts
+were real; the outbound figure was not. Same family of error as the prefetch
+no-op in §12.5: a number that agrees with what you expect is not evidence until
+you have checked it is a number at all.
 
 **Safety properties that must not regress:**
 
@@ -1042,7 +1316,17 @@ denials and zero outbound queries.**
   synthesised by one.
 - The proof returned includes the SOA and RRSIGs, so a DO client can validate it
   itself.
-- **NSEC3 is not handled** and falls through to a normal lookup — see §18.
+- **NSEC3 is handled, and more strictly than NSEC.** An NSEC records a gap
+  between names and can be checked against a name directly. NSEC3 records a gap
+  between *hashes*, and a hash says nothing about where a name sits, so proving
+  absence needs three records together: one matching the closest encloser, one
+  covering the next closer name, and one covering the wildcard that could
+  otherwise still answer.
+- **Opt-out spans are never used.** Such a span may contain unsigned
+  delegations, so it proves only that nothing *signed* is there. Treating it as
+  proof of absence would let this node deny names that genuinely exist.
+- **Unknown hash algorithms and iteration counts above the RFC 9276 limit are
+  refused**, not reasoned about.
 
 Bounded by `aggressive_nsec_max_zones` (10 000) and
 `aggressive_nsec_max_records_per_zone` (512).
@@ -1072,7 +1356,7 @@ and the anchor refreshed before it validates.
 
 ## 9. Transports
 
-### 9.1 All four, all dual-stack: UDP, TCP, DoT, DoH
+### 9.1 All five, all dual-stack: UDP, TCP, DoT, DoH, DoQ
 
 | Transport | RFC | Note |
 |---|---|---|
@@ -1080,6 +1364,7 @@ and the anchor refreshed before it validates.
 | TCP | 7766 | Multiple queries per connection, idle timeout |
 | DoT | 7858 | Reuses the TCP connection loop under a TLS listener — the framing is identical |
 | DoH | 8484 | HTTP/2, GET and POST |
+| DoQ | 9250 | QUIC, one stream per query — no head-of-line blocking between concurrent queries |
 
 **DoT reusing the TCP loop** is a deliberate simplification: DNS-over-TLS is
 DNS-over-TCP inside TLS, with the same 2-byte length prefix. Writing a second
@@ -1138,12 +1423,31 @@ whitelist.
 header, trusted without, untrusted with, untrusted without):
 `TestDoH_ClientAddressResolution`.
 
-### 9.5 DoQ is deferred
+### 9.5 DoQ (RFC 9250)
 
-RFC 9250 (DNS over QUIC) is not built. It is the lowest-value transport for this
-deployment — subscribers reach the resolver over the carrier's own network,
-where DoQ's head-of-line-blocking advantage over DoT matters least. It is on the
-list (§18).
+**Decision.** DNS over QUIC, served on 853/UDP — the same port number as DoT but
+a different socket, since one is TCP and the other UDP.
+
+**What it buys over DoT.** QUIC gives each query its own stream, so
+head-of-line blocking between concurrent queries disappears. On DoT, one slow
+answer stalls everything behind it on the same TCP connection.
+
+**Decisions inside it:**
+
+- **ALPN `doq` is set by the listener, not taken from the caller.** A listener
+  that negotiated anything else would not be a DoQ listener, and a client that
+  does not offer the token is refused during the handshake rather than after.
+- **`doq_max_streams_per_conn`** caps concurrent queries on one connection. That
+  is what stops a single client opening unbounded work — the QUIC equivalent of
+  the bounded worker pool on UDP (§9.3).
+- **Addresses are bound individually, never a wildcard**, for exactly the same
+  reason as the UDP listener: a reply has to leave from the address it arrived
+  on (§9.2).
+- RFC 9250's application error codes are used properly, including
+  `0x4 DOQ_EXCESSIVE_LOAD` for shedding a client rather than dropping it silently.
+- **RFC 9250 §4.2.1:** the message ID on a DoQ stream is zero, because a stream
+  carries exactly one exchange. Answering a non-zero ID would invite clients to
+  treat a stream as multiplexed. There is a test for it.
 
 ---
 
@@ -1851,7 +2155,7 @@ postinstall now warns about this.
 
 ---
 
-## 16. Performance and the query path
+## 16. Performance, privacy and telemetry
 
 ### 16.1 Measured numbers
 
@@ -1898,6 +2202,111 @@ level. `privacy.Redact` reduces a name to its registrable domain.
 **Why.** A resolver log is a record of what subscribers looked at. Metric labels
 are worse — they are scraped, stored and retained by default.
 
+`privacy.Hash` exists for correlating log lines without the name appearing. It is
+**unkeyed**, so it defends against casual disclosure only, not against someone
+who can hash candidate names — a threat model needing that wants an HMAC with a
+rotated per-node key, and the source says so rather than implying more than it
+delivers.
+
+### 16.5 Telemetry: what comes out of this, and at what cost
+
+**Decision.** Two streams, both structured, both cheap: a Prometheus endpoint on
+the management plane, and structured event logs on stderr.
+
+**87 metric series**, and the shape of them matters more than the count:
+
+| Subsystem | Series | Answers the question |
+|---|---|---|
+| `recursion_*` | 12 | Is the delegation walk healthy — referrals, bogus referrals, budget/depth exhaustion, 0x20 mismatches, glueless lookups, EDNS downgrades, TCP fallbacks, CNAME chases, minimise fallbacks |
+| `peer_*` | 11 | Is the pair link up in both directions, what is it saving us, is anything looping |
+| `policy_*` | 8 | What is filtering doing, including per-subscriber override hits |
+| `ratelimit_*` | 7 | Are we under attack, and is the limiter itself under pressure (evictions) |
+| `prefetch_*`, `nsec_*` | 5 + 5 | Are the two cache-warmth defences actually working |
+| `cache_*`, `infra_*` | 5 + 1 | Hit rate, evictions, what we know about authoritatives |
+| `anycast_*` | 5 | **Is this node taking traffic, and is dampening escalating** |
+| `dnssec_*`, `serve_*` | 3 + 3 | Validation outcomes; is expired data keeping subscribers online |
+| runtime (`goroutines`, `memory`, `gc`, `uptime`) | 4 | Standard process health |
+
+**The design decision behind them.** A metric is a `Source` with a
+`Read func() float64` closure, evaluated **at scrape time** over an atomic
+counter. So the hot path pays exactly one atomic increment per event, and all
+formatting, sorting and text generation is paid by the scraper. Observability
+does not tax the query path, which is what makes it acceptable to instrument
+this densely.
+
+**The privacy ceiling, which is deliberate and load-bearing.** Nothing is
+labelled by QNAME or client address. Not at debug, not behind a flag — the
+exporter has no label mechanism for them. A per-subscriber or per-domain series
+would let a browsing history be reconstructed from a time series, which is the
+same privacy failure as leaking the logs, only retained longer and readable by
+anyone with dashboard access. **This is the hard limit on what any telemetry
+pipeline downstream can ever contain**, and it is worth saying out loud before
+someone asks for per-subscriber query dashboards.
+
+### 16.6 Streaming it out
+
+**What is available today, with no change to the daemon:**
+
+- **The metrics endpoint** is a scrape target on the management address behind
+  the source ACL (§13.1) — Prometheus, VictoriaMetrics, a Telegraf `prometheus`
+  input, or anything else that scrapes. From there, remote-write into whatever
+  the NOC already runs.
+- **Structured JSON event logs.** `log.format: json` makes every line a JSON
+  object on stderr; systemd captures it to journald. From journald, a shipper —
+  Vector, Fluent Bit, promtail — streams it to Kafka, Loki, Elasticsearch or a
+  SIEM. **That is a genuine per-event stream today**, and it costs the daemon
+  nothing beyond writing the line, because the shipping happens outside the
+  process where backpressure cannot reach the query path.
+- The events worth streaming are already structured for it: DNSSEC bogus with the
+  reason, 0x20 case mismatches (off-path spoofing attempts), policy blocks with
+  subscriber and rule, anycast state transitions with the failing check named,
+  rate-limit engagement, peer link up/down, and every management-plane
+  authentication event with user and remote address.
+- **GoBGP has its own gRPC telemetry** for the routing side, independent of
+  cgdns, so the BGP view is already streamable by whatever monitors the routers.
+
+**What is not built, stated plainly so nobody assumes it:**
+
+| Not present | What it would give | Note |
+|---|---|---|
+| **OTLP / OpenTelemetry export** | Push metrics and traces to a collector | The cleanest addition — the `Source` registry maps onto OTLP metrics directly |
+| **gNMI / OpenConfig streaming** | Subscribe-and-push in the shape carrier NMS tooling already speaks | Most valuable if the NOC is already gNMI-based for the routers |
+| **dnstap** | Per-query streaming in the DNS-native format Unbound, BIND, Knot and PowerDNS all emit | See the warning below |
+| statsd, Kafka producer, pushgateway | Push without a shipper | Log shipping covers this today |
+
+**On dnstap specifically, since it is the obvious ask.** It is the standard for
+DNS query streaming and it would slot into the handler chain naturally. But
+**dnstap carries full QNAMEs and client addresses** — it exists to carry exactly
+what §16.4 spends effort keeping out of logs and metrics. Adding it would create
+the highest-sensitivity data stream in the platform, and it should therefore be a
+deliberate, ACL'd, off-by-default decision with a retention policy attached and
+lawful-intercept-grade handling — not a feature that arrives because a dashboard
+wanted it. Flagged as a decision to take consciously, not a gap to close
+casually.
+
+### 16.7 Alerting: the series that matter
+
+Not everything with a counter deserves a page. These do:
+
+| Metric | What a change means |
+|---|---|
+| `cgdns_anycast_advertised` | 0 means this node is not taking traffic — the single most important series |
+| `cgdns_anycast_flaps_total` | Rising means dampening is escalating; a node is sick, not merely down |
+| `cgdns_dnssec_bogus_total` | A broken zone, or an attack |
+| `cgdns_recursion_case_mismatch_total` | Non-zero means off-path spoofing attempts |
+| `cgdns_ratelimit_dropped_total` | An attack, or a rate set below what real clients need |
+| `cgdns_ratelimit_evictions_total` | Sustained means `max_buckets` is too small for the client population |
+| `cgdns_serve_stale_served_total` | Authoritatives failing; expired data is holding subscribers up |
+| `cgdns_prefetch_dropped_total` | `max_concurrent` too small — popular names expiring before their refresh gets a slot |
+| `cgdns_nsec_synthesised_total` | Rising fast means a flood of made-up names is being absorbed here rather than reaching the zone it targets |
+| `cgdns_peer_outbound_up` / `_inbound_up` | 0 means the pair is split and each node is on its own |
+
+**The store hash is deliberately not a metric.** Drift is a *comparison between
+two nodes*, and a single node cannot report it — publishing a hash as a series
+would invite an alert rule that cannot actually detect the condition. Use
+`cgdnsctl drift`, and alert on a disagreement that persists past a sync interval
+(§5.4).
+
 ---
 
 ## 17. Accepted risk register
@@ -1916,7 +2325,7 @@ Everything we chose to live with, in one place.
 | 6c | **The lab implements one shared anycast address on both nodes, not the two-address production model** | It was built to prove recursion, DNSSEC, failover and the pair link, all of which it did | Real, and called out in §3.4a — the two-address model has **not** been exercised end to end |
 | 7 | **Nothing detects config drift between POPs automatically** | There is deliberately no cross-POP control plane | `cgdnsctl drift` is per-pair; cross-POP consistency is the provisioning system's job |
 | 8 | **We own DNS correctness** rather than inheriting Unbound's two decades of hardening | The three features that justify the product all need to be inside the resolver | Named regression tests for every security invariant; RFC + section cited in source; live and lab verification |
-| 9 | **NSEC3 zones get no aggressive-denial protection** | NSEC3 needs closest-encloser reasoning and per-candidate hashing; not yet built | Falls through to a normal lookup — correct, just not optimised. RRL still applies |
+| 9 | **Aggressive denial saves much less on a large NSEC3 zone than on an NSEC one** (`debian.org`: 4/50 rising to 22/50, against 49/50 for NSEC) | Inherent to NSEC3: hashing scatters names across the chain, so one denial rarely covers the next made-up name. Not an implementation shortfall | Improves as the chain caches; RRL (§11) still caps what a flood costs regardless |
 | 10 | **The TOTP secret is stored recoverable** | Verifying a code requires computing it | Store file mode; replicates only over the mTLS pair link |
 | 11 | **`redirect` policy action returns an address the subscriber did not ask for** | It is what a walled-garden product requires | EDE 15 on every policy response so clients can tell |
 | 12 | **Rate limiting could in principle limit our own health probe** | Probes come from loopback and are answers, not denials | Live flood test asserts `cgdns_anycast_advertised` stays 1; **re-check on any bucketing change** |
@@ -1925,18 +2334,29 @@ Everything we chose to live with, in one place.
 
 ## 18. Not built yet, and why that order
 
+Every feature originally on this list has now landed — WebUI, DoQ and aggressive
+NSEC3 included. What remains is **verification work, not construction**, and it
+matters more than the feature list did:
+
 | Item | Status and reasoning |
 |---|---|
-| **DoQ (RFC 9250)** | Lowest-value transport for this deployment — subscribers reach us over the carrier's own network, where DoQ's advantage over DoT is smallest. |
-| **Aggressive NSEC3** | NSEC is done. NSEC3 means hashing each candidate with the zone's parameters and reasoning about the closest encloser. Those zones fall through to a normal lookup, which is correct but unoptimised. |
-| **Config anti-entropy proven on live nodes** | Unit-tested, and the management API now makes runtime writes possible; the full multi-day live soak has not been run. |
+| **The two-address anycast model, proven end to end** | The headline deployment property, and it has never been run — the lab uses one shared address (§3.4a). This is the most important outstanding item, and it belongs before the first production POP |
+| **Config anti-entropy on live nodes** | Unit-tested, and the management API now makes runtime writes possible; the full multi-day live soak has not been run |
+| **A licence** | §20. Needed before any external distribution |
+| **RFC 8326 `GRACEFUL_SHUTDOWN`** | Planned maintenance currently does a plain withdraw (§4.8) |
 
 **Order rationale.** The build order throughout has been: query path first
 (nothing else matters if resolution is wrong), then the things that keep it
-serving under attack (RRL, aggressive NSEC, serve-stale), then the things that
-make it operable (management API, CLI, packaging), then the presentation layer
-(WebUI). Every step has been deployed and exercised on the lab pair before moving
-on.
+serving under attack (RRL, aggressive NSEC/NSEC3, serve-stale), then the things
+that make it operable (management API, CLI, packaging), then the presentation
+layer (WebUI), then the remaining transport (DoQ). Every step has been deployed
+and exercised on the lab pair before moving on.
+
+**The honest read on where the risk now sits.** It has moved out of the code and
+into deployment. The features are built and tested; what has not been proven is
+the production topology (§3.4a) and multi-day behaviour under real subscriber
+load. That is the right place for a project at this stage to be, but it should be
+said plainly rather than left to be inferred from a short "not built" list.
 
 ---
 
@@ -1944,14 +2364,38 @@ on.
 
 **"Why not just run Unbound? It's free, it's proven, and it's someone else's
 problem."**
-Because the three things that make this a product rather than a resolver — per
-subscriber policy with no I/O on the query path, cache sharing between the pair,
-and a health decision that probes the real serving path and drives BGP — all
-require being inside the resolver. With Unbound, policy becomes generated config
-plus a reload on a box taking production traffic, cache sharing is impossible,
-and health becomes parsing `unbound-control` output. See §2.1 for the full
-comparison including PowerDNS and Knot. The cost of this decision is stated
-honestly: we own DNS correctness now, and §7 and §8 exist because of it.
+Two specific blockers, both checkable rather than matters of taste. **Unbound
+cannot create a view at runtime** — per-client policy lives in `unbound.conf` and
+needs a reload, so every subscriber override becomes a config edit on a box
+taking production traffic. And **no mainstream recursor exposes per-entry cache
+insertion**, so pair cache sharing is not implementable against any of them;
+`unbound-control` offers whole-cache dump and load, nothing finer. §2.1 sets out
+the four requirements every candidate was measured against and works through
+Unbound, BIND, PowerDNS, Knot and CoreDNS one at a time. The cost is stated
+honestly there too: we own DNS correctness now, which is why §7 and §8 exist —
+and §2.1 ends with the conditions under which this decision would be wrong.
+
+**"Why not nscd? Or dnsmasq, or systemd-resolved?"**
+Category rather than capability: all three are stub or forwarding caches serving
+one host or one small network, none of them recurses, and each needs a real
+recursive resolver behind it. nscd in particular is glibc's *NSS* cache — it does
+not listen on 53, does not speak DNS to clients, caches `getaddrinfo()` results
+rather than RRsets, and expires them on a configured constant rather than the
+record's TTL, which alone breaks CDN and failover behaviour. §2.1a has the full
+answer including where nscd stands with the distributions today.
+
+**"What can we get out of it for monitoring? Can we stream it?"**
+87 Prometheus series on the management listener behind the ACL, plus structured
+JSON event logs that journald and a shipper turn into a real per-event stream to
+Kafka, Loki or a SIEM — both available today with no change to the daemon
+(§16.6). Metrics are read at scrape time from atomic counters, so instrumentation
+costs the query path one increment. Native push (OTLP, gNMI) is not built and is
+an open decision. The one hard limit: **nothing is labelled by QNAME or client
+address, by construction** — a browsing history reconstructable from a time
+series is the same failure as leaking the logs, so per-subscriber query
+dashboards are not something this will ever produce. Per-query streaming would
+mean dnstap, which is a deliberate decision with a retention policy attached, not
+a switch to flip (§16.6).
 
 **"Two nodes with no quorum. What happens when they disagree?"**
 They converge, deterministically, on the higher Lamport counter with node ID as
@@ -2107,7 +2551,13 @@ Genuinely undecided, flagged rather than hidden:
    demonstration that withdrawing one node moves only that address, out of the
    POP, while the sibling keeps serving the other. This should happen before the
    first production POP, not during it.
-7. **RFC 8326 `GRACEFUL_SHUTDOWN` community on planned maintenance.** Today a
+7. **Whether to add push telemetry, and in which shape** (§16.6). Today the
+   metrics are pull and the event stream is JSON logs via a shipper, which covers
+   most needs. OTLP is the cheapest addition; gNMI is worth it only if the NOC is
+   already gNMI-based. **dnstap is a separate decision with a privacy weight** —
+   it carries full QNAMEs and client addresses, so it needs a retention policy
+   and an access model agreed before it is switched on, not after.
+8. **RFC 8326 `GRACEFUL_SHUTDOWN` community on planned maintenance.** Today a
    planned restart does a plain withdraw before the listeners stop, which works
    but drops whatever was in flight at the moment the route disappears. Tagging
    the routes with the well-known community first would let the adjacent router

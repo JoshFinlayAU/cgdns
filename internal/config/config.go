@@ -74,6 +74,15 @@ type Listen struct {
 	DoT []string `yaml:"dot"`
 	// DoH serves DNS over HTTPS (RFC 8484), conventionally on 443.
 	DoH []string `yaml:"doh"`
+	// DoQ serves DNS over QUIC (RFC 9250), conventionally on 853 over UDP.
+	// It shares the port number with DoT but not the socket: one is TCP, the
+	// other UDP.
+	DoQ []string `yaml:"doq"`
+	// DoQMaxIdleTimeout closes a QUIC connection that has gone quiet.
+	DoQMaxIdleTimeout time.Duration `yaml:"doq_max_idle_timeout"`
+	// DoQMaxStreamsPerConn caps concurrent queries on one connection, which is
+	// what stops a single client opening unbounded work.
+	DoQMaxStreamsPerConn int `yaml:"doq_max_streams_per_conn"`
 	// DoHPath is the DoH query endpoint.
 	DoHPath string `yaml:"doh_path"`
 	// TLS is the certificate for DoT and DoH. Required when either is set.
@@ -502,9 +511,11 @@ func Default() Config {
 			StateDir: "/var/lib/cgdns",
 		},
 		Listen: Listen{
-			UDPSocketsPerAddr: 0,
-			MaxTCPConns:       4096,
-			TCPIdleTimeout:    10 * time.Second,
+			UDPSocketsPerAddr:    0,
+			MaxTCPConns:          4096,
+			DoQMaxIdleTimeout:    30 * time.Second,
+			DoQMaxStreamsPerConn: 256,
+			TCPIdleTimeout:       10 * time.Second,
 		},
 		Resolver: Resolver{
 			Mode:                     ModeForward,
@@ -647,12 +658,21 @@ func (c *Config) Validate() error {
 		bad("node.state_dir is required")
 	}
 
-	if len(c.Listen.UDP) == 0 && len(c.Listen.TCP) == 0 && len(c.Listen.DoT) == 0 && len(c.Listen.DoH) == 0 {
-		bad("listen: at least one of listen.udp, listen.tcp, listen.dot or listen.doh must be set")
+	if len(c.Listen.UDP) == 0 && len(c.Listen.TCP) == 0 && len(c.Listen.DoT) == 0 &&
+		len(c.Listen.DoH) == 0 && len(c.Listen.DoQ) == 0 {
+		bad("listen: at least one of listen.udp, listen.tcp, listen.dot, listen.doh or listen.doq must be set")
 	}
-	if len(c.Listen.DoT) > 0 || len(c.Listen.DoH) > 0 {
+	if len(c.Listen.DoQ) > 0 {
+		if c.Listen.DoQMaxIdleTimeout <= 0 {
+			bad("listen.doq_max_idle_timeout must be > 0")
+		}
+		if c.Listen.DoQMaxStreamsPerConn <= 0 {
+			bad("listen.doq_max_streams_per_conn must be > 0: an unbounded stream count lets one client open unbounded work")
+		}
+	}
+	if len(c.Listen.DoT) > 0 || len(c.Listen.DoH) > 0 || len(c.Listen.DoQ) > 0 {
 		if c.Listen.TLS.CertFile == "" || c.Listen.TLS.KeyFile == "" {
-			bad("listen.tls.cert_file and listen.tls.key_file are required when listen.dot or listen.doh is set")
+			bad("listen.tls.cert_file and listen.tls.key_file are required when listen.dot, listen.doh or listen.doq is set")
 		} else {
 			for _, f := range []string{c.Listen.TLS.CertFile, c.Listen.TLS.KeyFile} {
 				if _, err := os.Stat(f); err != nil {
@@ -673,7 +693,7 @@ func (c *Config) Validate() error {
 	for _, group := range []struct {
 		field string
 		addrs []string
-	}{{"listen.udp", c.Listen.UDP}, {"listen.tcp", c.Listen.TCP}} {
+	}{{"listen.udp", c.Listen.UDP}, {"listen.tcp", c.Listen.TCP}, {"listen.doq", c.Listen.DoQ}} {
 		for _, a := range group.addrs {
 			ap, err := netip.ParseAddrPort(a)
 			switch {
@@ -1227,6 +1247,9 @@ func (c *Config) AnycastPrefixes() []netip.Prefix { return mustParsePrefixes(c.H
 func (c *Config) IsValidationDisabled() bool {
 	return c.Resolver.Mode == ModeRecursive && !c.Resolver.DNSSEC
 }
+
+// DoQAddrs returns the parsed DoQ listen addresses.
+func (c *Config) DoQAddrs() []netip.AddrPort { return mustParseAll(c.Listen.DoQ) }
 
 // ManagementAddrs returns the parsed management listen addresses.
 func (c *Config) ManagementAddrs() []netip.AddrPort { return mustParseAll(c.Management.Listen) }

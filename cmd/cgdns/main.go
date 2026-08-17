@@ -351,8 +351,9 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	var (
 		dot *transport.TCP
 		doh *transport.DoH
+		doq *transport.DoQ
 	)
-	if len(cfg.Listen.DoT) > 0 || len(cfg.Listen.DoH) > 0 {
+	if len(cfg.Listen.DoT) > 0 || len(cfg.Listen.DoH) > 0 || len(cfg.Listen.DoQ) > 0 {
 		tlsCfg, err := loadTLS(cfg.Listen.TLS)
 		if err != nil {
 			return err
@@ -393,6 +394,23 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 				return err
 			}
 			defer func() { _ = doh.Close() }()
+		}
+		if len(cfg.Listen.DoQ) > 0 {
+			doq, err = transport.NewDoQ(transport.DoQOptions{
+				Addrs:             cfg.DoQAddrs(),
+				TLS:               tlsCfg,
+				MaxIdleTimeout:    cfg.Listen.DoQMaxIdleTimeout,
+				MaxStreamsPerConn: int64(cfg.Listen.DoQMaxStreamsPerConn),
+				ClientBudget:      cfg.Resolver.ClientBudget,
+				AllowQuery:        queryACL,
+				Handler:           handler,
+				Log:               log,
+				Metrics:           txMetrics,
+			})
+			if err != nil {
+				return err
+			}
+			defer func() { _ = doq.Close() }()
 		}
 	}
 
@@ -626,6 +644,10 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	if doh != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); errCh <- doh.Serve(ctx) }()
+	}
+	if doq != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- doq.Serve(ctx) }()
 	}
 
 	if cfg.Metrics.Listen != "" {
