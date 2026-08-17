@@ -81,6 +81,15 @@ It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and t
 **Anycast health** - the node owns the decision on whether it belongs in the anycast set, and drives GoBGP (it just made sense.. go project.. gRPC..) over its gRPC API. `gobgpd` runs as a separate unit; cgdns never shells out to a CLI and never embeds BGP in-process, so a resolver restart does not drop the session. Checks run through the real serving path. Withdrawal is fast; re-advertisement is dampened, and the penalty decays on stable serving time rather than on recovery. SIGTERM withdraws before the
 listeners stop, so a planned restart moves traffic away first.
 
+One gobgpd trap is worth knowing, because it fails silently and in the safe-looking
+direction. An import filter belongs on each neighbour, never in
+`[global.apply-policy]`: a global policy with `default-import-policy = "reject-route"`
+also judges the routes this node originates, so the anycast prefix never reaches
+the RIB. Both the gRPC API and `gobgp global rib add` return success having done
+nothing, and the node reports itself advertised while the router has no route to
+it at all. Check the router, not the resolver, when confirming a node is really
+in the anycast set.
+
 **Pair link** - one mutually authenticated TLS connection between the two nodes in a POP, carrying two payloads with deliberately different guarantees. Config replication is reliable and converging: writes are acknowledged and any gap is repaired by an anti-entropy exchange when the link returns, so a change made while the sibling was down lands when it rejoins. Cache sharing is best-effort, because losing a push is a cache miss the sibling resolves for itself and that is never worth blocking a query for. There is no quorum and nothing to lose: a partitioned pair keeps resolving on both sides, and the link reconnects on its own.
 
 **Config replication** - write to either node and both converge. Last-write-wins ordered by a Lamport counter with the node ID as tiebreak, so the two agree without depending on synchronised clocks. Deletes are tombstones held for seven days - without them, a node that was down during a delete resurrects the record on rejoin, because from its side the record simply still exists. `cgdnsctl drift` compares the store hash across the pair; that hash is the only drift detector a pair has, so it is the thing to alert on.
