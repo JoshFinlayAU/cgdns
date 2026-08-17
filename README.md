@@ -43,7 +43,7 @@ The reason for two addresses rather than one shared between the pair is what hap
 |---|---|
 | management | operator API, metrics, SSH |
 | pair link | config replication and cache sharing to the sibling node |
-| BGP VLAN | a shared /29 and /64 carrying the eBGP sessions to the nearest router - single-hop, sourced from this interface rather than from a loopback |
+| peering | reaches the nearest BGP router; the eBGP sessions are sourced from this interface rather than from a loopback. Any addressing that gets the node to the router's peering address will do - the lab happens to use a shared /29 |
 | `anycast0` | this node's service address - DNS listeners bind here (read below) |
 | `loopback0` | unique per node, never anycast - the address outbound queries are sourced from |
 

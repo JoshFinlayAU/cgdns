@@ -9,7 +9,7 @@ Four roles per node, and keeping them apart is what makes the rest work.
 
 | Role | Example (ns1) | Announced? | Purpose |
 |---|---|---|---|
-| BGP VLAN | `10.255.255.1/29`, `fd51:13:1::1/64` | no, connected | carries the eBGP sessions to the router |
+| peering | `10.255.255.1/29`, `fd51:13:1::1/64` | no, connected | reaches the router's peering address |
 | `loopback0` | `10.255.0.1/32`, `fd51:13::1/128` | see below | the node's identity — outbound queries are sourced here |
 | `anycast0` | `10.255.0.53/32`, `fd51:13:53::53/128` | yes, health-gated | the service address subscribers query |
 | management | `10.51.13.146` | no | operator API, metrics, SSH |
@@ -26,8 +26,21 @@ from it, and that is the whole point: a query sourced from an anycast address
 invites the reply back to whichever node the return path happens to pick, which
 is not necessarily the one that asked.
 
-The eBGP sessions run over the BGP VLAN addresses, **not** over `loopback0` —
-single-hop eBGP to the directly attached router.
+The eBGP sessions run over the peering addresses, **not** over `loopback0`.
+
+How that segment is addressed does not matter. A /30, a /31 (RFC 3021), a
+shared /29, a VLAN with both nodes and the router on it, or IPv6 link-local
+peering — all fine. The only requirement is that each node can reach the
+router's peering address, and for single-hop eBGP that it is a connected
+route. If the router is not adjacent, the session needs `ebgp-multihop` and a
+route to reach it, which is a different setup rather than a bigger prefix.
+
+The lab uses a shared /29 (`.1` ns1, `.2` ns2, `.3` router) because one VLAN
+was less to build than two point-to-point links. Nothing depends on that
+choice. The one thing worth deciding deliberately is whether the two nodes
+share the segment: on a shared VLAN they can reach each other over it, which
+is either convenient or an extra path you did not intend, depending on how you
+feel about the pair link being the only thing between them.
 
 ## 1. Interfaces
 
