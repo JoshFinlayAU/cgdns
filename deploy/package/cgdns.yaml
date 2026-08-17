@@ -16,9 +16,14 @@ node:
   state_dir: /var/lib/cgdns
 
 listen:
-  # The anycast service addresses. Bind them explicitly: a wildcard bind loses
-  # the destination address, so replies would leave with the wrong source and
-  # anycast would break subtly, under load.
+  # This node's anycast service address. Each node in a pair owns a DIFFERENT
+  # one -- ns1 in every POP announces the first, ns2 in every POP announces the
+  # second -- and subscribers are handed both. A node failing takes its own
+  # address to the next POP and leaves the subscriber's other resolver local.
+  #
+  # Bind them explicitly: a wildcard bind loses the destination address, so
+  # replies would leave with the wrong source and anycast would break subtly,
+  # under load.
   udp: []
   tcp: []
   # dot: ["<anycast-v4>:853", "[<anycast-v6>]:853"]
@@ -158,7 +163,8 @@ peer:
 # to it over gRPC and never shells out to a routing CLI.
 health:
   enabled: false
-  # anycast_prefixes: ["<anycast-v4>/32", "<anycast-v6>/128"]
+  # The address THIS node announces, not the pair's. ns1 and ns2 differ here.
+  # anycast_prefixes: ["<this-node-anycast-v4>/32", "<this-node-anycast-v6>/128"]
   # gobgp_target: "127.0.0.1:50051"
 
 # The operator API and WebUI. Both are served here and nowhere else: enabling

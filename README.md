@@ -16,17 +16,24 @@ Louis read this before you comment. [docs/LOUIS.md](docs/LOUIS.md)
 
 ## Deployment model
 
-Two resolvers per POP, each announce their anycast IP.
+Two resolvers per POP. Each owns **its own** anycast address, and that address is announced from every POP.
 
 ```
-POP (per state / region)
+                 ns1 address                      ns2 address
+                 10.255.0.53                      10.255.0.54
 
-  ns1 ──────── pair link ──────── ns2        config replication + cache sync
-   │                               │
-   └── eBGP /30 ── router ── eBGP ─┘         each announces the anycast /32 + /128
+  SYD            ns1 ──── pair link ──── ns2      config replication + cache sync
+                  └── eBGP ── router ── eBGP ─┘
+
+  MEL            ns1 ──── pair link ──── ns2
+                  └── eBGP ── router ── eBGP ─┘
+
+  Between POPs: nothing at all.
 ```
 
-Subscribers are handed the anycast addresses; BGP routes them to the nearest POP. A node that fails withdraws its prefix and traffic moves to its pair, or to the next POP if both are gone.
+Subscribers are handed both addresses, the way anyone hands out a primary and a secondary. BGP routes each to the nearest POP announcing it, so a subscriber in Sydney reaches Sydney's ns1 and Sydney's ns2.
+
+The reason for two addresses rather than one shared between the pair is what happens when a node dies. Sydney's ns1 withdraws `10.255.0.53`, and that address now routes to Melbourne's ns1 — a little further away but still answering. The subscriber's second resolver, `10.255.0.54`, is untouched and still in Sydney, so the common case is served locally by the other address rather than waiting on reconvergence for the same one. Lose both nodes in a POP and both addresses simply route to the next closest POP.
 
 **Cache is shared only within a POP, never between them.** CDN and cloud resolvers return geographically specific answers based on where the *resolver* sits, so replicating a Sydney cache entry to Perth would hand Perth subscribers Sydney endpoints. This is a correctness constraint as much as it realistically is a performance choice.
 
@@ -37,8 +44,8 @@ Subscribers are handed the anycast addresses; BGP routes them to the nearest POP
 | management | operator API, metrics, SSH |
 | pair link | config replication and cache sharing to the sibling node |
 | p2p /30 | eBGP session to the nearest BGP router (to announce its loopback) |
-| `anycast0` | the shared service address - DNS listeners bind here (read below) |
-| `loopback0` | unique per node - this is where the anycast address lives that we announce |
+| `anycast0` | this node's service address - DNS listeners bind here (read below) |
+| `loopback0` | unique per node - the address outbound queries and the BGP session are sourced from |
 
 The anycast0 dummy interface was a trial by fire decision that was settled on to work in basically the same way and reason that "nameserver 127.0.0.53" does in most Linux distros these days. We just need somewhere to bind to that never goes down (and that is not attached to anything and is never gonna ARP), then we let the kernel do the routing from there on.
 
