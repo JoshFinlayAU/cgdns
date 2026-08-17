@@ -43,9 +43,12 @@ The reason for two addresses rather than one shared between the pair is what hap
 |---|---|
 | management | operator API, metrics, SSH |
 | pair link | config replication and cache sharing to the sibling node |
-| p2p /30 | eBGP session to the nearest BGP router (to announce its loopback) |
+| BGP VLAN | a shared /29 and /64 carrying the eBGP sessions to the nearest router - single-hop, sourced from this interface rather than from a loopback |
 | `anycast0` | this node's service address - DNS listeners bind here (read below) |
-| `loopback0` | unique per node - the address outbound queries and the BGP session are sourced from |
+| `loopback0` | unique per node, never anycast - the address outbound queries are sourced from |
+
+Setting all of this up from scratch - addressing, gobgpd, the router side, and
+what to check where - is written up in [docs/provisioning.md](docs/provisioning.md).
 
 The anycast0 dummy interface was a trial by fire decision that was settled on to work in basically the same way and reason that "nameserver 127.0.0.53" does in most Linux distros these days. We just need somewhere to bind to that never goes down (and that is not attached to anything and is never gonna ARP), then we let the kernel do the routing from there on.
 
