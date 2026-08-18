@@ -615,11 +615,12 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 		}
 
 		mgmt, err = management.NewServer(management.ServerOptions{
-			Listen:  cfg.Management.Listen,
-			TLS:     mgmtTLS,
-			ACL:     netacl.New(cfg.ManagementAllowFrom(), true),
-			Handler: api.Handler(),
-			Log:     log,
+			Listen:      cfg.Management.Listen,
+			TLS:         mgmtTLS,
+			ACL:         netacl.New(cfg.ManagementAllowFrom(), true),
+			LocalSocket: cfg.ManagementLocalSocket(),
+			Handler:     api.Handler(),
+			Log:         log,
 		})
 		if err != nil {
 			return err

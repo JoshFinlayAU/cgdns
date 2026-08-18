@@ -20,6 +20,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/JoshFinlayAU/cgdns/internal/control"
+	"github.com/JoshFinlayAU/cgdns/internal/config"
 	"github.com/JoshFinlayAU/cgdns/internal/management"
 )
 
@@ -29,6 +30,10 @@ var version = "dev"
 // defaultTokenFile is where the daemon writes its bootstrap token, so cgdnsctl
 // run on the node itself needs no configuration.
 const defaultTokenFile = "/var/lib/cgdns/bootstrap.token"
+
+// defaultAddr is the fallback when an operator names no node. Reaching it means
+// they meant this node, which is what the local socket is for.
+const defaultAddr = "127.0.0.1:8443"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -44,6 +49,7 @@ func main() {
 
 type globals struct {
 	addr      string
+	socket    string
 	token     string
 	tokenFile string
 	caFile    string
@@ -55,7 +61,8 @@ type globals struct {
 func run(args []string) error {
 	var g globals
 	fs := flag.NewFlagSet("cgdnsctl", flag.ContinueOnError)
-	fs.StringVar(&g.addr, "addr", envOr("CGDNS_ADDR", "127.0.0.1:8443"), "node management address (env CGDNS_ADDR)")
+	fs.StringVar(&g.addr, "addr", envOr("CGDNS_ADDR", defaultAddr), "node management address (env CGDNS_ADDR)")
+	fs.StringVar(&g.socket, "socket", envOr("CGDNS_SOCKET", config.DefaultLocalSocket), "local control socket, used when no -addr or -token is given (env CGDNS_SOCKET)")
 	fs.StringVar(&g.token, "token", os.Getenv("CGDNS_TOKEN"), "API token (env CGDNS_TOKEN)")
 	fs.StringVar(&g.tokenFile, "token-file", envOr("CGDNS_TOKEN_FILE", defaultTokenFile), "read the token from this file (env CGDNS_TOKEN_FILE)")
 	fs.StringVar(&g.caFile, "ca", os.Getenv("CGDNS_CA"), "CA certificate that signs the node's certificate (env CGDNS_CA)")
@@ -169,6 +176,19 @@ func (g globals) client() (*management.Client, error) {
 }
 
 func (g globals) clientFor(addr string) (*management.Client, error) {
+	// Managing the node you are logged into needs no token. The socket is
+	// root-owned and 0600, so opening it already requires the privilege that
+	// would let you edit the config or stop the service; a token would add a
+	// standing secret to lose without adding protection. It is used whenever
+	// it exists and nothing else was asked for.
+	if g.addr == defaultAddr && g.token == "" && addr == g.addr {
+		if _, err := os.Stat(g.socket); err == nil {
+			return management.NewClient(management.ClientOptions{
+				LocalSocket: g.socket, Timeout: g.timeout,
+			})
+		}
+	}
+
 	token := g.token
 	if token == "" && g.tokenFile != "" {
 		raw, err := os.ReadFile(g.tokenFile)

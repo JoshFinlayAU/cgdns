@@ -31,6 +31,13 @@ type Server struct {
 	http      *http.Server
 	listeners []net.Listener
 
+	// The local socket gets its own http.Server so a connection arriving on it
+	// can be marked at accept time, which is the only place the transport is
+	// still visible.
+	localHTTP *http.Server
+	localLn   net.Listener
+	localPath string
+
 	mu     sync.Mutex
 	closed bool
 }
@@ -48,6 +55,10 @@ type ServerOptions struct {
 	// ACL is the default-deny source filter, enforced at Accept so a refused
 	// client never reaches TLS or HTTP.
 	ACL *netacl.ACL
+
+	// LocalSocket is a unix socket for operators on the box. It carries no
+	// token: the file's mode is the credential. Empty disables it.
+	LocalSocket string
 
 	Handler http.Handler
 	Log     *slog.Logger
@@ -89,11 +100,38 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		},
 	}
 
+	// Marked at accept time, which is the only point the transport is still
+	// visible. A peer that is not root is left unmarked and falls through to
+	// ordinary token authentication, so a permissions mistake cannot become a
+	// privilege escalation.
+	s.localHTTP = &http.Server{
+		Handler:           opts.Handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       opts.ReadTimeout,
+		WriteTimeout:      opts.WriteTimeout,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			root, err := peerIsPrivileged(c)
+			if err != nil {
+				opts.Log.Warn("could not read the peer credentials on the local socket",
+					slog.String("err", err.Error()))
+				return ctx
+			}
+			if !root {
+				return ctx
+			}
+			return withLocal(ctx)
+		},
+	}
+
 	for _, addr := range opts.Listen {
 		if err := s.bind(addr); err != nil {
 			_ = s.Close()
 			return nil, err
 		}
+	}
+	if err := s.bindLocal(opts.LocalSocket); err != nil {
+		_ = s.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -149,7 +187,7 @@ func (s *Server) Addrs() []string {
 
 // Serve accepts until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
-	errs := make(chan error, len(s.listeners))
+	errs := make(chan error, len(s.listeners)+1)
 	for _, ln := range s.listeners {
 		go func(ln net.Listener) {
 			err := s.http.Serve(ln)
@@ -158,6 +196,15 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			errs <- err
 		}(ln)
+	}
+	if s.localLn != nil {
+		go func(ln net.Listener) {
+			err := s.localHTTP.Serve(ln)
+			if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+				err = nil
+			}
+			errs <- err
+		}(s.localLn)
 	}
 
 	select {

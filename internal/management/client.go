@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,6 +34,11 @@ type ClientOptions struct {
 	Addr  string
 	Token string
 
+	// LocalSocket dials a unix socket instead of the network. The socket
+	// carries no token — its mode is the credential — so Token is not required
+	// when this is set.
+	LocalSocket string
+
 	// CAFile verifies the node's certificate. Nodes are normally issued from a
 	// private CA, so this is the usual way to make a connection trusted.
 	CAFile string
@@ -45,14 +52,38 @@ type ClientOptions struct {
 
 // NewClient builds an API client.
 func NewClient(opts ClientOptions) (*Client, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 10 * time.Second
+	}
+
+	if opts.LocalSocket != "" {
+		// The host in the URL is a formality: the transport ignores it and
+		// dials the socket. Plain HTTP, because there is no network hop to
+		// protect and the socket's mode already decides who may speak.
+		base, err := url.Parse("http://localhost")
+		if err != nil {
+			return nil, err
+		}
+		path := opts.LocalSocket
+		return &Client{
+			base: base,
+			http: &http.Client{
+				Timeout: opts.Timeout,
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+						var d net.Dialer
+						return d.DialContext(ctx, "unix", path)
+					},
+				},
+			},
+		}, nil
+	}
+
 	if opts.Addr == "" {
 		return nil, errors.New("management: a node address is required")
 	}
 	if opts.Token == "" {
 		return nil, errors.New("management: an API token is required")
-	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 10 * time.Second
 	}
 
 	raw := opts.Addr
@@ -109,7 +140,9 @@ func (c *Client) do(method, path string, body []byte, out any) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

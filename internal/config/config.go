@@ -515,6 +515,15 @@ type Management struct {
 	Enabled bool     `yaml:"enabled"`
 	Listen  []string `yaml:"listen"`
 
+	// LocalSocket is a unix socket for operators on the box, carrying no token:
+	// its mode is the credential. Defaults to /run/cgdns/control.sock; set it
+	// to "-" to disable.
+	//
+	// Anyone who can open it can already read this config, replace the binary
+	// and stop the service, so a bearer token on top adds no protection and
+	// does add a long-lived secret to lose.
+	LocalSocket string `yaml:"local_socket"`
+
 	// TLS is required unless every listen address is loopback.
 	TLS TLS `yaml:"tls"`
 
@@ -532,6 +541,10 @@ type Management struct {
 	TrustedProxies []string `yaml:"trusted_proxies"`
 
 	// UI serves the embedded WebUI in addition to the API.
+	// UI serves the operator console. Off by default: it is the only part of
+	// this daemon that takes credentials, holds sessions and renders HTML, and
+	// that surface is not worth carrying on a resolver unless somebody is
+	// actually using it.
 	UI bool `yaml:"ui"`
 
 	// The WebUI is served here and nowhere else, and it needs HTTPS even on
@@ -579,6 +592,22 @@ func (z *Size) UnmarshalYAML(value *yaml.Node) error {
 	*z = parsed
 	return nil
 }
+
+// ManagementLocalSocket resolves the socket path, defaulting it and honouring
+// "-" as an explicit disable.
+func (c *Config) ManagementLocalSocket() string {
+	switch strings.TrimSpace(c.Management.LocalSocket) {
+	case "":
+		return DefaultLocalSocket
+	case "-":
+		return ""
+	default:
+		return c.Management.LocalSocket
+	}
+}
+
+// DefaultLocalSocket is where cgdnsctl looks when told nothing else.
+const DefaultLocalSocket = "/run/cgdns/control.sock"
 
 // ParseSize reads a byte quantity.
 func ParseSize(raw string) (Size, error) {

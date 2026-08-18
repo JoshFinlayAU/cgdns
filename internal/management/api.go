@@ -204,6 +204,17 @@ func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // guard authenticates and authorises before running h.
 func (a *API) guard(want Scope, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A request on the local socket is already privileged: the socket is
+		// root-owned and 0600, and the peer's uid was checked at accept. Asking
+		// it for a token as well would protect nothing — whoever can open the
+		// socket can already read the config, replace the binary and stop the
+		// service — while leaving a standing admin secret in a file or a shell
+		// history for an attacker who is past caring about it.
+		if isLocal(r.Context()) {
+			h(w, r)
+			return
+		}
+
 		// A browser session is the other way in. It is checked first only
 		// because a WebUI request carries no Authorization header.
 		if sess, id, ok := a.sessionFrom(r); ok {

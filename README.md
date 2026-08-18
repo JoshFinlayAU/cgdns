@@ -186,6 +186,24 @@ in the anycast set.
 
 **Management API** - REST, bound only to the management addresses, behind a default-deny source ACL enforced at accept, TLS mandatory unless every listener is loopback. Tokens carry read/write/admin scopes and are stored as a hash, so replicating them to the sibling - which is what lets you manage the pair from either node - never moves a secret. A node holding no token at all mints one to a root-only file; a node that already has one, including one adopted from its sibling, never does. Records are canonicalised on write, so what the API returns is what the resolver is actually enforcing.
 
+**Managing the node you are on needs no token.** cgdnsctl talks to a unix socket
+at `/run/cgdns/control.sock`, root-owned and `0600`, and a request arriving there
+is already privileged — the peer's uid is checked at accept, and whoever can open
+the socket can already read the config, replace the binary and stop the service.
+Demanding a bearer token as well would protect nothing while leaving a standing
+admin secret in a file or a shell history. `cgdnsctl status` just works.
+
+It is a socket rather than loopback TCP precisely so that reasoning holds: a TCP
+port is reachable by every local user and, given a routing mistake, from off the
+box. Tokens are still what a remote operator or another node uses, and are still
+how `cgdnsctl drift` reaches a sibling.
+
+**The console is built and switched off.** `management.ui` defaults off: it was
+never signed into once, and it is the only part of this daemon that accepts
+credentials, holds sessions and renders HTML. That is a standing authentication
+and XSS surface on a resolver, kept for a benefit nobody drew on. The code and
+its tests remain, and `ui: true` brings it back for a NOC that wants one.
+
 **Response rate limiting** - UDP only, because TCP, DoT and DoH complete a handshake and there is nothing there to spoof or reflect. It limits *responses* rather than queries, since the victim of a spoofed query never sent it and the only thing that helps them is us not sending the answer.
 
 What makes it work against water-torture is the grouping. A flood of `random1.victim.com`, `random2.victim.com` and so on has a different QNAME every time, so a bucket keyed on the QNAME gives every query its own bucket and limits precisely nothing. Denials are grouped by the *zone* that denied them - the SOA owner - so the whole flood collapses into one bucket. Answers are unlimited by default and denials are not: a real client asks for names that exist.
