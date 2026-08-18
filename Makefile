@@ -27,8 +27,12 @@ race:
 	$(GO) test -race -count=1 ./...
 
 .PHONY: integration
+# Includes the wiring tests, which start the real binary with a real config and
+# assert the effect that exists only if a feature is actually connected. Every
+# unit test here can pass while a feature does nothing at all — that is how
+# prefetch once shipped as a no-op and denial validation as dead code.
 integration:
-	$(GO) test -tags=integration ./...
+	$(GO) test -tags=integration -count=1 -timeout 15m ./...
 
 .PHONY: vet
 vet:

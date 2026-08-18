@@ -285,12 +285,22 @@ make build                                              # ./bin/cgdns, ./bin/cgd
 make check                                              # fmt, vet, tests
 make race                                               # tests under -race
 make bench                                              # hot-path benchmarks
+make integration                                        # wiring tests: real binary, real config
 make fuzz                                               # every fuzz target, 60s each
 FUZZTIME=10m make fuzz                                  # a longer soak
 
 ./bin/cgdns -config /etc/cgdns/cgdns.yaml -check        # validate and exit
 ./bin/cgdns -config /etc/cgdns/cgdns.yaml
 ```
+
+The wiring tests answer a different question from the unit tests: not whether a
+package works, but whether it is connected. They start the real binary with a
+real config, drive queries at it, and assert the observable effect that exists
+only if the feature is in the serving path — that a prefetch actually reached
+the upstream, that serve-stale answers once resolution fails, that the rate
+limiter drops under a flood. Every unit test in this repo can pass while a
+feature does nothing at all, which is how prefetch once shipped refreshing
+entries by reading the entry it meant to renew.
 
 The fuzz targets cover the paths that turn attacker-controlled bytes into
 decisions: the denial proofs that decide whether a name is securely absent, the
