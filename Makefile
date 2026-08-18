@@ -76,6 +76,32 @@ PKG_VERSION ?= $(shell v=$$(git describe --tags --abbrev=0 2>/dev/null); [ -n "$
 PKG_ARCH ?= amd64
 DIST := dist
 
+.PHONY: fuzz
+# Fuzz every target for a bounded time. Everything on the wire is
+# attacker-controlled, so these cover the paths that turn bytes into decisions:
+# denial proofs, the aggressive store, feed and hints parsing, and the query
+# acceptance path each listener applies before the resolver is involved.
+#
+# FUZZTIME can be raised for a longer soak; the corpus persists in the build
+# cache between runs, so successive runs go deeper.
+FUZZTIME ?= 60s
+fuzz:
+	@set -e; \
+	for spec in \
+	  "./internal/dnssec/:FuzzDenialProofs" \
+	  "./internal/dnssec/:FuzzParseAnchors" \
+	  "./internal/aggressive/:FuzzStore" \
+	  "./internal/transport/:FuzzQueryAcceptance" \
+	  "./internal/transport/:FuzzDoHReadQuery" \
+	  "./internal/transport/:FuzzDoHReadBody" \
+	  "./internal/policy/:FuzzParseRPZ" \
+	  "./internal/policy/:FuzzParseDomainList" \
+	  "./internal/resolver/roothints/:FuzzParse" ; do \
+	  pkg=$${spec%%:*}; target=$${spec##*:}; \
+	  printf '%-28s %s\n' "$$target" "$$pkg"; \
+	  go test -run XXX -fuzz "$$target" -fuzztime $(FUZZTIME) "$$pkg" | tail -2 | head -1; \
+	done
+
 .PHONY: package
 package: build
 	@command -v nfpm >/dev/null || { echo "nfpm not found: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest"; exit 1; }

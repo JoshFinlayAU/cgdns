@@ -267,10 +267,19 @@ make build                                              # ./bin/cgdns, ./bin/cgd
 make check                                              # fmt, vet, tests
 make race                                               # tests under -race
 make bench                                              # hot-path benchmarks
+make fuzz                                               # every fuzz target, 60s each
+FUZZTIME=10m make fuzz                                  # a longer soak
 
 ./bin/cgdns -config /etc/cgdns/cgdns.yaml -check        # validate and exit
 ./bin/cgdns -config /etc/cgdns/cgdns.yaml
 ```
+
+The fuzz targets cover the paths that turn attacker-controlled bytes into
+decisions: the denial proofs that decide whether a name is securely absent, the
+aggressive store that synthesises answers from cached records, the feed and root
+hints parsers, and the query acceptance every listener applies before the
+resolver is involved. The corpus persists in the build cache, so successive runs
+go deeper rather than starting over.
 
 `make package` produces a `.deb` and an `.rpm` in `dist/` (nfpm, pure Go - no
 dpkg-dev or rpmbuild needed). Binaries land in `/usr/sbin` and `/usr/bin`, the
