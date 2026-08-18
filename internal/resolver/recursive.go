@@ -39,6 +39,12 @@ type Nameserver struct {
 
 // RecursiveMetrics counts recursion-specific events.
 type RecursiveMetrics struct {
+	// AnsweredFromCache counts client queries that needed no outbound query at
+	// all. This is the hit ratio an operator means: the cache's own tally
+	// counts every internal lookup a single query makes — the delegation walk,
+	// each DNSKEY, each DS — which runs to a hundred or more per query and
+	// answers a different question entirely.
+	AnsweredFromCache atomic.Uint64
 	Referrals        atomic.Uint64
 	BogusReferrals   atomic.Uint64
 	OutboundQueries  atomic.Uint64
@@ -241,6 +247,9 @@ func (r *Recursive) ServeDNS(ctx context.Context, req *transport.Request) *dns.M
 	res, err := r.resolve(ctx, dns.CanonicalName(q.Name), q.Qtype, st)
 	if err != nil {
 		return r.failure(req.Msg, q, err)
+	}
+	if st.outbound == 0 && !req.Internal {
+		r.opts.Metrics.AnsweredFromCache.Add(1)
 	}
 
 	if r.opts.Validator != nil && res.secure == dnssec.StatusIndeterminate {

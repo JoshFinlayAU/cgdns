@@ -55,6 +55,20 @@ groups:
             this is firing, so treat it as loss of monitoring rather than a
             minor fault.
 
+      - alert: CgdnsCacheAtMemoryCeiling
+        expr: increase(cgdns_cache_evictions_total[30m]) > 1000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is evicting steadily — the cache is at its ceiling"
+          description: >-
+            Sustained eviction means cache.max_size or max_entries is now the
+            constraint. Nothing breaks, but the hit ratio falls and outbound
+            queries per client query rise, which shows up as latency and as load
+            on the authoritatives. Compare cgdns_cache_bytes against the
+            configured max_size and raise it in step with the node's RAM.
+
       - alert: CgdnsCacheHitRatioUnreadable
         expr: cgdns_cache_hits_total == 0 and cgdns_queries_total > 1000
         for: 30m

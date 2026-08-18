@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,7 +190,18 @@ type Resolver struct {
 
 // Cache sizes the RRset and negative caches.
 type Cache struct {
-	// MaxEntries is a per-cache ceiling, enforced by LRU eviction.
+	// MaxSize bounds the memory the cached data may occupy, written the way a
+	// VM is sized: "512MiB", "2GB", or a plain number of bytes. Empty leaves
+	// memory unbounded and only MaxEntries applies.
+	//
+	// This is the bound worth setting. MaxEntries caps a count, and an entry
+	// holding eight address records costs about two and a half times one
+	// holding two, so a count cannot tell an operator how much RAM the process
+	// will take — which is exactly what has to be known to size a node and not
+	// have it killed for running out.
+	MaxSize Size `yaml:"max_size"`
+	// MaxEntries is a per-cache ceiling, enforced by LRU eviction. It still
+	// bounds the map itself; both apply, whichever binds first.
 	MaxEntries int `yaml:"max_entries"`
 	// Shards must be a power of two; lookups mask the hash rather than
 	// dividing. More shards means less lock contention across cores.
@@ -539,6 +551,89 @@ type Management struct {
 	SessionTimeout time.Duration `yaml:"session_timeout"`
 }
 
+// Size is a byte quantity written the way an operator thinks about memory.
+//
+// It accepts a plain number of bytes, or a number with a unit: KB/MB/GB/TB for
+// powers of ten and KiB/MiB/GiB/TiB for powers of two. Both spellings are
+// accepted because both are in common use and guessing wrong by 7% is worse
+// than accepting either.
+type Size int64
+
+// UnmarshalYAML parses a size, rejecting anything it cannot read rather than
+// silently treating it as zero — an unbounded cache from a typo is exactly the
+// failure this setting exists to prevent.
+func (z *Size) UnmarshalYAML(value *yaml.Node) error {
+	var raw string
+	if err := value.Decode(&raw); err != nil {
+		var n int64
+		if err2 := value.Decode(&n); err2 != nil {
+			return fmt.Errorf("size must be a number of bytes or a string like \"512MiB\": %w", err)
+		}
+		*z = Size(n)
+		return nil
+	}
+	parsed, err := ParseSize(raw)
+	if err != nil {
+		return err
+	}
+	*z = parsed
+	return nil
+}
+
+// ParseSize reads a byte quantity.
+func ParseSize(raw string) (Size, error) {
+	txt := strings.TrimSpace(raw)
+	if txt == "" {
+		return 0, nil
+	}
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+		{"TB", 1e12}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3},
+		{"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10},
+		{"B", 1},
+	}
+	upper := strings.ToUpper(txt)
+	for _, u := range units {
+		if !strings.HasSuffix(upper, strings.ToUpper(u.suffix)) {
+			continue
+		}
+		numTxt := strings.TrimSpace(txt[:len(txt)-len(u.suffix)])
+		val, err := strconv.ParseFloat(numTxt, 64)
+		if err != nil {
+			return 0, fmt.Errorf("size %q: %q is not a number", raw, numTxt)
+		}
+		if val < 0 {
+			return 0, fmt.Errorf("size %q must not be negative", raw)
+		}
+		return Size(val * float64(u.mult)), nil
+	}
+	val, err := strconv.ParseInt(txt, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("size %q: expected bytes or a unit such as 512MiB", raw)
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("size %q must not be negative", raw)
+	}
+	return Size(val), nil
+}
+
+// String renders a size the way it would be written.
+func (z Size) String() string {
+	switch {
+	case z >= 1<<30:
+		return fmt.Sprintf("%.2fGiB", float64(z)/(1<<30))
+	case z >= 1<<20:
+		return fmt.Sprintf("%.0fMiB", float64(z)/(1<<20))
+	case z >= 1<<10:
+		return fmt.Sprintf("%.0fKiB", float64(z)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", int64(z))
+	}
+}
+
 // TLS is a certificate/key pair.
 type TLS struct {
 	CertFile string `yaml:"cert_file"`
@@ -780,6 +875,10 @@ func (c *Config) Validate() error {
 	var problems []string
 	bad := func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+
+	if c.Cache.MaxSize > 0 && c.Cache.MaxSize < 1<<20 {
+		bad("cache.max_size %s is below 1MiB: a cache that small evicts faster than it fills and every query becomes a full recursion", c.Cache.MaxSize)
 	}
 
 	if c.ACME.Enabled {

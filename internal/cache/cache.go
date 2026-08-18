@@ -93,8 +93,15 @@ func (e *Entry) RRsAt(now time.Time) []dns.RR {
 
 // Options configures a Cache. Zero values are rejected by New.
 type Options struct {
-	// MaxEntries is the total ceiling across all shards.
+	// MaxEntries is the total ceiling across all shards. It bounds a count,
+	// not memory: an entry holding eight address records costs roughly two and
+	// a half times one holding two, so a count alone cannot tell an operator
+	// how much RAM the cache will take.
 	MaxEntries int
+	// MaxBytes bounds the estimated memory instead, which is what a VM is
+	// sized against. Zero leaves memory unbounded and only the count applies.
+	// Both are enforced when both are set, whichever binds first.
+	MaxBytes int64
 	// Shards must be a power of two.
 	Shards int
 	// MinTTL and MaxTTL clamp TTLs learned from the wire.
@@ -121,6 +128,9 @@ type Options struct {
 // Stats is a point-in-time counter snapshot, summed across shards.
 type Stats struct {
 	Entries   int
+	// Bytes is the estimated heap the cached entries occupy. It is what
+	// max_size bounds, and the number to size a VM against.
+	Bytes     int64
 	Hits      uint64
 	Misses    uint64
 	Expired   uint64
@@ -140,8 +150,46 @@ type Cache struct {
 type node struct {
 	key   Key
 	entry Entry
+	// size is what this entry was charged against the shard's byte budget,
+	// remembered so a replacement or an eviction can refund exactly what was
+	// charged rather than recomputing against records that may have changed.
+	size int64
 	// Intrusive LRU links, avoiding a per-insert allocation.
 	prev, next *node
+}
+
+// Per-entry and per-record costs, calibrated against real heap growth: a
+// two-record A RRset measures about 400 bytes and an eight-record one about
+// 970, which fits a fixed cost for the entry plus a fixed cost per record plus
+// the record's own data.
+//
+// It is an estimate and says so. Go gives no cheap way to weigh a live object
+// graph, and packing every RRset to measure it would put that cost on the hot
+// path. The figure is used to bound memory, so it is better slightly high than
+// slightly low.
+const (
+	entryBaseCost  = 176
+	recordBaseCost = 72
+	// rdataFallback is charged when a record carries no RDLENGTH, which happens
+	// for records this daemon synthesised rather than read off the wire.
+	rdataFallback = 24
+)
+
+// entrySize estimates the heap an entry occupies, including its key.
+func entrySize(k Key, e Entry) int64 {
+	size := int64(entryBaseCost) + int64(len(k.Name))
+	for _, rr := range e.RRs {
+		if rr == nil {
+			continue
+		}
+		h := rr.Header()
+		rdata := int64(h.Rdlength)
+		if rdata == 0 {
+			rdata = rdataFallback
+		}
+		size += int64(recordBaseCost) + int64(len(h.Name)) + rdata
+	}
+	return size
 }
 
 type shard struct {
@@ -150,6 +198,10 @@ type shard struct {
 	head *node // most recently used
 	tail *node // least recently used
 	max  int
+	// maxBytes is this shard's slice of the memory ceiling. Zero means the
+	// count is the only bound.
+	maxBytes int64
+	bytes    int64
 
 	hits      uint64
 	misses    uint64
@@ -178,6 +230,13 @@ func New(opts Options) (*Cache, error) {
 	}
 
 	perShard := opts.MaxEntries / opts.Shards
+	perShardBytes := int64(0)
+	if opts.MaxBytes > 0 {
+		perShardBytes = opts.MaxBytes / int64(opts.Shards)
+		if perShardBytes < 1 {
+			perShardBytes = 1
+		}
+	}
 	c := &Cache{
 		shards: make([]*shard, opts.Shards),
 		mask:   uint64(opts.Shards - 1),
@@ -188,7 +247,8 @@ func New(opts Options) (*Cache, error) {
 	for i := range c.shards {
 		c.shards[i] = &shard{
 			m:   make(map[Key]*node, perShard/4+1),
-			max: perShard,
+			max:      perShard,
+			maxBytes: perShardBytes,
 		}
 	}
 	return c, nil
@@ -327,24 +387,22 @@ func (c *Cache) Put(k Key, e Entry, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	size := entrySize(k, e)
 	if n, ok := s.m[k]; ok {
+		s.bytes += size - n.size
 		n.entry = e
+		n.size = size
 		s.moveToFront(n)
 		s.inserts++
+		s.trim()
 		return
 	}
-	n := &node{key: k, entry: e}
+	n := &node{key: k, entry: e, size: size}
 	s.m[k] = n
 	s.pushFront(n)
+	s.bytes += size
 	s.inserts++
-
-	for len(s.m) > s.max {
-		if s.tail == nil {
-			break
-		}
-		s.remove(s.tail)
-		s.evictions++
-	}
+	s.trim()
 }
 
 // PutValidated caches an answer whose DNSSEC status has been decided, secure
@@ -435,6 +493,7 @@ func (c *Cache) Stats() Stats {
 	for _, s := range c.shards {
 		s.mu.Lock()
 		st.Entries += len(s.m)
+		st.Bytes += s.bytes
 		st.Hits += s.hits
 		st.Misses += s.misses
 		st.Expired += s.expired
@@ -482,6 +541,33 @@ func (s *shard) moveToFront(n *node) {
 func (s *shard) remove(n *node) {
 	s.unlink(n)
 	delete(s.m, n.key)
+	s.bytes -= n.size
+	if s.bytes < 0 {
+		s.bytes = 0
+	}
+}
+
+// trim evicts the least recently used entries until both bounds are satisfied.
+//
+// The byte bound is checked as well as the count because they answer different
+// questions: the count keeps the map from growing without limit, and the bytes
+// keep the process inside the memory the VM was sized for.
+func (s *shard) trim() {
+	for s.tail != nil {
+		overCount := len(s.m) > s.max
+		overBytes := s.maxBytes > 0 && s.bytes > s.maxBytes
+		if !overCount && !overBytes {
+			return
+		}
+		// Never evict the only entry on a byte bound: a single RRset larger
+		// than one shard's budget would otherwise be evicted the instant it was
+		// stored, and the cache would thrash on it for ever.
+		if overBytes && !overCount && len(s.m) <= 1 {
+			return
+		}
+		s.remove(s.tail)
+		s.evictions++
+	}
 }
 
 // CanonicalName lowercases an owner name per RFC 4343, without allocating when

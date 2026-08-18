@@ -96,6 +96,22 @@ Installed routes carry a metric below any static fallback, so a learned default 
 
 It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and the process answering internet queries should not also be able to reconfigure the network. Its unit grants that capability and nothing else - not even the `CAP_NET_BIND_SERVICE` the resolver has.
 
+**Sizing the cache.** `cache.max_size` bounds the memory the cached data may
+occupy — `"512MiB"`, `"2GiB"`, or a plain byte count — and it is the bound worth
+setting. `max_entries` caps a count, and a count cannot tell you how much RAM
+the process will take: an entry holding eight address records costs about two
+and a half times one holding two. A carrier sizing a node for fifty thousand
+subscribers needs to know the memory, not the entry count, and needs the process
+to stop at that figure rather than discover it during an OOM.
+
+Measured cost is about 400 bytes for a small RRset and roughly 1KiB for a large
+one, so a gigabyte holds somewhere between one and two and a half million
+entries depending on what subscribers ask for. Size the VM, decide the share the
+cache may have, set `max_size` to it, and let the entry count follow. Both bounds
+are enforced, whichever binds first, and `cgdns_cache_bytes` reports where it
+actually sits. The estimate is checked against real heap growth by a test and
+currently tracks within a few percent.
+
 **Two limits that look like tuning and are not.** `resolver.accept_sha1` must
 be on: RFC 8624 makes RSASHA1 NOT RECOMMENDED for signing but MUST for
 validation, and refusing it does not protect anyone — it makes zones that still

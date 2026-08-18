@@ -109,6 +109,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 
 	rrCache, err := cache.New(cache.Options{
 		MaxEntries:     cfg.Cache.MaxEntries,
+		MaxBytes:       int64(cfg.Cache.MaxSize),
 		Shards:         cfg.Cache.Shards,
 		MinTTL:         cfg.Cache.MinTTL,
 		MaxTTL:         cfg.Cache.MaxTTL,
@@ -1286,14 +1287,19 @@ func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver
 		// increments the resolver's copy, so in recursive mode — which is what
 		// a POP runs — both read zero for ever, and hit ratio is the first
 		// number anyone asks a resolver for.
-		metrics.Source{Name: "cgdns_cache_hits_total", Help: "Queries answered from cache.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Hits) }},
-		metrics.Source{Name: "cgdns_cache_misses_total", Help: "Queries that missed cache.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Misses) }},
+		// These count cache lookups, not client queries: one recursion makes
+		// many — the delegation walk, every DNSKEY, every DS. Useful for cache
+		// behaviour, misleading as a hit ratio. For that, use
+		// cgdns_queries_from_cache_total.
+		metrics.Source{Name: "cgdns_cache_lookup_hits_total", Help: "Cache lookups that found a live entry. Includes internal lookups made during recursion.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Hits) }},
+		metrics.Source{Name: "cgdns_cache_lookup_misses_total", Help: "Cache lookups that found nothing.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Misses) }},
 		metrics.Source{Name: "cgdns_upstream_queries_total", Help: "Outbound queries to upstream resolvers.", Kind: metrics.Counter, Read: u64(res.Upstream.Load)},
 		metrics.Source{Name: "cgdns_upstream_failures_total", Help: "Outbound queries that failed.", Kind: metrics.Counter, Read: u64(res.UpstreamFail.Load)},
 		metrics.Source{Name: "cgdns_tcp_fallback_total", Help: "Upstream exchanges retried over TCP after TC.", Kind: metrics.Counter, Read: u64(res.TCPFallback.Load)},
 		metrics.Source{Name: "cgdns_servfail_total", Help: "Responses returned as SERVFAIL.", Kind: metrics.Counter, Read: u64(res.ServFail.Load)},
 		metrics.Source{Name: "cgdns_timeouts_total", Help: "Queries that exhausted the client budget.", Kind: metrics.Counter, Read: u64(res.Timeouts.Load)},
 
+		metrics.Source{Name: "cgdns_cache_bytes", Help: "Estimated memory held by cached entries. This is what cache.max_size bounds and what a node should be sized against.", Kind: metrics.Gauge, Read: func() float64 { return float64(c.Stats().Bytes) }},
 		metrics.Source{Name: "cgdns_cache_entries", Help: "Entries currently held in the RRset cache.", Kind: metrics.Gauge, Read: func() float64 { return float64(c.Stats().Entries) }},
 		metrics.Source{Name: "cgdns_cache_evictions_total", Help: "Entries evicted by LRU pressure.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Evictions) }},
 		metrics.Source{Name: "cgdns_cache_expired_total", Help: "Entries found expired on lookup.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Expired) }},
@@ -1310,6 +1316,7 @@ func registerRecursiveMetrics(reg *metrics.Registry, m *resolver.RecursiveMetric
 	reg.Register(
 		metrics.Source{Name: "cgdns_recursion_referrals_total", Help: "Delegation referrals followed.", Kind: metrics.Counter, Read: u64(m.Referrals.Load)},
 		metrics.Source{Name: "cgdns_recursion_bogus_referrals_total", Help: "Referrals rejected by the bailiwick check.", Kind: metrics.Counter, Read: u64(m.BogusReferrals.Load)},
+		metrics.Source{Name: "cgdns_queries_from_cache_total", Help: "Client queries answered without a single outbound query. This is the hit ratio, against cgdns_queries_total.", Kind: metrics.Counter, Read: u64(m.AnsweredFromCache.Load)},
 		metrics.Source{Name: "cgdns_recursion_outbound_total", Help: "Queries sent to authoritative servers.", Kind: metrics.Counter, Read: u64(m.OutboundQueries.Load)},
 		metrics.Source{Name: "cgdns_recursion_outbound_failures_total", Help: "Outbound queries that failed or timed out.", Kind: metrics.Counter, Read: u64(m.OutboundFailures.Load)},
 		metrics.Source{Name: "cgdns_recursion_depth_exceeded_total", Help: "Queries abandoned at the delegation depth cap.", Kind: metrics.Counter, Read: u64(m.DepthExceeded.Load)},

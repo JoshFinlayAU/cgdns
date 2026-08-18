@@ -62,6 +62,11 @@ type Request struct {
 	Local netip.Addr
 	// Proto is the listener that received it.
 	Proto Proto
+	// Internal marks a query the daemon asked itself — a health probe running
+	// through the real serving path. It never crossed a listener, so counting
+	// it as client traffic makes ratios against cgdns_queries_total exceed one
+	// and quietly overstates how much work the cache is doing.
+	Internal bool
 	// Received is when the packet came off the wire. The client budget runs
 	// from here, not from when a worker picked it up.
 	Received time.Time

@@ -56,12 +56,12 @@ func TestCacheMetricsReflectTheCache(t *testing.T) {
 	registerMetrics(reg, &transport.Metrics{}, &resolver.Metrics{}, c, &acme.Metrics{})
 	snap := reg.Snapshot()
 
-	if got := snap["cgdns_cache_hits_total"]; got != float64(stats.Hits) {
-		t.Errorf("cgdns_cache_hits_total = %v, cache recorded %d — the metric is not reading the cache",
+	if got := snap["cgdns_cache_lookup_hits_total"]; got != float64(stats.Hits) {
+		t.Errorf("cgdns_cache_lookup_hits_total = %v, cache recorded %d — the metric is not reading the cache",
 			got, stats.Hits)
 	}
-	if got := snap["cgdns_cache_misses_total"]; got != float64(stats.Misses) {
-		t.Errorf("cgdns_cache_misses_total = %v, cache recorded %d", got, stats.Misses)
+	if got := snap["cgdns_cache_lookup_misses_total"]; got != float64(stats.Misses) {
+		t.Errorf("cgdns_cache_lookup_misses_total = %v, cache recorded %d", got, stats.Misses)
 	}
 	if got := snap["cgdns_cache_entries"]; got != float64(stats.Entries) {
 		t.Errorf("cgdns_cache_entries = %v, cache holds %d", got, stats.Entries)

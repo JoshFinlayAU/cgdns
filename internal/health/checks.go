@@ -66,6 +66,7 @@ func (c *ResolveCheck) Check(ctx context.Context) error {
 		Client:          c.Client,
 		Local:           c.Client.Addr(),
 		Proto:           transport.ProtoUDP,
+		Internal:        true,
 		Received:        time.Now(),
 		MaxResponseSize: dns.MaxMsgSize,
 	}
