@@ -1,0 +1,131 @@
+# Alerting for cgdns.
+#
+# The ordering here is deliberate. The probe rules come first because they are
+# the only ones judged from outside the resolver: a node's own metrics describe
+# what it believes, and this daemon has twice reported itself healthy through a
+# total failure. Where a probe rule and a node rule disagree, believe the probe.
+groups:
+  - name: cgdns-probe
+    rules:
+      - alert: CgdnsResolverDown
+        expr: cgdns_probe_reachable{check="resolves"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.target }} is not answering over {{ $labels.transport }}"
+          description: >-
+            The resolver did not answer a probe from outside itself. If the node
+            still reports cgdns_anycast_advertised 1, believe the probe and check
+            whether the route is actually in the router's table.
+
+      - alert: CgdnsNotValidating
+        expr: cgdns_probe_success{check="validates"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.target }} answered a signed name without AD"
+          description: >-
+            DNSSEC validation has stopped, or a chain that used to build no
+            longer does. Availability checks will not see this: the resolver is
+            answering, just without having verified anything.
+
+      - alert: CgdnsAcceptingBogus
+        expr: cgdns_probe_success{check="rejects_bogus"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.target }} answered a deliberately broken zone"
+          description: >-
+            dnssec-failed.org resolved instead of returning SERVFAIL. Validation
+            is off or is not rejecting, and subscribers are exposed to forged
+            answers.
+
+      - alert: CgdnsProbeStale
+        expr: time() - cgdns_probe_last_run_timestamp > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The cgdns probe has stopped running"
+          description: >-
+            No probe result in five minutes. The checks above are silent while
+            this is firing, so treat it as loss of monitoring rather than a
+            minor fault.
+
+  - name: cgdns-node
+    rules:
+      - alert: CgdnsCertificateExpiring
+        expr: cgdns_acme_cert_not_after - time() < 14 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} certificate expires in under 14 days"
+          description: >-
+            Renewal should have run 30 days out. Check cgdns_acme_failures_total
+            and the daemon log; on expiry every DoT, DoH and DoQ client stops
+            resolving at once.
+
+      - alert: CgdnsAcmeFailing
+        expr: increase(cgdns_acme_failures_total[6h]) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} certificate renewal is failing"
+
+      - alert: CgdnsChallengePortStuck
+        expr: cgdns_acme_challenge_seconds > 300
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} left the http-01 port open for {{ $value }}s"
+          description: >-
+            The challenge port is meant to be open for seconds. A long window is
+            either a stalled validation or a listener that failed to close, and
+            it is exposed on an address subscribers reach.
+
+      - alert: CgdnsDnssecBogusRising
+        expr: increase(cgdns_dnssec_bogus_total[15m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is rejecting many zones as bogus"
+          description: >-
+            Either a large zone broke its signing, or this node's own validation
+            has a fault. Compare against the other node: if only one is
+            reporting, suspect the node.
+
+      - alert: CgdnsValidationEvidenceUnavailable
+        expr: increase(cgdns_dnssec_unavailable_total[15m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} cannot fetch the records it needs to validate"
+          description: >-
+            This is a reachability problem, not a signing one. Check outbound
+            egress from the node's own source address.
+
+      - alert: CgdnsWithdrawnFromAnycast
+        expr: cgdns_anycast_advertised == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} has withdrawn itself from the anycast set"
+
+      - alert: CgdnsPairLinkDown
+        expr: cgdns_peer_outbound_up == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has lost its pair link"
+          description: >-
+            Resolution continues on both nodes; what stops is config replication
+            and cache sharing. Not urgent, but it will diverge.

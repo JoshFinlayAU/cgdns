@@ -96,6 +96,24 @@ Installed routes carry a metric below any static fallback, so a learned default 
 
 It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and the process answering internet queries should not also be able to reconfigure the network. Its unit grants that capability and nothing else - not even the `CAP_NET_BIND_SERVICE` the resolver has.
 
+**External probing** - the node's own metrics describe what it believes, and
+this daemon has twice reported itself healthy through a total failure. So
+`cgdns-probe` runs somewhere else, speaks to the anycast address the way a
+subscriber does, and judges only the answer that comes back. It runs three
+checks because there are three ways to be broken and they need telling apart: a
+signed name must return NOERROR **with AD**, a deliberately broken zone must
+return SERVFAIL, and an ordinary name must resolve. A resolver failing the first
+two while passing the third looks perfectly healthy on a dashboard and is not
+validating anything.
+
+It probes over UDP, TCP and DoT, exports Prometheus metrics, and runs one-shot
+with a non-zero exit for use in CI or a turnup check. Deployed on a pair, each
+node probes its **sibling** rather than itself; a genuinely separate vantage
+point is better still, and moving it is a change to `-targets`.
+
+Alert rules ship in `deploy/prometheus/cgdns-alerts.yml`. Where a probe rule and
+a node rule disagree, believe the probe.
+
 **Certificates** - the encrypted transports need a certificate a subscriber's
 device trusts, and renewing that by hand is a scheduled outage: the failure is
 silent until the day it expires, then every encrypted client stops resolving at

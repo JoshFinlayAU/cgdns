@@ -30,6 +30,21 @@ contents:
     file_info:
       mode: 0755
 
+  - src: ./bin/cgdns-probe
+    dst: /usr/bin/cgdns-probe
+    file_info:
+      mode: 0755
+
+  - src: ./deploy/systemd/cgdns-probe.service
+    dst: /usr/lib/systemd/system/cgdns-probe.service
+    file_info:
+      mode: 0644
+
+  - src: ./deploy/prometheus/cgdns-alerts.yml
+    dst: /usr/share/doc/cgdns/cgdns-alerts.yml
+    file_info:
+      mode: 0644
+
   - src: ./deploy/systemd/cgdns-routed.service
     dst: /usr/lib/systemd/system/cgdns-routed.service
     file_info:

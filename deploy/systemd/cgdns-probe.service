@@ -1,0 +1,33 @@
+[Unit]
+Description=cgdns external probe
+Documentation=file:/usr/share/doc/cgdns/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cgdns/probe.env
+ExecStart=/usr/bin/cgdns-probe -listen ${PROBE_LISTEN} -targets ${PROBE_TARGETS} -interval ${PROBE_INTERVAL}
+Restart=always
+RestartSec=10s
+
+# The probe resolves and serves one metrics page. It needs nothing else.
+DynamicUser=yes
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
