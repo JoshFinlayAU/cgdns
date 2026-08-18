@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -80,6 +81,9 @@ type Options struct {
 type Validator struct {
 	anchors []Anchor
 	fetch   Fetcher
+
+	inheritedMu sync.RWMutex
+	inherited   map[string]bool
 	maxDep  int
 	now     func() time.Time
 	sha1    bool
@@ -228,6 +232,7 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 	if errors.Is(err, errNotAZoneCut) {
 		// Not cut from its parent, so it has no keys of its own: the records
 		// sitting at this name are signed by the parent zone.
+		v.markInherited(zone)
 		return parentKeys, StatusSecure, nil
 	}
 	if err != nil || status != StatusSecure {
@@ -438,6 +443,32 @@ func parentZone(zone string) string {
 		return "."
 	}
 	return zone[i:]
+}
+
+// markInherited records that a zone's keys were borrowed from its parent
+// because the name is not a zone cut.
+//
+// The distinction matters when the records turn out to carry no signature. A
+// name inside a signed zone always has one, so an unsigned RRset means the
+// inference was wrong: the name really is a delegation, the parent proved there
+// is no DS for it, and the correct verdict is insecure rather than bogus.
+// Calling it bogus makes SERVFAIL out of every CNAME that lands in a CDN zone
+// below a signed parent, which is most of Apple's and Microsoft's estate.
+func (v *Validator) markInherited(zone string) {
+	v.inheritedMu.Lock()
+	defer v.inheritedMu.Unlock()
+	if v.inherited == nil {
+		v.inherited = make(map[string]bool)
+	}
+	v.inherited[dns.CanonicalName(zone)] = true
+}
+
+// KeysWereInherited reports whether the keys returned for zone belong to an
+// ancestor rather than to zone itself.
+func (v *Validator) KeysWereInherited(zone string) bool {
+	v.inheritedMu.RLock()
+	defer v.inheritedMu.RUnlock()
+	return v.inherited[dns.CanonicalName(zone)]
 }
 
 // errNotAZoneCut signals that a name carries no DS because it is not a

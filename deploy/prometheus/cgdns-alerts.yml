@@ -55,6 +55,19 @@ groups:
             this is firing, so treat it as loss of monitoring rather than a
             minor fault.
 
+      - alert: CgdnsCacheHitRatioUnreadable
+        expr: cgdns_cache_hits_total == 0 and cgdns_queries_total > 1000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} reports no cache hits after {{ $value }} queries"
+          description: >-
+            A resolver that has answered thousands of queries and recorded no
+            cache hit is not describing itself accurately. This exact reading
+            once meant the counter was wired to the forwarder's tally while the
+            node ran recursive.
+
   - name: cgdns-node
     rules:
       - alert: CgdnsCertificateExpiring
@@ -88,17 +101,22 @@ groups:
             either a stalled validation or a listener that failed to close, and
             it is exposed on an address subscribers reach.
 
+      # The probe deliberately resolves a broken zone on every cycle, so this
+      # counter has a constant floor: roughly two per probe target per minute,
+      # about 90 per quarter hour for a three-target probe. A threshold under
+      # that fires for ever and teaches everyone to ignore the alert. Raise this
+      # in step with the probe interval or the number of targets.
       - alert: CgdnsDnssecBogusRising
-        expr: increase(cgdns_dnssec_bogus_total[15m]) > 50
+        expr: increase(cgdns_dnssec_bogus_total[15m]) > 500
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "{{ $labels.instance }} is rejecting many zones as bogus"
           description: >-
-            Either a large zone broke its signing, or this node's own validation
-            has a fault. Compare against the other node: if only one is
-            reporting, suspect the node.
+            Above the floor the probe itself generates. Either a large zone broke
+            its signing, or this node's own validation has a fault. Compare
+            against the other node: if only one is reporting, suspect the node.
 
       - alert: CgdnsValidationEvidenceUnavailable
         expr: increase(cgdns_dnssec_unavailable_total[15m]) > 50

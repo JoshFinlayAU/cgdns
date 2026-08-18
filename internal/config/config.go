@@ -170,6 +170,11 @@ type Resolver struct {
 
 	// AcceptSHA1 permits RSASHA1 signatures. SHA-1 is not collision resistant;
 	// enabling it weakens the guarantee validation exists to provide.
+	// AcceptSHA1 allows RSASHA1 signatures. RFC 8624 §3.1 makes RSASHA1 NOT
+	// RECOMMENDED for signing but MUST for validation, and refusing it does not
+	// protect a subscriber from anything — it makes zones that still sign with
+	// it unreachable, which is strictly worse. Many .gov zones sign with
+	// algorithm 7 today.
 	AcceptSHA1 bool `yaml:"accept_sha1"`
 
 	// UDPBufferSize is the EDNS0 advertised buffer. 1232 avoids fragmentation

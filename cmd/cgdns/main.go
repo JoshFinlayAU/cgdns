@@ -1282,8 +1282,12 @@ func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver
 		metrics.Source{Name: "cgdns_tcp_accepted_total", Help: "TCP connections accepted.", Kind: metrics.Counter, Read: u64(tx.TCPAccepted.Load)},
 		metrics.Source{Name: "cgdns_tcp_refused_total", Help: "TCP connections refused by ACL or connection limit.", Kind: metrics.Counter, Read: u64(tx.TCPRefused.Load)},
 
-		metrics.Source{Name: "cgdns_cache_hits_total", Help: "Queries answered from cache.", Kind: metrics.Counter, Read: u64(res.CacheHits.Load)},
-		metrics.Source{Name: "cgdns_cache_misses_total", Help: "Queries that missed cache.", Kind: metrics.Counter, Read: u64(res.CacheMisses.Load)},
+		// Read from the cache rather than the resolver: only the forwarder
+		// increments the resolver's copy, so in recursive mode — which is what
+		// a POP runs — both read zero for ever, and hit ratio is the first
+		// number anyone asks a resolver for.
+		metrics.Source{Name: "cgdns_cache_hits_total", Help: "Queries answered from cache.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Hits) }},
+		metrics.Source{Name: "cgdns_cache_misses_total", Help: "Queries that missed cache.", Kind: metrics.Counter, Read: func() float64 { return float64(c.Stats().Misses) }},
 		metrics.Source{Name: "cgdns_upstream_queries_total", Help: "Outbound queries to upstream resolvers.", Kind: metrics.Counter, Read: u64(res.Upstream.Load)},
 		metrics.Source{Name: "cgdns_upstream_failures_total", Help: "Outbound queries that failed.", Kind: metrics.Counter, Read: u64(res.UpstreamFail.Load)},
 		metrics.Source{Name: "cgdns_tcp_fallback_total", Help: "Upstream exchanges retried over TCP after TC.", Kind: metrics.Counter, Read: u64(res.TCPFallback.Load)},

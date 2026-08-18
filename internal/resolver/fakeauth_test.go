@@ -132,6 +132,27 @@ func (f *fakeAuth) addCNAME(name, target string, ttl uint32) *fakeAuth {
 	return f
 }
 
+// addRRSIG attaches a signature to an existing RRset. The signature is not
+// verifiable — these fixtures are unsigned — but it lets a test check that
+// signatures travel with the records they cover.
+func (f *fakeAuth) addRRSIG(name string, covered uint16, signer string, ttl uint32) *fakeAuth {
+	n := dns.CanonicalName(name)
+	rr := &dns.RRSIG{
+		Hdr:         dns.RR_Header{Name: n, Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: ttl},
+		TypeCovered: covered,
+		Algorithm:   dns.ECDSAP256SHA256,
+		Labels:      uint8(dns.CountLabel(n)),
+		OrigTtl:     ttl,
+		Expiration:  uint32(time.Now().Add(24 * time.Hour).Unix()),
+		Inception:   uint32(time.Now().Add(-24 * time.Hour).Unix()),
+		KeyTag:      12345,
+		SignerName:  dns.CanonicalName(signer),
+		Signature:   "AAAA",
+	}
+	f.records[key(n, covered)] = append(f.records[key(n, covered)], rr)
+	return f
+}
+
 // addEmptyNonTerminal marks a name as existing with no records of its own,
 // which is what an intermediate label in a deep name looks like.
 func (f *fakeAuth) addEmptyNonTerminal(name string) *fakeAuth {

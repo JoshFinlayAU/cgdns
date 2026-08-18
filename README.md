@@ -96,6 +96,15 @@ Installed routes carry a metric below any static fallback, so a learned default 
 
 It runs as its own daemon, because installing routes needs `CAP_NET_ADMIN` and the process answering internet queries should not also be able to reconfigure the network. Its unit grants that capability and nothing else - not even the `CAP_NET_BIND_SERVICE` the resolver has.
 
+**Two limits that look like tuning and are not.** `resolver.accept_sha1` must
+be on: RFC 8624 makes RSASHA1 NOT RECOMMENDED for signing but MUST for
+validation, and refusing it does not protect anyone — it makes zones that still
+sign with it, including many `.gov` zones, unreachable. And
+`max_outbound_per_query` bounds honest work, not loops; loops are already capped
+by `max_delegation_depth` and `max_cname_chain`. A CDN-fronted name crosses
+several zones by CNAME and each needs its own DNSKEY and DS, so a low ceiling
+SERVFAILs names people use daily. 100 is a working figure; 32 is not.
+
 **External probing** - the node's own metrics describe what it believes, and
 this daemon has twice reported itself healthy through a total failure. So
 `cgdns-probe` runs somewhere else, speaks to the anycast address the way a

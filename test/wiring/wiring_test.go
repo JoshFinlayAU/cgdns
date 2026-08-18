@@ -168,3 +168,28 @@ rate_limit:
 		t.Error("cgdns_queries_total did not move after a query")
 	}
 }
+
+// Cache hit ratio is the first number anyone asks a resolver for, and it was
+// unreadable in production for days: the exported counter was fed by the
+// forwarder, which a recursive POP never runs, so it read zero for ever while
+// the cache underneath was working perfectly.
+func TestCacheHitsAreCounted(t *testing.T) {
+	up := startUpstream(t)
+	up.ttl.Store(60)
+	d := start(t, up.addr, "")
+
+	for i := 0; i < 3; i++ {
+		if _, err := d.query("repeat.test.", dns.TypeA); err != nil {
+			t.Fatalf("query %d: %v", i, err)
+		}
+	}
+
+	hits := d.metric(t, "cgdns_cache_hits_total")
+	misses := d.metric(t, "cgdns_cache_misses_total")
+	if hits == 0 {
+		t.Errorf("asked the same name three times and the cache reported no hits (misses=%v)", misses)
+	}
+	if misses == 0 {
+		t.Error("the first query cannot have been a hit, so misses should have moved too")
+	}
+}

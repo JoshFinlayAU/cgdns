@@ -376,6 +376,16 @@ func (r *Recursive) validate(ctx context.Context, res *result) (dnssec.Status, e
 			continue
 		}
 		if len(sigs) == 0 {
+			// The zone reads as secure but the records carry no signature. A
+			// name inside a signed zone always has one, so if the keys were
+			// borrowed from an ancestor the inference was wrong: this really is
+			// a delegation whose parent proved it has no DS, and the answer is
+			// insecure rather than forged. Calling it bogus turns every CNAME
+			// landing in a CDN zone below a signed parent into a SERVFAIL.
+			if r.opts.Validator.KeysWereInherited(zone) {
+				worst = downgrade(worst, dnssec.StatusInsecure)
+				continue
+			}
 			return dnssec.StatusBogus, dnssec.ErrNoSignatures
 		}
 		if _, err := r.opts.Validator.VerifyRRset(rrs, sigs, keys); err != nil {
@@ -636,8 +646,14 @@ func (r *Recursive) finishAnswer(ctx context.Context, qname string, qtype uint16
 	if err != nil {
 		return nil, err
 	}
+	// Carry the signatures for both halves. Dropping them leaves every RRset in
+	// a CNAME chain looking unsigned, and validation then tries to build a
+	// chain of trust at the alias itself rather than at the zone that signed
+	// it — which fails, so every signed alias into another zone becomes a
+	// SERVFAIL. That is most of what a CDN-fronted name looks like.
 	combined := append(append([]dns.RR{}, answer...), tail.answer...)
-	return &result{rcode: tail.rcode, answer: combined, authority: tail.authority}, nil
+	sigs := append(append([]*dns.RRSIG{}, sigsCovering(resp.Answer, answer)...), tail.sigs...)
+	return &result{rcode: tail.rcode, answer: combined, sigs: sigs, authority: tail.authority}, nil
 }
 
 // sigsCovering returns the RRSIGs from section that cover the types present in
