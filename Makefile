@@ -14,6 +14,7 @@ build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/cgdns-routed ./cmd/cgdns-routed
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/cgdns-probe ./cmd/cgdns-probe
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/cgdnsdiff ./cmd/cgdnsdiff
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/cgdnsload ./cmd/cgdnsload
 
 .PHONY: test
 test:

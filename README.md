@@ -275,13 +275,35 @@ Everything on the original list is in. What remains is real work, not polish:
 
 ## Performance
 
-Measured on a Xeon Gold 6140, hot path, zero allocations:
+Measured with `cgdnsload`, which ramps offered load and reports what was
+achieved rather than what was asked for — the difference between the two is the
+answer. The daemon was pinned to 4 CPUs to match a POP node; the load generator
+had the rest of the host, and forwarded to a local authoritative so the
+measurement is of this daemon and not of the internet.
 
-| | |
-|---|---|
-| Subscriber prefix lookup (v4 / v6) | 3.6 ns / 7.0 ns |
-| Cache hit | 344 ns |
-| Cache miss | 262 ns |
+```
+                achieved   loss     p50     p95     p99
+  600 senders    143,105   0.07%   1.2ms   5.5ms  10.6ms
+ 1500 senders    137,395   0.32%   2.0ms   7.6ms  13.7ms
+```
+
+The knee is around 140,000 queries per second. Past it, more concurrency yields
+*less* throughput and several times the loss, which is the shape to recognise:
+a saturated resolver does not slow down politely, it starts dropping. CPU peaked
+at 290% of the 400% available, so the limit is the packet path rather than
+compute — adding cores would not move it much.
+
+A five-minute soak at the knee answered 41,993,025 queries at 0.07% loss with
+p99 steady at 9.7ms and nothing logged. Memory rose from 44MB to 277MB and
+stopped there.
+
+**Resident memory is not the cache size.** With `max_size: "64MiB"` the cache
+held exactly 64MiB across 176,000 entries and 400,000 evictions — the ceiling
+does what it says — while the process sat at 277MB. The difference is Go's heap
+under load, and it scales with query rate rather than with the cache: the same
+build serving a household holds ~1MB of cache in 64MB of RSS. Size a node as
+cache plus roughly 200MB of headroom at full tilt, not as cache alone.
+
 
 ## Configuration
 
