@@ -513,7 +513,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 	}
 
 	reg := metrics.NewRegistry()
-	registerMetrics(reg, txMetrics, resMetrics, rrCache, acmeMetrics)
+	registerMetrics(reg, txMetrics, resMetrics, recMetrics, rrCache, acmeMetrics)
 	if classifier != nil {
 		registerPolicyMetrics(reg, polMetrics, classifier, registry)
 	}
@@ -1263,7 +1263,7 @@ func metricsServer(cfg config.Config, reg *metrics.Registry, log *slog.Logger) (
 	}, nil
 }
 
-func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver.Metrics, c *cache.Cache, acmeMetrics *acme.Metrics) {
+func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver.Metrics, rec *resolver.RecursiveMetrics, c *cache.Cache, acmeMetrics *acme.Metrics) {
 	u64 := func(f func() uint64) func() float64 {
 		return func() float64 { return float64(f()) }
 	}
@@ -1272,6 +1272,13 @@ func registerMetrics(reg *metrics.Registry, tx *transport.Metrics, res *resolver
 	}
 	reg.Register(
 		metrics.Source{Name: "cgdns_queries_total", Help: "DNS queries received.", Kind: metrics.Counter, Read: u64(tx.Queries.Load)},
+		// Whichever mode is running keeps this tally; the other stays zero. It
+		// is registered here rather than beside the recursion counters so the
+		// hit ratio exists in both modes — an operator asking "how much is the
+		// cache doing" should not get silence because of how the node resolves.
+		metrics.Source{Name: "cgdns_queries_from_cache_total", Help: "Client queries answered without a single outbound query. This is the hit ratio, against cgdns_queries_total.", Kind: metrics.Counter, Read: func() float64 {
+			return float64(res.CacheHits.Load() + rec.AnsweredFromCache.Load())
+		}},
 		metrics.Source{Name: "cgdns_acme_renewals_total", Help: "Certificates successfully issued or renewed.", Kind: metrics.Counter, Read: u64(acmeMetrics.Renewals.Load)},
 		metrics.Source{Name: "cgdns_acme_failures_total", Help: "Failed certificate orders. Sustained non-zero means the certificate will eventually expire.", Kind: metrics.Counter, Read: u64(acmeMetrics.Failures.Load)},
 		metrics.Source{Name: "cgdns_acme_cert_not_after", Help: "Expiry of the certificate in use, as a Unix timestamp. Alert on this approaching, not on the renewal count.", Kind: metrics.Gauge, Read: i64(acmeMetrics.NotAfter.Load)},
@@ -1317,7 +1324,6 @@ func registerRecursiveMetrics(reg *metrics.Registry, m *resolver.RecursiveMetric
 	reg.Register(
 		metrics.Source{Name: "cgdns_recursion_referrals_total", Help: "Delegation referrals followed.", Kind: metrics.Counter, Read: u64(m.Referrals.Load)},
 		metrics.Source{Name: "cgdns_recursion_bogus_referrals_total", Help: "Referrals rejected by the bailiwick check.", Kind: metrics.Counter, Read: u64(m.BogusReferrals.Load)},
-		metrics.Source{Name: "cgdns_queries_from_cache_total", Help: "Client queries answered without a single outbound query. This is the hit ratio, against cgdns_queries_total.", Kind: metrics.Counter, Read: u64(m.AnsweredFromCache.Load)},
 		metrics.Source{Name: "cgdns_recursion_outbound_total", Help: "Queries sent to authoritative servers.", Kind: metrics.Counter, Read: u64(m.OutboundQueries.Load)},
 		metrics.Source{Name: "cgdns_recursion_outbound_failures_total", Help: "Outbound queries that failed or timed out.", Kind: metrics.Counter, Read: u64(m.OutboundFailures.Load)},
 		metrics.Source{Name: "cgdns_recursion_depth_exceeded_total", Help: "Queries abandoned at the delegation depth cap.", Kind: metrics.Counter, Read: u64(m.DepthExceeded.Load)},

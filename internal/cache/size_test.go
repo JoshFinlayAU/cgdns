@@ -2,8 +2,8 @@ package cache
 
 import (
 	"fmt"
-	"runtime"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 

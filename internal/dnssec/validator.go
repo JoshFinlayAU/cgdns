@@ -84,9 +84,9 @@ type Validator struct {
 
 	inheritedMu sync.RWMutex
 	inherited   map[string]bool
-	maxDep  int
-	now     func() time.Time
-	sha1    bool
+	maxDep      int
+	now         func() time.Time
+	sha1        bool
 }
 
 // New builds a Validator.

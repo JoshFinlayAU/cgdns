@@ -19,7 +19,7 @@ both.*
 **Part 1 — [What this is, and why it should go national](#part-1--what-this-is-and-why-it-should-go-national)**
 · [In one paragraph](#in-one-paragraph)
 · [The eight reasons](#the-eight-reasons-to-deploy-this-nationally)
-· [What it costs and what is unproven](#what-it-costs-and-what-is-still-unproven)
+· [What it costs, and what POP-BNE has proved](#what-it-costs-and-what-is-still-unproven)
 · [Evidence](#the-evidence-behind-those-claims)
 
 **Part 2 — [The components](#part-2--the-components)**
@@ -30,6 +30,7 @@ both.*
 · [The pair](#the-pair)
 · [Anycast and routing](#anycast-and-routing)
 · [Management](#management)
+· [Certificates and the external probe](#certificates-and-judging-the-node-from-outside-itself)
 · [Packaging](#packaging-and-operations)
 
 **Part 3 — [The architecture decisions that matter](#part-3--the-architecture-decisions-that-matter)**
@@ -39,7 +40,7 @@ both.*
 · [What is outstanding](#what-is-outstanding)
 · [How this has been tested and hardened](#how-this-has-been-tested-and-hardened)
 
-**→ [What I need to start a real-world test](#what-i-need-to-start-a-real-world-test)** — *the ask, if you read nothing else*
+**→ [What I need next: a second POP in S1](#what-i-need-next-a-second-pop-in-s1)** — *the ask, if you read nothing else*
 · [Addressing](#addressing) · [BGP peering](#bgp-peering) · [The test plan, already written](#the-test-plan-is-already-written)
 
 ---
@@ -54,8 +55,8 @@ itself — walking the delegation chain from the root rather than forwarding to
 anyone else's resolver — validates DNSSEC, and applies per-subscriber policy
 where a filtered product has been sold. It runs as two nodes per POP, each
 announcing one of the two anycast addresses subscribers receive as their primary
-and secondary. Nodes are managed through a REST API, a CLI or a web console, all
-equivalent, from either node. A sick node withdraws itself from BGP and traffic
+and secondary. Nodes are managed through a REST API and a CLI — and
+an optional web console — all equivalent, from either node. A sick node withdraws itself from BGP and traffic
 moves; a dead POP means subscribers are served by the next-closest one. There is
 no central cluster, no quorum, and nothing between POPs.
 
@@ -176,39 +177,58 @@ protocol behaviour cites its RFC section in the source, and why the test suite i
 the size it is. **This obligation does not end**, and under-investing in it later
 is the way this decision turns out to have been wrong.
 
-**The reference deployment model has never been run.** This is the single most
-important caveat in this document, and it is wider than one setting.
+**POP-BNE is live, built to the reference model, and carrying real subscriber
+traffic.** A household resolves through it, and the counters below were read off
+the running nodes rather than inferred.
 
-The lab pair predates the model in [provisioning.md](provisioning.md) and reaches
-equivalent behaviour by other means. It is a worked example, not the reference:
+Verified on `athena--dns1` and `athena--dns2`, and at the PE, which is the only
+place that proves an announcement landed:
 
-| Lab | Reference model |
+| Property | State |
 |---|---|
-| Both nodes peer with one router over a shared /29 | one node per PE, so a router failure withdraws one node, not the POP |
-| A separate `loopback0` holds the query source | `eth0` is the query source; no loopback |
-| RFC 1918 and ULA addressing, masqueraded out by the router | public space, no NAT |
-| Static return routes on the router to reach each loopback | not needed — eth0 is natively routed |
-| A dedicated interface carries IPv6 on its own VLAN | v6 rides eth0 alongside v4 |
-| One shared anycast address across the pair | each node owns its own, announced from every POP |
-| One POP | the same two addresses announced from every POP |
+| Services | `cgdns`, `gobgpd`, `cgdns-routed`, `cgdns-probe` — all active on both nodes |
+| BGP | One session per family per node to the PE, both established |
+| Anycast | `anycast0` holds `160.30.37.252/32` + `2001:df4:2040:53::1/128` on ns1, `.253`/`::2` on ns2. `cgdns_anycast_advertised 1` on both |
+| Learned default | Installed per family by the route agent at metric 5, with the correct preferred source (`src 160.30.37.37`) |
+| Query source | `outbound_source_v4/_v6` pinned to eth0, never the anycast address |
+| Encrypted transports | DoT + DoQ on 853, DoH on 443, TLS 1.3 minimum, on both anycast addresses in both families |
+| Certificates | **Publicly trusted Let's Encrypt**, issued automatically — `dns1.as135559.net.au` and `dns2.as135559.net.au`, valid to 15 Nov 2026. Zero ACME failures |
+| Pair link | `cgdns_peer_inbound_up 1` and `_outbound_up 1` on both, with peer cache fetches actually being served |
+| DNSSEC | Validating and rejecting: secure, insecure and bogus all counting |
+| Cache | Memory-bounded at 1 GiB; currently a few hundred KiB and ~1,300 entries |
 
-So the lab has proved the *software* thoroughly — recursion, DNSSEC,
-health-driven withdraw and re-advertise, failover, the pair link, rate limiting
-under flood, serve-stale isolation — and has proved **none of the production
-addressing, peering or anycast topology**. In particular, the failover it
-demonstrated was *within* the POP, which is specifically not what production
-will do.
+**A metric worth understanding before anyone alerts on it.**
+`cgdns_dnssec_bogus_total` sits in the low hundreds on both nodes, and **that is
+the system working**. Almost every one of them is `dnssec-failed.org` — the
+deliberately broken zone `cgdns-probe` queries on a timer to confirm validation
+is still *rejecting*. A resolver that only ever counted `secure` would look
+healthier and be less trustworthy. Alert on a *change in the rate* against a
+known baseline, not on the counter being non-zero.
 
-Standing up one POP to the reference model is the most important outstanding
-item, and it belongs before the first production deployment rather than during
-it. **The procedure for doing it is written** — addressing, both sides of the BGP
-configuration, the build order and the turnup checks, in
-[provisioning.md](provisioning.md) and summarised at the end of this document.
-What it needs is the addresses and the peering, not more design.
+**What POP-BNE does not yet prove**, and these are the honest remaining gaps:
 
-**There has been no multi-day soak under real subscriber load.** Everything is
-verified in a two-node lab and against the live internet. That is meaningful
-evidence and it is not the same as production.
+- **Carrier query volumes.** One household is real traffic, not representative
+  load. Nothing here has been driven at the rates a state's subscriber base
+  produces.
+- **Inter-POP behaviour.** With one POP there is nowhere for an address to move
+  to. The property that makes anycast worth having — a node withdrawing and the
+  same address answering from the next site — cannot be demonstrated until a
+  second POP exists. **This is now the single most valuable next step.**
+- **The withdrawal path in production.** Exercised thoroughly in the lab, not yet
+  drilled at POP-BNE.
+- **Multi-day behaviour under sustained load**, as opposed to multi-day
+  behaviour under a household's.
+
+**One deliberate divergence from the written model, and it has a cost worth
+knowing.** POP-BNE peers **iBGP inside AS135559** rather than the private-ASN
+eBGP that `provisioning.md` describes, because it matches the pattern already
+used elsewhere in the estate. The consequence is iBGP split horizon: a route
+learned from one iBGP peer is never re-advertised to another, so the anycast
+prefixes reached the PE and stopped one hop later — the PE could reach them and
+nothing else could. Resolved by making the PE a route reflector for those
+sessions. **eBGP with a private ASN avoids this entirely**, because eBGP-learned
+routes propagate into iBGP without reflection. The choice is not cosmetic, and
+it is worth settling deliberately before the second POP rather than inheriting it.
 
 **Capacity planning has a consequence people miss.** Because each node holds one
 of the two addresses, a single node failure sends that address to the next state.
@@ -221,7 +241,7 @@ load.
 
 | Claim | Backed by |
 |---|---|
-| Correctness of the resolution engine | **378 tests and 13 benchmarks**, `-race` clean, **zero skipped tests**; verified live against the real root servers |
+| Correctness of the resolution engine | **406 tests, 13 benchmarks and 9 fuzz targets**, `-race` clean, **zero skipped tests**; verified live against the real root servers |
 | DNSSEC validation | `AD` set on `iana.org` and `cloudflare.com`; SERVFAIL with EDE 9 on `dnssec-failed.org` |
 | IPv6 is real, not nominal | Full lab run with **IPv4 egress disabled entirely** — every outbound query over v6, DNSSEC still validating |
 | Anycast failover | Lab: prefix withdrawn on SIGTERM, router moves to sibling, no failed queries, re-advertises on restart |
@@ -231,6 +251,12 @@ load.
 | Aggressive NSEC/NSEC3 | Live internet: 49/50 synthesised on NSEC and small NSEC3 zones; measured honestly, including the large-zone case where it saves much less |
 | Serve-stale vs health | Lab: isolated node kept answering cached names **and still withdrew**, citing that the root NS came from expired cache |
 | Packaging | Real `.deb` install on a lab node, including the upgrade and removal paths |
+| **The deployment model itself** | **POP-BNE, built to `provisioning.md`**: four prefixes active at the PE with native next hops, defaults learned and installed per family, egress source confirmed by capture |
+| **Real subscriber use** | **A household resolving through POP-BNE today**, over both anycast addresses and both families |
+| Automatic certificates | Publicly trusted Let's Encrypt certificates issued and installed on both nodes without manual steps, zero ACME failures |
+| The pair link in production | Peer up in both directions on both nodes, with cache fetches actually served between them |
+| Wire parsers under hostile input | **Nine fuzz targets** over the parsers where attacker-chosen bytes become a decision — denial proofs, the aggressive store, feed and root-hints parsing, and the listener acceptance path. **Nine million executions, nothing found** |
+| Judged from outside itself | `cgdns-probe` runs off-node, queries the anycast address as a subscriber does, and judges only the answer returned |
 
 ---
 ---
@@ -373,6 +399,16 @@ are answers, and overriding them would resurrect names their owner deliberately
 removed. Stale answers carry EDE 3 and never set `AD`, because signatures as old
 as the data may have expired.
 
+**The cache is bounded by memory, not by entry count.** An entry count cannot
+bound memory: an entry holding eight address records costs roughly two and a half
+times one holding two, so the same `max_entries` can mean 380 MB or 930 MB
+depending on what subscribers happen to ask for. That is not a figure a node can
+be sized against, and the failure mode is the process being killed rather than
+the cache getting smaller. `cache.max_size` takes the memory instead — `512MiB`,
+`2GiB`, or a byte count — enforced by the same LRU eviction per shard, with the
+entry count still capping the map itself. Both bounds apply, whichever binds
+first. `cgdns_cache_bytes` reports where a node actually sits.
+
 **Aggressive NSEC/NSEC3** stores validated denials and reuses them for every name
 they prove absent. Only validated denials are stored, an NSEC is only used inside
 the zone its own SOA names, and NSEC3 proof is stricter — closest encloser, next
@@ -487,16 +523,76 @@ at all — including none adopted from its sibling, which is what stops a rejoin
 node growing a credential nobody knows about. There is no default password
 anywhere.
 
-**Web console**, embedded in the binary: three files, no framework, no build step,
-nothing fetched from a CDN. Content-Security-Policy has no `unsafe-inline`
+**The local node is managed over a unix socket**, not a token.
+`cgdnsctl` talks to `/run/cgdns/control.sock`; the file is `0600` and the peer's
+uid is checked at accept, so a request arriving there is authorised by the socket
+itself. Whoever can open it can already read the config, replace the binary and
+stop the service — a token on top of that protects nothing, and it does leave a
+standing admin secret in a file or a shell history. It is a socket rather than
+loopback TCP so that argument holds: a TCP port is reachable by every local user
+and, given a routing mistake, from off the box. Tokens remain what a *remote*
+operator or a sibling node uses.
+
+**Web console**, embedded in the binary and **off by default**: three files, no
+framework, no build step, nothing fetched from a CDN. It is the only part of the
+daemon that accepts credentials, holds sessions and renders HTML — a standing
+authentication and XSS surface on a resolver — so it is carried only where
+somebody actually wants it. `ui: true` brings it back. Content-Security-Policy has no `unsafe-inline`
 because the console renders every value with `textContent`, so an operator-supplied
 record can never be parsed as markup. It adds no listener of its own.
 
-**Telemetry.** 95 Prometheus series on the management plane, read at scrape time
+**Telemetry.** 105 Prometheus series on the management plane, read at scrape time
 from atomic counters so instrumentation costs the query path one increment.
 Structured JSON logs make a per-event stream that journald and a shipper turn
 into Kafka, Loki or a SIEM feed. Nothing is labelled by query name or client
 address.
+
+## Certificates, and judging the node from outside itself
+
+**ACME issuance and renewal is built in.** DoT, DoH and DoQ need a certificate
+subscriber devices trust, and renewing one by hand is a scheduled outage —
+silent until the day it expires, then every encrypted client stops resolving at
+once. The manager writes to the same `listen.tls` paths the listeners read, so
+the two cannot drift, and renewals are picked up on the next handshake rather
+than by restarting a listener.
+
+- **http-01 is the default, and its port is not left open.** It binds when a
+  challenge starts and closes the moment it finishes — about fifteen seconds a
+  quarter, recorded in `cgdns_acme_challenge_seconds`. A resolver's addresses are
+  reachable by every subscriber and, through the covering prefix, from the
+  internet; a web server running all year to serve one file for a few seconds is
+  attack surface bought for nothing.
+- **dns-01 is used instead wherever a provider is configured**, because it opens
+  nothing — and it is the only workable option once a name is anycast from
+  several POPs, where the CA would validate against whichever POP is nearest *it*
+  rather than the one asking.
+- **A certificate no public CA vouches for is treated as needing replacement**
+  even when it is valid for years and names the right hosts. An interim
+  placeholder passes every expiry and hostname check, so nothing else would ever
+  replace it.
+
+**`cgdns-probe` judges the resolver from outside itself.** A node's metrics
+describe what it believes; they cannot describe what a subscriber receives, and
+the gap between those two is where the serious incidents live. The probe runs
+elsewhere, speaks to the anycast address the way a subscriber does, and judges
+only the answer that comes back.
+
+Three checks, because there are three distinct ways to be broken:
+
+| Check | Catches |
+|---|---|
+| A signed name returns NOERROR **with `AD`** | Validation has silently stopped — no availability check would notice |
+| A deliberately broken zone returns **SERVFAIL** | Validation is not *rejecting*, so subscribers are exposed to forged answers |
+| An ordinary name resolves | Plain availability |
+
+Passing only the third looks perfectly healthy and is not DNSSEC at all.
+
+UDP, TCP and DoT; Prometheus metrics with `-listen`, or one-shot with a non-zero
+exit. Deployed at POP-BNE with each node probing its sibling, which is
+independent of either node's self-report. **Where a probe rule and a node rule
+disagree, believe the probe** — the alert rules are ordered to say so. Verified
+by drill rather than by assertion: stopping cgdns on one node turned all three of
+its sibling's checks red within twelve seconds.
 
 ## Packaging and operations
 
@@ -773,40 +869,56 @@ eventually takes it down.
 
 ## What is outstanding
 
-Every feature originally planned has landed. What remains splits into two kinds
-of work, and the first kind matters more than the feature list ever did.
+Every feature originally planned has landed, and POP-BNE is live and serving. The
+remaining work is proving behaviour that one POP and one household cannot show.
 
-**Verification — the reference model has not been run:**
+**Verification:**
 
-1. **Stand up one POP to the model in `provisioning.md`** — one node per PE,
-   public addressing with no NAT, eth0 as the query source, each node owning its
-   own anycast address. The lab differs from this in seven respects (Part 1), so
-   this is the first time the production topology will exist anywhere. Before the
-   first production deployment, not during it.
-2. **A second POP**, since "the same address announced from every POP" is the
-   property that makes inter-POP failover real and cannot be shown with one.
-3. **Config anti-entropy over a multi-day window** — unit-tested and lab-verified
+1. **A second POP.** With one site there is nowhere for an anycast address to
+   move to, so the property that justifies the whole design — a node withdrawing
+   and the same address answering from the next site — has not been demonstrated.
+   **This is the most valuable next step by a distance.**
+2. **A withdrawal drill at POP-BNE.** Exercised thoroughly in the lab; not yet run
+   against the live PE.
+3. **Carrier query volumes.** A household is real traffic, not representative
+   load.
+4. **Config anti-entropy over a multi-day window** — unit-tested and lab-verified
    in short runs.
-4. **A soak under real subscriber load.**
-5. **Fuzz tests on the wire parsers.** There are none today. Every packet is
-   attacker-controlled and Go's memory safety removes the worst outcomes, but
-   fuzzing is the right tool for the parsing surface and its absence is a gap,
-   not a decision.
+
+**Where the deployed configuration differs from the documented defaults.** Both
+are deliberate operator choices at POP-BNE, and both are worth revisiting rather
+than inheriting:
+
+| Setting | Default | POP-BNE | Consequence |
+|---|---|---|---|
+| `resolver.max_outbound_per_query` | 32 | **100** | This is the amplification limit. A higher cap resolves deeper or more awkward delegation chains, and raises the ceiling on what a single client query can generate |
+| `resolver.accept_sha1` | false | **true** | RSASHA1 signatures are accepted. SHA-1 is not collision resistant, so this weakens exactly the guarantee validation exists to provide |
+
+**Filtering is not enabled in production.** There is no `policy` block in the
+POP-BNE configuration, so the enforcer is not in the query path at all. The
+capability is built, tested and documented; it is simply not switched on, which
+is the correct state until something is sold that needs it.
+
+**Open items at POP-BNE**, small but real:
+
+| | Status |
+|---|---|
+| `no-export` on the anycast prefixes | The inbound filter no longer sets it. Sampled external sessions show the prefixes are not being advertised out, but the community is the belt-and-braces and it is absent |
+| A v6 `/127` for the pair link | The pair link is v4-only there |
 
 **Deliberately deferred, with reasons:**
 
 | | Status |
 |---|---|
-| **Public IPv6 anycast** | Needs a separately routed prefix rather than an on-link `/64`. A `/128` taken from a connected subnet makes the router attempt neighbour discovery for it on the wrong interface |
-| **Session replication** | A console session is node-local, so moving to the sibling means signing in again. A considered trade: replicating live session state would put mutable per-request data on the pair link for a saving measured in one login |
+| **Session replication** | A console session is node-local, so moving to the sibling means signing in again. A considered trade: replicating live session state would put mutable per-request data on the pair link for a saving measured in one login. The console is off by default in any case |
 | **A licence** | Not yet chosen, and needed before any external distribution |
 | **RFC 8326 `GRACEFUL_SHUTDOWN`** | Planned maintenance does a plain withdraw, which works but drops what was in flight when the route disappears. Tagging routes with the community first would let the PE drain the path before withdrawal |
 
-**Where the risk sits now.** It has moved out of the code and into deployment.
-The features are built, tested and lab-verified; what has not been proven is the
-production topology and multi-day behaviour under real subscriber load. That is
-the right place for a project at this stage to be — but it should be said plainly
-rather than inferred from a short list.
+**Where the risk sits now.** It has moved out of the code, through deployment,
+and into scale. The software is built, tested, fuzzed and running; the model is
+deployed and serving real queries. What is unproven is behaviour across sites and
+at volume — which is a materially better place to be than a fortnight of
+documentation would suggest.
 
 ---
 
@@ -870,21 +982,60 @@ over IPv6 and DNSSEC still validated.
 | **Memory safety** | Go, no cgo, on a codebase whose entire input surface is attacker-controlled |
 | **Supply chain** | Eight direct dependencies, no web framework, no ORM, no logging or metrics library, no test framework beyond stdlib |
 
+### Fuzzing
+
+**Nine targets**, covering the places where bytes an attacker chooses become a
+decision the resolver acts on. **Nine million executions found nothing**, which
+is worth knowing either way.
+
+The denial proofs get the most attention, because they decide whether a name is
+*securely absent* and a wrong answer there is a downgrade rather than a crash.
+Those targets assert more than the absence of a panic: a held no-DS proof must
+not be contradicted by a DS sitting in the very records it read, and a zone-cut
+verdict must come from a record that actually matches the name. The rest cover
+the aggressive-denial store, which must never synthesise a denial without an SOA
+or with a dead TTL; the feed and root-hints parsers, which read third-party and
+operator files; and the acceptance path every listener applies before the
+resolver is involved.
+
+### In production
+
+POP-BNE is verified where it counts rather than where it is convenient: all four
+anycast prefixes active **at the PE** with native next hops, defaults learned and
+installed per family at metric 5 with the correct preferred source, 6/6 signed
+domains validating with `AD` over both anycast addresses in both families, and
+**every outbound query sourced from eth0 rather than the anycast address,
+confirmed by packet capture**. Encrypted transports answer on both addresses
+under publicly trusted certificates. The pair link is up in both directions and
+serving cache fetches between the nodes. A household resolves through it.
+
+The external probe is verified **by drill, not by assertion**: stopping cgdns on
+one node turned all three of its sibling's checks red within twelve seconds.
+
 ### Where the testing does not reach
 
-Said plainly: no fuzzing yet, no multi-day soak, no production traffic, and the
-reference deployment topology has never been stood up. Those are the four gaps,
-and they are the four items in the list above this one.
+Said plainly: no second POP, so inter-POP failover is undemonstrated; no
+withdrawal drill against the live PE; and no load beyond a household. Those are
+the three gaps, and they are the first three items in the list above.
 
 ---
 ---
 
-# What I need to start a real-world test
+# What I need next: a second POP in S1
 
-Everything above is built, tested, and proven as far as a lab can prove it. The
-next step is not more code. It is **one POP, built to the reference model, in S1**.
+**The first POP is already built, live, and serving.** POP-BNE runs the model in
+`provisioning.md`, announces four anycast prefixes that are active at the PE and
+reflected across the estate, resolves with DNSSEC over both families, serves the
+encrypted transports, and has a household resolving through it. It was stood up,
+verified at the router, and it works.
 
-Here is exactly what that needs.
+So this is no longer a request to find out whether the thing runs. **It is a
+request for the one property a single site cannot demonstrate: that an address
+withdrawn in one POP is answered by the next one.** That is the whole reason for
+building it this way, and until a second POP exists it is a design argument
+rather than a demonstrated fact.
+
+S1 is the obvious second site. Here is exactly what it needs.
 
 ## Addressing
 
@@ -918,9 +1069,19 @@ From the PE side:
   above and tagged `no-export`. Reject everything else from them.
 
 `docs/provisioning.md` has the complete working configuration for both sides. The
-PE example there is written against the lab's MikroTik, so the S1 Nokias need the
-SR OS equivalent — a small piece of work, but it is your team's to do and it is
-the only part of this I cannot write myself.
+PE example there is written against RouterOS, so the S1 Nokias need the SR OS
+equivalent — a small piece of work, but it is your team's to do and it is the
+only part of this I cannot write myself.
+
+**One thing to decide deliberately rather than inherit: iBGP or eBGP.** POP-BNE
+peers iBGP inside AS135559, matching the pattern already used in the estate, and
+that ran straight into split horizon — a route learned from one iBGP peer is
+never re-advertised to another, so the anycast prefixes reached the PE and went
+no further. The PE could reach them; nothing else could. It is fixed there by
+making the PE a route reflector for those sessions. **eBGP with a private ASN
+avoids it outright**, because eBGP-learned routes propagate into iBGP without
+reflection. Either works. I would rather we picked one on purpose for S1 than
+copied BNE without noticing why it needed a route reflector.
 
 ## One thing that is easy to forget
 
@@ -938,17 +1099,17 @@ Management addressing on `eth2` can come from the existing S1 management range.
 customers.**
 
 To be completely clear about what I am **not** asking for: **no customer goes
-near this. Not one.** I am asking for a POP that exists, so that the seven things
-a single-site lab could not prove can be proven against real routers instead of
-reasoned about in a document:
+near this. Not one.** The first four things on the old version of this list are
+now done and verified at POP-BNE. What a second site adds is the rest:
 
-1. Real PE peering, one node per router
-2. Public addressing with no NAT in the path
-3. `eth0` as the query source, with replies arriving where they were asked from
-4. Each node owning its own anycast address
-5. A single node failing, and only its address moving
-6. Inter-POP behaviour, once there is a second site
-7. Multi-day stability under sustained load
+1. A single node failing, and **only its address moving** — to the other POP
+2. Inter-POP behaviour generally: nearest-site selection, and reconvergence
+3. The withdrawal path drilled against live PEs rather than a lab router
+4. Two sites' worth of sustained running before anyone discusses a customer
+
+The household is on it because I am willing to be the first person inconvenienced
+if it breaks. That is the order I would like to keep: me, then internal, then a
+customer who has been asked.
 
 I will come back with the results either way, including the parts that do not
 work. The flood test, the isolation test and the partition test all exist because

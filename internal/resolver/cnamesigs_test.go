@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-
 )
 
 // A CNAME chain is assembled from several responses, and the signatures have to

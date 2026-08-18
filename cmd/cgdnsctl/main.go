@@ -19,8 +19,8 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/JoshFinlayAU/cgdns/internal/control"
 	"github.com/JoshFinlayAU/cgdns/internal/config"
+	"github.com/JoshFinlayAU/cgdns/internal/control"
 	"github.com/JoshFinlayAU/cgdns/internal/management"
 )
 

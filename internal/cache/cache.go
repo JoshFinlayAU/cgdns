@@ -127,7 +127,7 @@ type Options struct {
 
 // Stats is a point-in-time counter snapshot, summed across shards.
 type Stats struct {
-	Entries   int
+	Entries int
 	// Bytes is the estimated heap the cached entries occupy. It is what
 	// max_size bounds, and the number to size a VM against.
 	Bytes     int64
@@ -246,7 +246,7 @@ func New(opts Options) (*Cache, error) {
 	}
 	for i := range c.shards {
 		c.shards[i] = &shard{
-			m:   make(map[Key]*node, perShard/4+1),
+			m:        make(map[Key]*node, perShard/4+1),
 			max:      perShard,
 			maxBytes: perShardBytes,
 		}

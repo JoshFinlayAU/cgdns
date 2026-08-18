@@ -45,21 +45,21 @@ type RecursiveMetrics struct {
 	// each DNSKEY, each DS — which runs to a hundred or more per query and
 	// answers a different question entirely.
 	AnsweredFromCache atomic.Uint64
-	Referrals        atomic.Uint64
-	BogusReferrals   atomic.Uint64
-	OutboundQueries  atomic.Uint64
-	OutboundFailures atomic.Uint64
-	DepthExceeded    atomic.Uint64
-	BudgetExceeded   atomic.Uint64
-	CaseMismatch     atomic.Uint64
-	GluelessLookups  atomic.Uint64
-	EDNSDowngrades   atomic.Uint64
-	TCPFallbacks     atomic.Uint64
-	CNAMEChased      atomic.Uint64
-	MinimiseFallback atomic.Uint64
-	Secure           atomic.Uint64
-	Insecure         atomic.Uint64
-	Bogus            atomic.Uint64
+	Referrals         atomic.Uint64
+	BogusReferrals    atomic.Uint64
+	OutboundQueries   atomic.Uint64
+	OutboundFailures  atomic.Uint64
+	DepthExceeded     atomic.Uint64
+	BudgetExceeded    atomic.Uint64
+	CaseMismatch      atomic.Uint64
+	GluelessLookups   atomic.Uint64
+	EDNSDowngrades    atomic.Uint64
+	TCPFallbacks      atomic.Uint64
+	CNAMEChased       atomic.Uint64
+	MinimiseFallback  atomic.Uint64
+	Secure            atomic.Uint64
+	Insecure          atomic.Uint64
+	Bogus             atomic.Uint64
 	// ValidationUnavailable counts answers withheld because the records needed
 	// to judge the chain could not be fetched. Kept apart from Bogus: one means
 	// a zone is broken or forged, the other means this node could not see.

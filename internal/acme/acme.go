@@ -39,9 +39,9 @@ import (
 
 // Metrics counts certificate lifecycle events.
 type Metrics struct {
-	Renewals   atomic.Uint64
-	Failures   atomic.Uint64
-	NotAfter   atomic.Int64
+	Renewals    atomic.Uint64
+	Failures    atomic.Uint64
+	NotAfter    atomic.Int64
 	LastAttempt atomic.Int64
 	// ChallengeSeconds records how long the last HTTP-01 listener was open.
 	// It is the exposure window, so it is worth being able to alert on.

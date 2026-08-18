@@ -64,8 +64,8 @@ func startUpstream(t *testing.T) *fakeUpstream {
 		case strings.HasPrefix(q.Name, "absent."):
 			m.Rcode = dns.RcodeNameError
 			m.Ns = []dns.RR{&dns.SOA{
-				Hdr:    dns.RR_Header{Name: "test.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60},
-				Ns:     "ns.test.", Mbox: "hostmaster.test.",
+				Hdr: dns.RR_Header{Name: "test.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60},
+				Ns:  "ns.test.", Mbox: "hostmaster.test.",
 				Serial: 1, Refresh: 60, Retry: 60, Expire: 60, Minttl: 60,
 			}}
 		case q.Qtype == dns.TypeA:
@@ -245,11 +245,21 @@ func (d *daemon) flood(name string, qtype uint16) {
 }
 
 func (d *daemon) query(name string, qtype uint16) (*dns.Msg, error) {
+	return d.queryWithin(name, qtype, 3*time.Second)
+}
+
+// queryWithin waits a given time for an answer.
+//
+// Some answers are only produced after the daemon gives up on something else —
+// serve-stale replies once resolution has failed, which takes the query timeout
+// and any retries first. A client that gives up sooner than the daemon does
+// reports a failure that never happened.
+func (d *daemon) queryWithin(name string, qtype uint16, wait time.Duration) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), qtype)
 	m.RecursionDesired = true
-	c := &dns.Client{Timeout: 3 * time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	c := &dns.Client{Timeout: wait}
+	ctx, cancel := context.WithTimeout(context.Background(), wait*2)
 	defer cancel()
 	resp, _, err := c.ExchangeContext(ctx, m, d.dnsAddr)
 	return resp, err

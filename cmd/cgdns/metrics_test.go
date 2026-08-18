@@ -53,7 +53,7 @@ func TestCacheMetricsReflectTheCache(t *testing.T) {
 	}
 
 	reg := metrics.NewRegistry()
-	registerMetrics(reg, &transport.Metrics{}, &resolver.Metrics{}, c, &acme.Metrics{})
+	registerMetrics(reg, &transport.Metrics{}, &resolver.Metrics{}, &resolver.RecursiveMetrics{}, c, &acme.Metrics{})
 	snap := reg.Snapshot()
 
 	if got := snap["cgdns_cache_lookup_hits_total"]; got != float64(stats.Hits) {

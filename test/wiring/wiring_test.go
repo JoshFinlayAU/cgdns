@@ -57,12 +57,19 @@ func TestServeStaleAnswersWhenUpstreamFails(t *testing.T) {
 	up := startUpstream(t)
 	up.ttl.Store(1)
 
+	// Prefetch is off deliberately. It is on by default, and it refreshes an
+	// entry near the end of its life — which for a one-second TTL lands inside
+	// this test's own wait and hands the entry a fresh lease. The answer then
+	// comes from a live cache entry rather than a stale one, and the test fails
+	// intermittently for a reason that has nothing to do with serve-stale.
 	d := start(t, up.addr, `
 cache_extra:
   serve_stale:
     enabled: true
     max_stale: 1h
     answer_ttl: 30s
+  prefetch:
+    enabled: false
 `)
 
 	if _, err := d.query("cached.test.", dns.TypeA); err != nil {
@@ -72,7 +79,9 @@ cache_extra:
 	time.Sleep(1500 * time.Millisecond)
 	up.failing.Store(true)
 
-	resp, err := d.query("cached.test.", dns.TypeA)
+	// Generous, because serve-stale answers only after resolution has failed:
+	// the query timeout and its retries elapse first.
+	resp, err := d.queryWithin("cached.test.", dns.TypeA, 15*time.Second)
 	if err != nil {
 		t.Fatalf("query with the upstream down: %v", err)
 	}
@@ -184,12 +193,19 @@ func TestCacheHitsAreCounted(t *testing.T) {
 		}
 	}
 
-	hits := d.metric(t, "cgdns_cache_hits_total")
-	misses := d.metric(t, "cgdns_cache_misses_total")
+	hits := d.metric(t, "cgdns_cache_lookup_hits_total")
+	misses := d.metric(t, "cgdns_cache_lookup_misses_total")
 	if hits == 0 {
-		t.Errorf("asked the same name three times and the cache reported no hits (misses=%v)", misses)
+		t.Errorf("asked the same name three times and the cache reported no lookup hits (misses=%v)", misses)
 	}
 	if misses == 0 {
 		t.Error("the first query cannot have been a hit, so misses should have moved too")
+	}
+
+	// The ratio an operator reads is client queries that needed no outbound
+	// query at all, which is a different number from cache lookups and the one
+	// that was silently zero in production.
+	if fromCache := d.metric(t, "cgdns_queries_from_cache_total"); fromCache == 0 {
+		t.Error("repeat queries were served without any of them counting as answered from cache")
 	}
 }
