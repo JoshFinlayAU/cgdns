@@ -895,6 +895,10 @@ func registerPolicyMetrics(reg *metrics.Registry, m *policy.Metrics, c *subscrib
 		// override. It is reported separately because "how many queries did the
 		// mandatory filtering affect" is a question asked by regulators and
 		// auditors, not by operations.
+		// The figure that predicts memory: rules cost 160-230 bytes each, so an
+		// operator deciding whether another list fits needs to see this without
+		// parsing feed files off the node.
+		metrics.Source{Name: "cgdns_policy_rules", Help: "Policy rules in force across every class, the mandatory tier included.", Kind: metrics.Gauge, Read: func() float64 { return float64(r.TotalRules()) }},
 		metrics.Source{Name: "cgdns_policy_mandatory_applied_total", Help: "Answers decided by the mandatory compliance tier.", Kind: metrics.Counter, Read: u64(m.MandatoryApplied.Load)},
 		metrics.Source{Name: "cgdns_policy_passthru_total", Help: "Queries explicitly allowed by a passthru rule.", Kind: metrics.Counter, Read: u64(m.Passthru.Load)},
 		metrics.Source{Name: "cgdns_policy_override_allowed_total", Help: "Queries allowed by a per-subscriber whitelist.", Kind: metrics.Counter, Read: u64(m.OverrideAllowed.Load)},

@@ -264,3 +264,20 @@ func (r *Registry) Classes() []string {
 
 // SubscribersWithOverrides reports how many subscribers have personal rules.
 func (r *Registry) SubscribersWithOverrides() int { return len(*r.overrides.Load()) }
+
+// TotalRules counts every rule in force, the mandatory tier included.
+//
+// It is the figure that predicts memory: rules cost roughly 160 to 230 bytes
+// each, so an operator deciding whether another list fits has to be able to see
+// this without parsing feed files. Classes sharing a feed are counted once per
+// class, which is what they actually occupy — compiled sets are per class.
+func (r *Registry) TotalRules() int {
+	total := 0
+	for _, p := range *r.classes.Load() {
+		total += p.Rules.Len()
+	}
+	if m := r.mandatory.Load(); m != nil {
+		total += m.Rules.Len()
+	}
+	return total
+}

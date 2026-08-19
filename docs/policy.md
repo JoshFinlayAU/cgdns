@@ -207,6 +207,47 @@ policy:
 | `cgdns_feed_refreshes_rejected_total` | refreshes the guard refused |
 | `cgdns_feed_protected_rules_dropped_total` | rules stripped for naming a protected domain |
 | `cgdns_feed_last_success_timestamp` | how stale the lists are |
+| `cgdns_policy_rules` | rules in force; multiply by ~200 bytes to predict memory |
+
+## What it costs
+
+Measured on a 16-core Xeon 6140 with 1,130,040 rules in force (light +
+nsfw + tif.medium), against a cache-warm query mix:
+
+| | no policy | 1.13M rules |
+|---|---|---|
+| achieved, 150k offered | 70,401 qps | 70,065 qps |
+| p50 | 200 µs | 200 µs |
+| p95 | 900 µs | 700 µs |
+| p99 | 2.7 ms | 2.7 ms |
+| loss | 0.00% | 0.00% |
+
+The difference is inside the noise, and the generator was the limit in both runs
+rather than the resolver. The lookup itself is 7.6 ns for the common case (a
+name that is not filtered), 23 ns worst case (a deep name, where the wildcard
+match has the most labels to walk), and **zero allocations** either way:
+
+```
+BenchmarkSet_Match_Scale/miss_shallow-16     7.635 ns/op   0 B/op   0 allocs/op
+BenchmarkSet_Match_Scale/miss_deep-16        22.93 ns/op   0 B/op   0 allocs/op
+BenchmarkSet_Match_Hit/exact-16              6.421 ns/op   0 B/op   0 allocs/op
+BenchmarkSet_Match_Hit/wildcard_subdomain-16 11.91 ns/op   0 B/op   0 allocs/op
+```
+
+Against a query that takes 200 µs to answer from cache, policy is roughly one
+part in ten thousand. **Filtering costs memory, not latency** — that is the only
+budget worth managing here. Resident memory with those three lists loaded was
+558 MiB.
+
+Reproduce it with real feed content:
+
+```sh
+CGDNS_BENCH_RPZ=/var/lib/cgdns/feeds   go test -run=XXX -bench='Set_Match' -benchmem ./internal/policy/
+```
+
+Without that variable the benchmark synthesises rules at the same scale, which
+is enough to catch a regression but not to quote a figure: synthetic names share
+prefixes in ways real domains do not, and that flatters the lookup.
 
 `cgdns_policy_mandatory_applied_total` is separate from the rest because "how
 many queries did the mandatory filtering affect" is a question asked by auditors,

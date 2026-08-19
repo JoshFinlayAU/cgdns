@@ -98,6 +98,8 @@ cgdnsctl policy show 203.0.113.45          # what applies here, and why
 
 **Compliance filtering** is separate, because it is imposed rather than chosen. A list created `--mandatory` applies to every client above every profile *and* above a subscriber's own allow list — that is what a court order or a regulator's notice requires, and it is the only thing here nobody can opt out of. Entries are maintained through `cgdnsctl` and replicate to the sibling; each carries a `--note` recording the authority it was added under, because the question asked later is never "is this blocked" but "on whose". A list can also fetch an RPZ URL and take hand-added entries on top. Answers decided this way are counted separately in `cgdns_policy_mandatory_applied_total`.
 
+Filtering costs memory, not latency. Measured against 1,130,040 real rules on a cache-warm mix: 70,401 qps without policy, 70,065 with, p50 200 µs either way and zero loss in both — the load generator was the limit, not the resolver. The lookup is 7.6 ns for a name that is not filtered, 23 ns worst case, and allocates nothing. Resident memory with those three lists loaded was 558 MiB, which is the number to budget.
+
 **Feeds are guarded on the way in.** A published blocklist is a third party deciding what subscribers can resolve, rebuilt daily so it cannot be pinned to a hash. A refresh that moves the rule count more than 30%, or arrives near-empty, is refused and the previous copy keeps serving. Rules naming a `protected_names` entry are stripped and counted while the rest of the feed is kept — one bad entry should not discard a good list, but a bank going dark for every subscriber is not an acceptable way to discover it. See [docs/policy.md](docs/policy.md).
 
 **Learned routes** - gobgpd is a BGP speaker: it holds a learned route in its RIB and never puts it in the forwarding table. That is enough to advertise an anycast address, but it means a node cannot use a default its upstream is offering, and keeps a static one even when that next hop is gone. `cgdns-routed` closes the gap for an explicitly listed handful of prefixes - a default and the sibling's loopback, typically.
@@ -446,6 +448,7 @@ series worth alerting on:
 | `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
 | `cgdns_policy_mandatory_applied_total` | answers decided by the compliance tier, which nobody can override |
+| `cgdns_policy_rules` | rules in force; multiply by ~200 bytes to predict memory |
 | `cgdns_feed_refreshes_rejected_total` | a published list moved further in a day than any real edit would |
 | `cgdns_feed_protected_rules_dropped_total` | a feed tried to block a name that must never be blocked |
 | `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
