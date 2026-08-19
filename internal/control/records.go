@@ -44,6 +44,36 @@ type FeedRecord struct {
 	RPZZone string `json:"rpz_zone,omitempty"`
 	SHA256  string `json:"sha256,omitempty"`
 	Version uint64 `json:"version"`
+
+	// Category is what this feed filters in an operator's language — security,
+	// ads, tracking, gambling, adult, compliance. Profiles are assembled from
+	// categories rather than feed names so the person building a product tier
+	// does not have to know which upstream list covers what.
+	Category string `json:"category,omitempty"`
+
+	// Mandatory applies this feed to every client regardless of profile, above
+	// any subscriber override. It is for filtering imposed on the operator
+	// rather than chosen by them.
+	Mandatory bool `json:"mandatory,omitempty"`
+
+	// Managed holds the feed's content here instead of fetching it, for a list
+	// maintained by hand. A managed feed may still carry a URL, in which case
+	// the fetched rules and these entries are both applied.
+	Managed bool           `json:"managed,omitempty"`
+	Entries []ManagedEntry `json:"entries,omitempty"`
+}
+
+// ManagedEntry is one hand-maintained rule.
+//
+// Note carries why the entry exists — an order reference, a ticket, a date.
+// Compliance filtering is the case this exists for, and the question asked of
+// it later is never "is this name blocked" but "on whose authority", which
+// nothing else in the record can answer.
+type ManagedEntry struct {
+	Name   string   `json:"name"`
+	Action string   `json:"action,omitempty"`
+	To     []string `json:"to,omitempty"`
+	Note   string   `json:"note,omitempty"`
 }
 
 // ClassRecord binds feeds and a block action to a subscriber class.
@@ -64,6 +94,19 @@ type State struct {
 	overrides   map[string]OverrideRecord
 	feeds       map[string]FeedRecord
 	classes     map[string]ClassRecord
+
+	// rejected holds records that failed validation while the state was being
+	// built. A record dropped in silence looks identical to one that was never
+	// pushed, and the operator who wrote it has already been told it was
+	// accepted; the publisher logs these so the disagreement surfaces.
+	rejected []string
+}
+
+// Rejected reports records that were dropped while building this state.
+func (s *State) Rejected() []string { return s.rejected }
+
+func (s *State) reject(kind RecordKind, key string, err error) {
+	s.rejected = append(s.rejected, fmt.Sprintf("%s %q: %v", kind, key, err))
 }
 
 // NewState returns empty state.
@@ -199,12 +242,30 @@ func (s *State) setFeed(r FeedRecord) error {
 	default:
 		return fmt.Errorf("feed %q has unknown format %q", r.Name, r.Format)
 	}
-	if r.Format == "rpz" && r.RPZZone == "" {
-		return fmt.Errorf("feed %q is rpz format but names no zone", r.Name)
-	}
-	if r.URL == "" && r.File == "" {
+	if r.URL == "" && r.File == "" && !r.Managed {
 		return fmt.Errorf("feed %q names neither a url nor a file", r.Name)
 	}
+	r.Category = strings.ToLower(strings.TrimSpace(r.Category))
+	for i, e := range r.Entries {
+		if e.Name == "" {
+			return fmt.Errorf("feed %q has an entry with no name", r.Name)
+		}
+		switch e.Action {
+		case "", "nxdomain", "nodata", "redirect":
+		default:
+			return fmt.Errorf("feed %q entry %q has unknown action %q", r.Name, e.Name, e.Action)
+		}
+		if e.Action == "redirect" && len(e.To) == 0 {
+			return fmt.Errorf("feed %q entry %q redirects nowhere", r.Name, e.Name)
+		}
+		for _, to := range e.To {
+			if _, err := netip.ParseAddr(to); err != nil {
+				return fmt.Errorf("feed %q entry %q redirects to %q, which is not an address", r.Name, e.Name, to)
+			}
+		}
+		r.Entries[i].Name = strings.ToLower(strings.TrimSuffix(e.Name, "."))
+	}
+	sort.Slice(r.Entries, func(i, j int) bool { return r.Entries[i].Name < r.Entries[j].Name })
 	s.feeds[r.Name] = r
 	return nil
 }

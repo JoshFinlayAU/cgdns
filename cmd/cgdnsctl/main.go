@@ -102,6 +102,8 @@ func run(args []string) error {
 		return cmdUser(g, rest[1:])
 	case "allow", "block":
 		return cmdOverrideList(g, rest[0], rest[1:])
+	case "policy":
+		return cmdPolicy(g, rest[1:])
 	case "help":
 		usage(fs)
 		return nil
@@ -143,6 +145,8 @@ Commands:
 
   allow <subscriber> <domain>...  add domains to a subscriber's allow list
   block <subscriber> <domain>...  add domains to a subscriber's block list
+
+  policy                          what is filtered and for whom; "policy help" for the rest
 
 Flags:
 `, strings.Join(nouns, ", "))

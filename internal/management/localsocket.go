@@ -72,7 +72,14 @@ func (s *Server) bindLocal(path string) error {
 	return nil
 }
 
-// peerIsPrivileged reports whether the far end of a unix connection is root.
+// peerIsPrivileged reports whether the far end of a unix connection may
+// administer this node without a token.
+//
+// Root qualifies, and so does the uid the daemon itself runs as: the socket is
+// mode 0600 and owned by that uid, so those two are already the only peers the
+// kernel will let connect, and that uid can read the node's keys and state
+// directly in any case. Refusing it would only mean the account that owns the
+// daemon cannot operate it.
 func peerIsPrivileged(c net.Conn) (bool, error) {
 	uc, ok := c.(*net.UnixConn)
 	if !ok {
@@ -95,5 +102,5 @@ func peerIsPrivileged(c net.Conn) (bool, error) {
 	if credErr != nil {
 		return false, credErr
 	}
-	return cred.Uid == 0, nil
+	return cred.Uid == 0 || cred.Uid == uint32(os.Getuid()), nil
 }

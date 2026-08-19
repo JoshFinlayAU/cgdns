@@ -88,6 +88,18 @@ A feed decides what subscribers are allowed to resolve, so it is treated as a co
 
 **Subscriber policy** - RPZ zones and plain domain lists, compiled per subscriber class with specificity-ordered matching. Per-subscriber allow and block overrides take precedence over shared class feeds, so one customer can be unblocked without editing a feed you may not own. Blocked answers carry EDE 15 so clients can distinguish policy from a genuine NXDOMAIN. A feed that fails to load leaves the previous rules serving - filtering goes stale, resolution does not.
 
+Nothing is filtered by default: an address with no assignment resolves everything. Policy is built from *categories* (security, ads, tracking, gambling, adult, compliance) rather than feed names, bundled into *profiles*, and assigned by CIDR — one address or a /48, longest match wins. `cgdnsctl policy catalog` lists the feeds behind each category with measured rule counts and memory, because whether a list can be enabled is a question about how much RAM the node has.
+
+```sh
+cgdnsctl policy profile set family --category security --category adult
+cgdnsctl policy assign 2001:df4:2040::/48 family --id cust-10241
+cgdnsctl policy show 203.0.113.45          # what applies here, and why
+```
+
+**Compliance filtering** is separate, because it is imposed rather than chosen. A list created `--mandatory` applies to every client above every profile *and* above a subscriber's own allow list — that is what a court order or a regulator's notice requires, and it is the only thing here nobody can opt out of. Entries are maintained through `cgdnsctl` and replicate to the sibling; each carries a `--note` recording the authority it was added under, because the question asked later is never "is this blocked" but "on whose". A list can also fetch an RPZ URL and take hand-added entries on top. Answers decided this way are counted separately in `cgdns_policy_mandatory_applied_total`.
+
+**Feeds are guarded on the way in.** A published blocklist is a third party deciding what subscribers can resolve, rebuilt daily so it cannot be pinned to a hash. A refresh that moves the rule count more than 30%, or arrives near-empty, is refused and the previous copy keeps serving. Rules naming a `protected_names` entry are stripped and counted while the rest of the feed is kept — one bad entry should not discard a good list, but a bank going dark for every subscriber is not an acceptable way to discover it. See [docs/policy.md](docs/policy.md).
+
 **Learned routes** - gobgpd is a BGP speaker: it holds a learned route in its RIB and never puts it in the forwarding table. That is enough to advertise an anycast address, but it means a node cannot use a default its upstream is offering, and keeps a static one even when that next hop is gone. `cgdns-routed` closes the gap for an explicitly listed handful of prefixes - a default and the sibling's loopback, typically.
 
 It is narrow on purpose. Prefixes are matched **exactly**, so accepting a default does not accept the routes inside it; at most `max_routes` are held, so a loose filter upstream cannot become a full table in the kernel; and it only ever deletes routes it installed. That is three filters - the router's output policy, gobgp's import policy, and the agent's own list - and only the last is not somebody else's configuration to get wrong.
@@ -433,6 +445,9 @@ series worth alerting on:
 | `cgdns_dnssec_unavailable_total` | a chain could not be judged because a DNSKEY or DS was unreachable — a reachability problem here, not a signing problem at the zone |
 | `cgdns_recursion_case_mismatch_total` | non-zero means off-path spoofing attempts |
 | `cgdns_policy_override_allowed_total` | per-subscriber whitelist hits |
+| `cgdns_policy_mandatory_applied_total` | answers decided by the compliance tier, which nobody can override |
+| `cgdns_feed_refreshes_rejected_total` | a published list moved further in a day than any real edit would |
+| `cgdns_feed_protected_rules_dropped_total` | a feed tried to block a name that must never be blocked |
 | `cgdns_ratelimit_dropped_total` | rising means an attack, or a rate set below what real clients need |
 | `cgdns_ratelimit_evictions_total` | sustained means `max_buckets` is too small for the client population |
 | `cgdns_serve_stale_served_total` | rising means authoritatives are failing and expired data is keeping subscribers online |

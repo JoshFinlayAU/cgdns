@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"net/netip"
+
+	"github.com/miekg/dns"
 	"os"
 	"strings"
 )
@@ -18,8 +20,19 @@ type FeedSpec struct {
 	Name   string
 	Format string
 	File   string
-	// RPZZone is the zone name to strip from owners, required for RPZ feeds.
+	// RPZZone is the zone name to strip from owners. Empty takes it from the SOA.
 	RPZZone string
+
+	// Entries are rules held in the control plane rather than a file, for a
+	// list maintained by hand. They apply on top of File when both are set.
+	Entries []Entry
+}
+
+// Entry is one hand-maintained rule.
+type Entry struct {
+	Name   string
+	Action Action
+	To     []netip.Addr
 }
 
 // Feed formats.
@@ -72,6 +85,32 @@ func Compile(feeds []FeedSpec, classes []ClassSpec) (map[string]*Policy, error) 
 }
 
 func compileFeed(f FeedSpec) (*Set, error) {
+	if f.File == "" {
+		return entrySet(f), nil
+	}
+	set, err := compileFeedFile(f)
+	if err != nil {
+		return nil, err
+	}
+	set.Merge(entrySet(f))
+	return set, nil
+}
+
+// entrySet turns hand-maintained entries into rules. Each covers the name and
+// everything beneath it: an entry naming a site is meant to reach its
+// subdomains, and a compliance list that blocked only the apex would not do
+// what the instruction behind it says.
+func entrySet(f FeedSpec) *Set {
+	set := NewSet()
+	for _, e := range f.Entries {
+		rule := Rule{Action: e.Action, Feed: f.Name, Addrs: e.To}
+		set.AddExact(dns.CanonicalName(e.Name), rule)
+		set.AddWildcard(dns.CanonicalName(e.Name), rule)
+	}
+	return set
+}
+
+func compileFeedFile(f FeedSpec) (*Set, error) {
 	file, err := os.Open(f.File)
 	if err != nil {
 		return nil, fmt.Errorf("opening feed %q: %w", f.Name, err)
@@ -80,9 +119,6 @@ func compileFeed(f FeedSpec) (*Set, error) {
 
 	switch f.Format {
 	case FormatRPZ:
-		if f.RPZZone == "" {
-			return nil, fmt.Errorf("feed %q is RPZ format but names no rpz_zone", f.Name)
-		}
 		return ParseRPZ(file, f.RPZZone, f.Name)
 	case FormatDomainList, "":
 		return ParseDomainList(file, f.Name, ActionNXDOMAIN, nil)

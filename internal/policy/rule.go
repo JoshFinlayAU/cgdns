@@ -194,6 +194,11 @@ func (o *Overrides) Match(qname string) (Rule, bool) {
 type Registry struct {
 	classes   atomic.Pointer[map[string]*Policy]
 	overrides atomic.Pointer[map[string]*Overrides]
+	// mandatory holds rules that apply to every subscriber and that nothing
+	// overrides — the compliance tier. It is separate from the class policies
+	// rather than a class every subscriber happens to be in, because the whole
+	// point is that it cannot be opted out of, and a class can be.
+	mandatory atomic.Pointer[Policy]
 }
 
 // NewRegistry returns an empty Registry.
@@ -201,8 +206,20 @@ func NewRegistry() *Registry {
 	r := &Registry{}
 	r.classes.Store(&map[string]*Policy{})
 	r.overrides.Store(&map[string]*Overrides{})
+	r.mandatory.Store(nil)
 	return r
 }
+
+// ReplaceMandatory swaps in the rules that apply to everyone.
+//
+// These exist for filtering a jurisdiction requires — a court-ordered block, a
+// regulator's list — where "the subscriber asked us not to" is not a defence.
+// Everything else about this system is designed so an operator can unblock a
+// name quickly; this is the one part that deliberately is not.
+func (r *Registry) ReplaceMandatory(p *Policy) { r.mandatory.Store(p) }
+
+// Mandatory returns the compliance policy, or nil.
+func (r *Registry) Mandatory() *Policy { return r.mandatory.Load() }
 
 // Replace swaps in a new set of class policies.
 func (r *Registry) Replace(policies map[string]*Policy) {

@@ -32,6 +32,12 @@ type FetchMetrics struct {
 	Updated   atomic.Uint64
 	Unchanged atomic.Uint64
 	Failures  atomic.Uint64
+	// Rejected counts refreshes refused by the guard. Any of these is worth an
+	// alert: filtering is now running on yesterday's copy, deliberately.
+	Rejected atomic.Uint64
+	// Protected counts rules dropped for naming something that must not be
+	// blocked.
+	Protected atomic.Uint64
 	// HashMismatches counts content that did not match its pinned digest.
 	// Any of these is worth an alert: the feed was tampered with, or the
 	// publisher changed it without the control plane being told.
@@ -61,6 +67,12 @@ type FetcherOptions struct {
 	Client  *http.Client
 	Log     *slog.Logger
 	Metrics *FetchMetrics
+
+	// Guard decides whether fetched content may replace what is live. These
+	// lists cannot be pinned to a hash — they are published daily — so this is
+	// the only thing standing between a publisher's bad build and every
+	// subscriber the feed applies to.
+	Guard Guard
 }
 
 // Fetcher downloads feed content to local files.
@@ -229,6 +241,56 @@ func (f *Fetcher) fetchOne(ctx context.Context, feed Feed) (bool, error) {
 		f.opts.Metrics.Unchanged.Add(1)
 		f.opts.Metrics.LastSuccess.Store(time.Now().Unix())
 		return false, nil
+	}
+
+	// Judged before it is allowed anywhere near the live path.
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	verdict, err := f.opts.Guard.Check(tmp, dst)
+	if err != nil {
+		return false, fmt.Errorf("checking the fetched feed: %w", err)
+	}
+	if !verdict.Accepted {
+		f.opts.Metrics.Rejected.Add(1)
+		f.opts.Log.Error("refusing a feed refresh, keeping the copy already live",
+			slog.String("feed", feed.Name),
+			slog.String("reason", verdict.Reason),
+			slog.Int("live_rules", verdict.OldRules),
+			slog.Int("offered_rules", verdict.NewRules))
+		return false, fmt.Errorf("policy: feed %s rejected: %s", feed.Name, verdict.Reason)
+	}
+	if len(verdict.Stripped) > 0 {
+		f.opts.Metrics.Protected.Add(uint64(len(verdict.Stripped)))
+		f.opts.Log.Warn("a feed tried to block a protected name; the rules were dropped",
+			slog.String("feed", feed.Name),
+			slog.Any("names", verdict.Stripped))
+
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			return false, err
+		}
+		clean, err := os.CreateTemp(f.opts.Dir, ".strip-*")
+		if err != nil {
+			return false, err
+		}
+		cleanName := clean.Name()
+		defer func() { _ = os.Remove(cleanName) }()
+		if _, err := StripProtected(tmp, clean, f.opts.Guard.Protected); err != nil {
+			_ = clean.Close()
+			return false, err
+		}
+		if err := clean.Close(); err != nil {
+			return false, err
+		}
+		if err := os.Chmod(cleanName, 0o640); err != nil {
+			return false, err
+		}
+		if err := os.Rename(cleanName, dst); err != nil {
+			return false, err
+		}
+		f.opts.Metrics.Updated.Add(1)
+		f.opts.Metrics.LastSuccess.Store(time.Now().Unix())
+		return true, nil
 	}
 
 	if err := tmp.Close(); err != nil {

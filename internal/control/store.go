@@ -431,23 +431,31 @@ func (s *Store) State() (*State, uint64) {
 		switch r.Kind {
 		case KindSubscriber:
 			var v SubscriberRecord
-			if json.Unmarshal(r.Payload, &v) == nil {
-				_ = state.setSubscriber(v)
+			if err := json.Unmarshal(r.Payload, &v); err != nil {
+				state.reject(r.Kind, r.Key, err)
+			} else if err := state.setSubscriber(v); err != nil {
+				state.reject(r.Kind, r.Key, err)
 			}
 		case KindOverride:
 			var v OverrideRecord
-			if json.Unmarshal(r.Payload, &v) == nil {
-				_ = state.setOverride(v)
+			if err := json.Unmarshal(r.Payload, &v); err != nil {
+				state.reject(r.Kind, r.Key, err)
+			} else if err := state.setOverride(v); err != nil {
+				state.reject(r.Kind, r.Key, err)
 			}
 		case KindFeed:
 			var v FeedRecord
-			if json.Unmarshal(r.Payload, &v) == nil {
-				_ = state.setFeed(v)
+			if err := json.Unmarshal(r.Payload, &v); err != nil {
+				state.reject(r.Kind, r.Key, err)
+			} else if err := state.setFeed(v); err != nil {
+				state.reject(r.Kind, r.Key, err)
 			}
 		case KindClass:
 			var v ClassRecord
-			if json.Unmarshal(r.Payload, &v) == nil {
-				_ = state.setClass(v)
+			if err := json.Unmarshal(r.Payload, &v); err != nil {
+				state.reject(r.Kind, r.Key, err)
+			} else if err := state.setClass(v); err != nil {
+				state.reject(r.Kind, r.Key, err)
 			}
 		}
 	}

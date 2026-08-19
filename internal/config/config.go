@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/JoshFinlayAU/cgdns/internal/policy"
 )
 
 // ErrInvalid is the sentinel wrapping every validation failure. Callers that
@@ -311,6 +313,27 @@ type Policy struct {
 	// FeedMaxBytes caps one feed. A source that streamed forever would
 	// otherwise fill the disk of every node subscribed to it.
 	FeedMaxBytes int64 `yaml:"feed_max_bytes"`
+
+	// FeedMaxChangeRatio rejects a refresh whose rule count moves more than
+	// this fraction. These lists are published daily and cannot be pinned to a
+	// hash, so every refresh is a fresh download from a third party that can
+	// block any name it likes; a list that doubles or halves overnight is a
+	// publisher accident or a compromise, and yesterday's copy is the safer one
+	// to keep serving. Default 0.3. Zero disables the check.
+	FeedMaxChangeRatio float64 `yaml:"feed_max_change_ratio"`
+
+	// FeedMinRules rejects a feed that arrives nearly empty, which is
+	// indistinguishable from a successful fetch of nothing and switches
+	// filtering off without failing. Default 50.
+	FeedMinRules int `yaml:"feed_min_rules"`
+
+	// ProtectedNames must never be blocked by a fetched feed. Rules naming them
+	// are dropped on the way in and counted, rather than the whole feed being
+	// refused, because one bad entry should not discard an otherwise good list
+	// — but a bank or a government service going dark for every subscriber is
+	// not an acceptable way to find out. A name here also protects everything
+	// beneath it.
+	ProtectedNames []string `yaml:"protected_names"`
 }
 
 // PolicyFeed is one blocklist source.
@@ -319,8 +342,30 @@ type PolicyFeed struct {
 	// Format is domain-list or rpz.
 	Format string `yaml:"format"`
 	File   string `yaml:"file"`
-	// RPZZone is required for rpz feeds.
+	// RPZZone is the origin to strip from each rule owner. Leave it empty to take
+	// it from the feed's own SOA, which is what a published feed should be
+	// trusted for — a name pinned here and later changed upstream strips nothing
+	// and produces an empty policy.
 	RPZZone string `yaml:"rpz_zone"`
+
+	// Category groups feeds for an operator: security, ads, tracking,
+	// gambling, adult, compliance. It is what the CLI offers and what a
+	// subscriber-facing product tier is described in, so it should read the way
+	// somebody would describe the filtering, not the way the file is built.
+	Category string `yaml:"category"`
+
+	// Mandatory puts this feed above every override, including a subscriber's
+	// own allow list. It is for filtering a jurisdiction requires, where "the
+	// subscriber asked us not to" is not a defence. It applies to every client
+	// regardless of class, so a feed marked this way needs to be narrow and
+	// deliberate — it is the one thing here that cannot be opted out of.
+	Mandatory bool `yaml:"mandatory"`
+
+	// Managed marks a feed whose entries are edited through cgdnsctl and kept
+	// in the replicated control store rather than fetched. It is how a
+	// compliance list gets maintained when the source is a court order or a
+	// regulator's notice rather than a URL.
+	Managed bool `yaml:"managed"`
 }
 
 // PolicyClass binds feeds and a block action to a subscriber class.
@@ -591,6 +636,32 @@ func (z *Size) UnmarshalYAML(value *yaml.Node) error {
 	}
 	*z = parsed
 	return nil
+}
+
+// FeedGuard builds the checks a fetched feed must pass before it may replace
+// what is live, defaulting them so a config that says nothing still gets them.
+// An operator who has not thought about supply chain should not be the one
+// without a guard.
+func (c *Config) FeedGuard() policy.Guard {
+	ratio := c.Policy.FeedMaxChangeRatio
+	if ratio == 0 {
+		ratio = 0.3
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	min := c.Policy.FeedMinRules
+	if min == 0 {
+		min = 50
+	}
+	if min < 0 {
+		min = 0
+	}
+	return policy.Guard{
+		MaxChangeRatio: ratio,
+		MinRules:       min,
+		Protected:      c.Policy.ProtectedNames,
+	}
 }
 
 // ManagementLocalSocket resolves the socket path, defaulting it and honouring

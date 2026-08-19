@@ -23,18 +23,28 @@ type Metrics struct {
 	Passthru        atomic.Uint64
 	OverrideAllowed atomic.Uint64
 	OverrideBlocked atomic.Uint64
+	// MandatoryApplied counts answers decided by the compliance tier. It is
+	// reported separately because it is the number a regulator asks about.
+	MandatoryApplied atomic.Uint64
 }
 
 // Enforcer applies subscriber policy in front of a resolver.
 //
 // Evaluation order is fixed and is the whole contract:
 //
-//  1. the subscriber's own allow list, which beats everything;
-//  2. the subscriber's own block list;
-//  3. the feeds their class subscribes to.
+//  1. the mandatory rules, which nothing overrides;
+//  2. the subscriber's own allow list, which beats everything below it;
+//  3. the subscriber's own block list;
+//  4. the feeds their class subscribes to.
 //
 // A subscriber unblocking a name they need must not require editing a shared
 // feed, so their allow list is consulted before any class rule is considered.
+//
+// Above it sits the compliance tier, and the ordering there is the point: where
+// a jurisdiction requires a name to be blocked or redirected, "the subscriber
+// asked us not to" is not a defence, so a subscriber allow cannot reach it.
+// Everything else here is built to make unblocking fast; this part deliberately
+// is not.
 type Enforcer struct {
 	classifier *subscriber.Classifier
 	registry   *Registry
@@ -98,8 +108,17 @@ func (e *Enforcer) ServeDNS(ctx context.Context, req *transport.Request) *dns.Ms
 	return e.apply(req, rule, sub)
 }
 
-// lookup resolves the rule for a subscriber, overrides first.
+// lookup resolves the rule for a subscriber, compliance first.
 func (e *Enforcer) lookup(sub subscriber.Subscriber, qname string) (Rule, bool) {
+	// Checked before anything a subscriber or an operator can set, and applied
+	// even to a subscriber with no policy at all: a compliance obligation does
+	// not depend on which product tier somebody bought.
+	if m := e.registry.Mandatory(); m != nil {
+		if r, ok := m.Rules.Match(qname); ok && r.Action != ActionPassthru {
+			e.metrics.MandatoryApplied.Add(1)
+			return r, true
+		}
+	}
 	if ov := e.registry.OverridesFor(sub.ID); ov != nil {
 		if r, ok := ov.Allow.Match(qname); ok {
 			e.metrics.OverrideAllowed.Add(1)

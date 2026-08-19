@@ -277,6 +277,7 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 			Timeout:  cfg.Policy.FeedTimeout,
 			Log:      log,
 			Metrics:  fetchMetrics,
+			Guard:    cfg.FeedGuard(),
 		})
 		if err != nil {
 			return err
@@ -890,6 +891,11 @@ func registerPolicyMetrics(reg *metrics.Registry, m *policy.Metrics, c *subscrib
 		metrics.Source{Name: "cgdns_policy_redirected_total", Help: "Queries redirected to a walled garden.", Kind: metrics.Counter, Read: u64(m.Redirected.Load)},
 		metrics.Source{Name: "cgdns_policy_rewritten_total", Help: "Queries rewritten to another name.", Kind: metrics.Counter, Read: u64(m.Rewritten.Load)},
 		metrics.Source{Name: "cgdns_policy_dropped_total", Help: "Queries dropped by policy.", Kind: metrics.Counter, Read: u64(m.Dropped.Load)},
+		// Answers decided by the compliance tier, which no subscriber can
+		// override. It is reported separately because "how many queries did the
+		// mandatory filtering affect" is a question asked by regulators and
+		// auditors, not by operations.
+		metrics.Source{Name: "cgdns_policy_mandatory_applied_total", Help: "Answers decided by the mandatory compliance tier.", Kind: metrics.Counter, Read: u64(m.MandatoryApplied.Load)},
 		metrics.Source{Name: "cgdns_policy_passthru_total", Help: "Queries explicitly allowed by a passthru rule.", Kind: metrics.Counter, Read: u64(m.Passthru.Load)},
 		metrics.Source{Name: "cgdns_policy_override_allowed_total", Help: "Queries allowed by a per-subscriber whitelist.", Kind: metrics.Counter, Read: u64(m.OverrideAllowed.Load)},
 		metrics.Source{Name: "cgdns_policy_override_blocked_total", Help: "Queries blocked by a per-subscriber block list.", Kind: metrics.Counter, Read: u64(m.OverrideBlocked.Load)},
@@ -1506,5 +1512,12 @@ func registerFeedMetrics(reg *metrics.Registry, m *policy.FetchMetrics) {
 		// or its publisher changed it without telling the control plane.
 		metrics.Source{Name: "cgdns_feed_hash_mismatches_total", Help: "Feed content that did not match its pinned sha256.", Kind: metrics.Counter, Read: u64(m.HashMismatches.Load)},
 		metrics.Source{Name: "cgdns_feed_last_success_timestamp", Help: "Unix time of the last successful feed fetch.", Kind: metrics.Gauge, Read: func() float64 { return float64(m.LastSuccess.Load()) }},
+		// A refresh the guard refused means a published list moved further in a
+		// day than any real edit would. The previous copy is still serving, so
+		// nothing is broken yet, but somebody has to look at why.
+		metrics.Source{Name: "cgdns_feed_refreshes_rejected_total", Help: "Feed refreshes refused for changing too much or arriving near-empty.", Kind: metrics.Counter, Read: u64(m.Rejected.Load)},
+		// A feed tried to block a name that must never be blocked. One is worth
+		// investigating; a run of them is a publisher problem or an attack.
+		metrics.Source{Name: "cgdns_feed_protected_rules_dropped_total", Help: "Rules dropped for naming a protected domain.", Kind: metrics.Counter, Read: u64(m.Protected.Load)},
 	)
 }

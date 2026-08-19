@@ -161,3 +161,41 @@ groups:
           description: >-
             Resolution continues on both nodes; what stops is config replication
             and cache sharing. Not urgent, but it will diverge.
+
+      - alert: CgdnsFeedRefreshRejected
+        expr: increase(cgdns_feed_refreshes_rejected_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} refused a filter list refresh"
+          description: >-
+            A published list changed by more than the guard allows, or arrived
+            near-empty. The previous copy is still serving, so filtering is
+            intact but going stale. These lists are rebuilt daily by a third
+            party and cannot be pinned to a hash, so a jump this large is
+            either a publisher accident or somebody tampering with what every
+            subscriber resolves. Compare against the publisher's own changelog
+            before raising the threshold.
+
+      - alert: CgdnsProtectedNameBlocked
+        expr: increase(cgdns_feed_protected_rules_dropped_total[24h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} dropped a rule naming a protected domain"
+          description: >-
+            A filter list tried to block a name on the protected list. The rule
+            was stripped and everything else in the feed was kept, so nothing
+            is broken — but a list attempting to blackhole a bank or a
+            government service is worth reading properly.
+
+      - alert: CgdnsFeedContentStale
+        expr: time() - cgdns_feed_last_success_timestamp > 172800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has not refreshed a filter list in two days"
+          description: >-
+            Threat intelligence lists are only useful while they are current.
+            The node is still filtering on its last good copy.

@@ -30,22 +30,33 @@ const DefaultTTL = 60
 //	A / AAAA                redirect to the walled garden
 //
 // zoneName is the RPZ zone's own name, which is stripped from each owner to
-// recover the name being policed.
+// recover the name being policed. It may be empty, in which case the zone's own
+// SOA names it: a published feed can rename its zone between refreshes, and a
+// stale name in config strips nothing, which yields an empty policy rather than
+// an error.
 func ParseRPZ(r io.Reader, zoneName, feed string) (*Set, error) {
-	zoneName = dns.CanonicalName(zoneName)
+	origin := dns.CanonicalName(zoneName)
+	if origin == "." {
+		origin = "rpz.invalid."
+	}
 	set := NewSet()
 
-	zp := dns.NewZoneParser(r, zoneName, feed)
+	zp := dns.NewZoneParser(r, origin, feed)
 	zp.SetIncludeAllowed(false)
 
 	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
 		owner := dns.CanonicalName(rr.Header().Name)
-		switch rr.(type) {
-		case *dns.SOA, *dns.NS:
+		if soa, isSOA := rr.(*dns.SOA); isSOA {
+			if zoneName == "" {
+				origin = dns.CanonicalName(soa.Hdr.Name)
+			}
+			continue
+		}
+		if _, isNS := rr.(*dns.NS); isNS {
 			continue
 		}
 
-		policed, wildcard, ok := stripZone(owner, zoneName)
+		policed, wildcard, ok := stripZone(owner, origin)
 		if !ok {
 			continue
 		}
