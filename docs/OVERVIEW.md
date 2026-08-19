@@ -102,6 +102,14 @@ Measured on a Xeon Gold 6140: cache hit **344 ns**, subscriber classification
 **3.6 ns**, zero allocations on the hot path. Live resolution against the real
 root: **1.1 s cold, 156 ms warm**.
 
+**Capacity, measured rather than estimated.** With the daemon pinned to 4 CPUs to
+match a POP node and forwarding to a local authoritative — so the number is this
+daemon, not the internet — the knee is around **140,000 queries per second**:
+143,105 achieved at 0.07% loss, p99 10.6 ms. A five-minute soak at the knee
+answered **41,993,025 queries** at steady latency with nothing logged. CPU peaked
+at 290% of 400%, so the packet path binds before compute does — more cores would
+not move it much.
+
 ### 4. It absorbs the attacks that are actually aimed at resolvers
 
 Three defences, each targeting a real attack rather than a category:
@@ -197,6 +205,18 @@ place that proves an announcement landed:
 | DNSSEC | Validating and rejecting: secure, insecure and bogus all counting |
 | Cache | Memory-bounded at 1 GiB; currently a few hundred KiB and ~1,300 entries |
 
+**On the household, stated accurately:** it is a *soak*, not a load test. It sits
+at well under one query per second — three orders of magnitude below what a POP
+needs to survive — so it proves the thing runs correctly and continuously, and
+proves nothing about capacity. Capacity is measured separately, above.
+
+**Sizing a node: cache plus headroom, not cache alone.** `cache.max_size` bounds
+the cached data and does so exactly. It does not bound the process: at the knee,
+a 64 MiB cache sat inside 277 MB of resident memory, the difference being Go's
+heap under load, which scales with query *rate* rather than with cache size. The
+same build serving a household holds about a megabyte of cache in 64 MB of RSS.
+Size for the cache share plus roughly 200 MB of headroom at full tilt.
+
 **A metric worth understanding before anyone alerts on it.**
 `cgdns_dnssec_bogus_total` sits in the low hundreds on both nodes, and **that is
 the system working**. Almost every one of them is `dnssec-failed.org` — the
@@ -254,6 +274,8 @@ load.
 | **The deployment model itself** | **POP-BNE, built to `provisioning.md`**: four prefixes active at the PE with native next hops, defaults learned and installed per family, egress source confirmed by capture |
 | **Real subscriber use** | **A household resolving through POP-BNE today**, over both anycast addresses and both families |
 | Automatic certificates | Publicly trusted Let's Encrypt certificates issued and installed on both nodes without manual steps, zero ACME failures |
+| Capacity and saturation behaviour | `cgdnsload` ramp on 4 CPUs: knee at ~140k qps, 0.07% loss, p99 10.6 ms; a 5-minute soak answered 41,993,025 queries with nothing logged |
+| The memory bound holds under load | A 64 MiB cache stayed at exactly 64 MiB across 176,000 entries and 400,000 evictions |
 | The pair link in production | Peer up in both directions on both nodes, with cache fetches actually served between them |
 | Wire parsers under hostile input | **Nine fuzz targets** over the parsers where attacker-chosen bytes become a decision — denial proofs, the aggressive store, feed and root-hints parsing, and the listener acceptance path. **Nine million executions, nothing found** |
 | Judged from outside itself | `cgdns-probe` runs off-node, queries the anycast address as a subscriber does, and judges only the answer returned |
@@ -377,8 +399,12 @@ Full chain of trust from IANA's root anchors, embedded in the binary.
   as bogus — saying "your signing is broken" when the truth is "this node could
   not see" sends operators chasing the wrong fault. The answer is still withheld;
   unvalidated data is never served.
-- SHA-1 is off by default. NSEC3 iteration counts above the RFC 9276 limit are
-  refused rather than computed.
+- **RSASHA1 is accepted for validation**, and deliberately so: RFC 8624 makes it
+  NOT RECOMMENDED for *signing* but MUST for *validation*, and refusing it would
+  make zones that still sign with it — many `.gov` zones among them —
+  unresolvable. It ships off and production turns it on.
+- NSEC3 iteration counts above the RFC 9276 limit are refused rather than
+  computed.
 
 ## Caching
 
@@ -880,19 +906,23 @@ remaining work is proving behaviour that one POP and one household cannot show.
    **This is the most valuable next step by a distance.**
 2. **A withdrawal drill at POP-BNE.** Exercised thoroughly in the lab; not yet run
    against the live PE.
-3. **Carrier query volumes.** A household is real traffic, not representative
-   load.
+3. **Carrier volumes through the full recursive path.** The 140k qps ceiling was
+   measured in forwarding mode against a local authoritative, which isolates this
+   daemon's packet path and cache. Real recursion adds upstream latency and the
+   DNSSEC chain, so the operating point under subscriber traffic is a different
+   number and has not been measured.
 4. **Config anti-entropy over a multi-day window** — unit-tested and lab-verified
    in short runs.
 
-**Where the deployed configuration differs from the documented defaults.** Both
-are deliberate operator choices at POP-BNE, and both are worth revisiting rather
-than inheriting:
+**Two settings look like tuning and are not.** Both differ from the shipped
+defaults at POP-BNE, and in both cases the deployed value is the correct one:
 
-| Setting | Default | POP-BNE | Consequence |
+| Setting | Default | POP-BNE | Why the deployed value is right |
 |---|---|---|---|
-| `resolver.max_outbound_per_query` | 32 | **100** | This is the amplification limit. A higher cap resolves deeper or more awkward delegation chains, and raises the ceiling on what a single client query can generate |
-| `resolver.accept_sha1` | false | **true** | RSASHA1 signatures are accepted. SHA-1 is not collision resistant, so this weakens exactly the guarantee validation exists to provide |
+| `resolver.accept_sha1` | false | **true** | RFC 8624 makes RSASHA1 NOT RECOMMENDED for *signing* but **MUST for validation**. Refusing it protects nobody — it makes zones that still sign with it, including many `.gov` zones, unreachable |
+| `resolver.max_outbound_per_query` | 32 | **100** | It bounds honest work, not loops — loops are already capped by `max_delegation_depth` and `max_cname_chain`. A CDN-fronted name crosses several zones by CNAME and each needs its own DNSKEY and DS, so a low ceiling SERVFAILs names people use daily |
+
+The defaults are the conservative reading; production is the working one.
 
 **Filtering is not enabled in production.** There is no `policy` block in the
 POP-BNE configuration, so the enforcer is not in the query path at all. The

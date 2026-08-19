@@ -19,6 +19,21 @@ ExecStart=/usr/sbin/cgdns -config /etc/cgdns/cgdns.yaml
 Restart=on-failure
 RestartSec=5s
 StateDirectory=cgdns
+# Memory is bounded in three places because each catches a different failure.
+#
+# GOMEMLIMIT is the one that does the work: Go's collector otherwise lets the
+# heap reach roughly twice the live data before collecting, so a large cache can
+# double into an OOM on a node with no swap. This makes the collector work
+# harder as it approaches the figure instead.
+#
+# MemoryHigh asks the kernel to reclaim and throttle before anything is killed.
+# MemoryMax is the backstop, and its value is that the kernel kills *this*
+# service rather than letting the OOM killer choose — which on a resolver has a
+# habit of choosing sshd, turning a restart into a site visit.
+Environment=GOMEMLIMIT=2560MiB
+MemoryHigh=2800M
+MemoryMax=3200M
+
 RuntimeDirectory=cgdns
 
 # Ambient capabilities rather than setcap on the binary: NoNewPrivileges strips

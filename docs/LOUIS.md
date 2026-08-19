@@ -777,13 +777,13 @@ automatically**, and the pair link is up in both directions serving cache fetche
 between the nodes. Four services run on each node: `cgdns`, `gobgpd`,
 `cgdns-routed` and `cgdns-probe`. It carries a household's real traffic.
 
-**Two settings at POP-BNE differ from the documented defaults**, and both are
-operator choices rather than product behaviour:
+**Two settings at POP-BNE differ from the shipped defaults, and in both cases
+the deployed value is the correct one.** They look like tuning and are not:
 
-| Setting | Default | POP-BNE | Consequence |
+| Setting | Default | POP-BNE | Why the deployed value is right |
 |---|---|---|---|
-| `resolver.max_outbound_per_query` | 32 | **100** | This is the amplification limit (§7.2). Raising it accommodates deeper delegation chains and raises the ceiling on what one client query can generate |
-| `resolver.accept_sha1` | false | **true** | RSASHA1 accepted, which weakens the guarantee in §8.4 |
+| `resolver.accept_sha1` | false | **true** | RFC 8624 makes RSASHA1 NOT RECOMMENDED for *signing* but **MUST for validation**. Refusing it protects nobody and makes zones that still sign with it — including many `.gov` zones — unreachable (§8.4) |
+| `resolver.max_outbound_per_query` | 32 | **100** | It bounds honest work, not loops; loops are capped by `max_delegation_depth` and `max_cname_chain` (§7.2). A CDN-fronted name crosses several zones by CNAME, each needing its own DNSKEY and DS, so a low ceiling SERVFAILs names people use daily |
 
 **Filtering is not enabled there.** The configuration carries no `policy` block,
 so the enforcer is not in the query path at all (§10.1) — the correct state until
@@ -1316,9 +1316,17 @@ would make the caps meaningless — an attacker crafts a hierarchy where each
 lookup spawns more lookups, each with a full allowance. One budget per inbound
 query, shared by everything it triggers, is what makes 32 mean 32.
 
-**Why 32 specifically.** It is comfortably above what any legitimate deep
-delegation needs (a cold cross-TLD CNAME chase measured well under it) and low
-enough that one query cannot be turned into a meaningful outbound flood.
+**What the outbound cap actually bounds, and it is worth being precise.** It
+bounds *honest work*, not loops — loops are already caught by
+`max_delegation_depth` and `max_cname_chain`. A CDN-fronted name crosses several
+zones by CNAME, and each zone needs its own DNSKEY and DS fetched, so the count
+climbs quickly on names people use every day. **Set it too low and the resolver
+SERVFAILs ordinary names**; the shipped default of 32 is the conservative
+reading and production runs 100, which is the working figure.
+
+It is still the amplification bound in the sense that matters — one inbound
+query can generate at most that many outbound ones, and every sub-lookup it
+triggers draws from the same allowance.
 
 ### 7.3 QNAME minimisation is a privacy control, not an optimisation
 
@@ -1473,10 +1481,20 @@ Bogus (`validator.go:321-332`).
 **Decision.** Accepted: RSASHA256, RSASHA512, ECDSAP256SHA256, ECDSAP384SHA384,
 ED25519, ED448. RSASHA1 and RSASHA1NSEC3SHA1 only when `accept_sha1` is set.
 
-**Why.** SHA-1 is no longer collision resistant; a validator that accepts it
-undermines the guarantee it exists to provide. The escape hatch exists because
-some zones are still behind, and an operator should be able to make that call
-knowingly.
+**Why the algorithm list is what it is.** SHA-1 is no longer collision
+resistant, so it has no business signing anything.
+
+**But refusing it as a validator is a different question, and the answer runs
+the other way.** RFC 8624 makes RSASHA1 **NOT RECOMMENDED for signing and MUST
+for validation** — the asymmetry is deliberate. A validator that refuses it does
+not stop anyone forging, because a forger simply would not use it; what it does
+is make every zone still signed with RSASHA1 unresolvable, and that set still
+includes many `.gov` zones. **The subscriber experiences that as the resolver
+being broken.**
+
+So the shipped default is the conservative reading and **production runs with
+`accept_sha1: true`**, which is the correct operational choice. The knob exists
+so the decision is explicit either way rather than buried.
 
 **Validation detail:** `accept_sha1` with `dnssec: false` is a config *error*,
 not a no-op — it means the operator believes something about their configuration
@@ -2626,6 +2644,44 @@ Measured on a Xeon Gold 6140, hot path, zero allocations:
 | Rate-limiter decision | ~120 ns |
 
 Live resolution against the real root servers: cold 1.1 s, warm 156 ms.
+
+**Capacity, measured with `cgdnsload`.** The tool ramps *offered* load and
+reports what was *achieved*, because those differ and the difference is the
+measurement. Daemon pinned to 4 CPUs to match a POP node, forwarding to a local
+authoritative so the figure is this daemon rather than the internet:
+
+| | achieved | loss | p50 | p95 | p99 |
+|---|---|---|---|---|---|
+| 600 senders | 143,105 | 0.07% | 1.2 ms | 5.5 ms | 10.6 ms |
+| 1500 senders | 137,395 | 0.32% | 2.0 ms | 7.6 ms | 13.7 ms |
+
+**The shape past the knee is the part worth recognising.** More concurrency
+yields *less* throughput and several times the loss — a saturated resolver does
+not slow down politely, it starts dropping. CPU peaked at 290% of 400%, so the
+packet path binds before compute does and adding cores would not move it much.
+
+A five-minute soak at the knee answered **41,993,025 queries** at 0.07% loss,
+p99 steady at 9.7 ms, nothing logged.
+
+**A measurement caveat built into the tool.** Paced mode cannot find a ceiling on
+its own: a ticker asked for an interval of a few microseconds does not keep it,
+and above a few tens of thousands per second the generator quietly becomes the
+bottleneck. The numbers above come from unpaced mode for that reason.
+
+### 16.1a Resident memory is not the cache size
+
+**What `cache.max_size` bounds, exactly.** Under load a 64 MiB cache held
+**exactly 64 MiB** across 176,000 entries and 400,000 evictions — the ceiling
+does what it says.
+
+**What it does not bound.** The process sat at 277 MB while doing it. The
+difference is Go's heap under load, and it scales with query *rate* rather than
+with cache size: the same build serving a household holds about a megabyte of
+cache inside 64 MB of RSS.
+
+**So a node is sized as cache share plus roughly 200 MB of headroom at full
+tilt**, not as cache alone. Sizing on `max_size` and nothing else is how a node
+gets OOM-killed at the exact moment it is busiest.
 
 ### 16.2 The rules that keep it there
 
