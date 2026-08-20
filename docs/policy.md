@@ -5,6 +5,47 @@ things a subscriber did not ask to have blocked is a support problem at best and
 a regulatory one at worst, so the default for every client address is: no
 policy, resolve everything.
 
+## Turning it on
+
+**The packaged config ships without a `policy:` section, so the engine is off.**
+That is deliberate — a resolver should not gain a filtering path because somebody
+installed a package — but it fails quietly in one specific way: the control store
+accepts profiles and assignments either way and replays them back, so a node that
+will never filter looks identical through `cgdnsctl` to one that is filtering.
+
+Both production nodes ran like that for weeks. Two things now say so — the daemon
+logs which way it went at startup, and `cgdnsctl` warns before writing policy a
+node will not apply — but the check worth doing first is:
+
+```sh
+cgdnsctl status | grep -i policy
+```
+
+To enable it, add to `/etc/cgdns/cgdns.yaml` and restart:
+
+```yaml
+policy:
+  enabled: true
+  feed_dir: /var/lib/cgdns/feeds
+  feed_refresh_interval: 12h
+  feed_timeout: 120s
+  feed_max_bytes: 67108864
+  feed_max_change_ratio: 0.3
+  feed_min_rules: 50
+  protected_names:
+    - "gov.au"
+```
+
+Enabling the engine filters nothing on its own — every address is still
+unassigned. `feed_max_bytes` must be generous: the larger threat lists run to
+tens of megabytes, and a feed that overruns the cap is refused rather than
+truncated.
+
+On a pair, do one node at a time and check the other is healthy in between. The
+config is packaged `noreplace`, so upgrades will not touch it.
+
+---
+
 Filtering is built from four pieces.
 
 | | what it is | who chooses it |
@@ -106,6 +147,10 @@ cgdnsctl policy list add au-compliance notice.example \
 cgdnsctl policy list show au-compliance
 ```
 
+A list you maintain applies as soon as it is written — there is nothing to fetch,
+so it does not wait for a refresh cycle. That matters when the instruction behind
+it arrives with a deadline.
+
 An entry covers the name and everything beneath it. An order naming a site means
 the site, not just its apex.
 
@@ -144,6 +189,18 @@ measured rule counts and memory.
 
 Nothing is enabled by having a catalog entry — a list is fetched only once a
 profile names it.
+
+A newly added feed waits for the next `feed_refresh_interval` unless the fetch is
+forced, which is an odd thing to explain to somebody who has just pressed save:
+
+```sh
+curl -s -X POST --unix-socket /run/cgdns/control.sock \
+  http://localhost/api/v1/policy/refresh
+```
+
+Each node fetches independently. Feed *content* is never replicated — it runs to
+millions of rows and would swamp the pair link — so forcing a refresh is a
+per-node operation even though the records that describe it are shared.
 
 ### Memory
 

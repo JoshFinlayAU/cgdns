@@ -1916,6 +1916,181 @@ distinguish policy from a genuine NXDOMAIN.
 `redirect` requires `redirect_to` addresses — validation refuses the
 combination otherwise, rather than silently behaving as `nxdomain`.
 
+### 10.7 Policy is composed from categories, not from feed names
+
+**The decision:** an operator builds a profile by naming *what to filter* —
+`security`, `ads`, `tracking`, `gambling`, `adult`, `compliance` — and a built-in
+catalog resolves each category to a specific list. Feed URLs are never typed.
+
+**The alternative** was the obvious one: profiles reference feeds by name, and
+whoever configures a product tier looks up which list covers what. That is how
+the control records still work underneath, and it is a perfectly good data model.
+It is a bad *interface*, for two reasons that only show up later.
+
+The first is that it puts a research task in front of a commercial decision.
+"Sell a family filter" becomes "read a blocklist project's README and decide
+between `pro`, `pro.plus` and `ultimate`", which is a judgement about false
+positive rates that the person defining a product tier is not equipped to make
+and should not have to.
+
+The second is that it welds the product to a supplier. Every profile naming
+`hagezi-light` has to be rewritten if that list is ever replaced. A profile
+naming `ads` does not: the catalog entry changes and nothing configured moves.
+For a filtering product with a contractual description, that indirection is the
+difference between changing a supplier and re-selling the tier.
+
+**Each category resolves to its most conservative tier**, and that direction is
+deliberate. Under-filtering is a support ticket; over-filtering is a customer who
+cannot reach their bank. `--feed` remains available for an operator who wants a
+specific tier, so the default is a default and not a ceiling.
+
+`tracking` deliberately has *no* default tier, and naming it without `--feed` is
+an error that lists the alternatives. Its lists are narrow vendor-telemetry sets
+where "the sensible one" does not exist, and inventing one would have been a
+worse answer than admitting it.
+
+### 10.8 Compliance filtering is a separate tier, not a class everyone is in
+
+**The problem:** §10.4 makes a subscriber's allow list beat the class feeds, and
+that ordering is correct for everything an operator *chooses* to filter. It is
+wrong for the one case where filtering is imposed rather than chosen. A court
+order, a regulator's notice, a statutory blocking obligation — "the subscriber
+asked us not to" is not a defence for any of them.
+
+**The rejected approach** was a class every subscriber is a member of. It fails
+on both halves of what the requirement actually is. A class can be reassigned,
+so the obligation is one CLI typo from being lifted; and it still sits below the
+subscriber's allow list in the evaluation order, so any customer can opt out of
+it by unblocking the name.
+
+**What was built:** a mandatory tier held separately on the registry and
+consulted *first*, above the subscriber's own allow list and above every profile.
+It applies to a client with no assignment at all, which is the property that
+matters — an obligation that only covers customers who bought filtering is not an
+obligation that has been met.
+
+It compiles as a class named with a leading NUL byte, so it cannot be typed,
+assigned, or deleted through any interface that reaches the store. That is a
+cheap trick rather than a real capability boundary, and it is worth being honest
+about which: anyone with root on the node can edit the control store directly.
+It defends against the mistake, not against the operator.
+
+**Entries carry a `--note`, and this is the part that is easy to dismiss as
+paperwork.** The question asked of a compliance list months later is never "is
+this name blocked" — the list answers that. It is "on whose authority", asked by
+someone who was not there. A blocklist that cannot answer it is evidence of
+nothing.
+
+**Verified on the wire**, because this is the tier where believing the API would
+be worst: a subscriber allow-listing the name did not lift it, and an address
+with no profile at all was still subject to it.
+
+### 10.9 Guarding a list that cannot be pinned
+
+§10.5a pins a feed to a SHA-256 where one is available. **The lists an operator
+actually wants are rebuilt daily**, which makes a pinned digest meaningless: it
+would have to be updated every day, by a process that cannot verify the content
+either, which is a ritual rather than a control.
+
+So the guard checks *shape* instead of identity, and refuses a refresh that:
+
+- moves the rule count by more than `feed_max_change_ratio` (default 0.3), or
+- arrives with fewer than `feed_min_rules` (default 50), or
+- names something in `protected_names`, in which case the rule is stripped and
+  counted and the rest of the list is kept.
+
+The reasoning behind each threshold is the same: real editing of a curated list
+does not move it 30% overnight, so a jump that large is a publisher accident or
+somebody upstream having a very good day. A near-empty list is worse than a
+failed fetch, because it *succeeds* — filtering switches off and nothing errors.
+
+**Protected names are handled differently from the other two on purpose.** A
+whole-feed refusal for one bad entry throws away a list that is otherwise fine,
+so the rule is dropped and the feed is kept. But a bank or a government service
+going dark for every subscriber at once is not an acceptable way to discover a
+publisher's mistake, so it is counted and alerted rather than silently tolerated.
+
+**A refusal leaves the previous copy serving.** Filtering goes stale, which is
+recoverable and visible in `cgdns_feed_last_success_timestamp`; filtering goes
+*wrong* is neither.
+
+The honest limitation: this catches accidents and crude tampering. It does not
+catch a patient adversary who adds a hundred names a day, and nothing that reads
+a third-party list on a schedule can. What it buys is that the interesting attack
+has to be slow, and slow attacks leave a diff.
+
+### 10.10 What filtering actually costs
+
+Claimed since the beginning that policy is affordable. Measured, finally, with
+1,130,040 real rules loaded (`hagezi` light + nsfw + tif.medium) against the same
+node with nothing assigned:
+
+| | no policy | 1.13M rules |
+|---|---|---|
+| achieved, 150k offered | 70,401 qps | 70,065 qps |
+| p50 | 200 µs | 200 µs |
+| p99 | 2.7 ms | 2.7 ms |
+| loss | 0.00% | 0.00% |
+
+The difference is inside the noise, and the load generator was the limit in both
+runs rather than the resolver, so the honest reading is "no measurable
+difference" and not "0.5% slower". The lookup itself is 7.6 ns for a name that is
+not filtered, 23 ns for the worst case — a deep name, where the wildcard match
+has the most labels to walk before concluding nothing matches — and **zero
+allocations** either way.
+
+**So the conclusion is that filtering costs memory, not latency**, and memory is
+the only budget worth managing here: roughly 160–230 bytes per rule, and a
+refresh holds the old and the new copy at once, so a list costs double for the
+moment it swaps. Those three lists put a node at 558 MiB resident.
+
+Two things had to be corrected before those numbers meant anything, both the same
+mistake in different clothes. The first runs were measuring the internet, because
+every unique name in the generated set needed a real recursion. The next were
+measuring rate limiting, because generated names return NXDOMAIN and NXDOMAIN is
+a denial — correct production behaviour, and it masked the thing under test
+completely. The figures above are from a 99.3% cache-hit mix with RRL disabled,
+which is the only configuration in which the question "what does policy cost" has
+an answer.
+
+### 10.11 The default is no policy, and there is no empty profile
+
+An address with no assignment resolves everything. There is deliberately **no**
+"default profile with no feeds in it", which was the obvious way to model it and
+would have read more consistently.
+
+Two reasons it is not there. It is a second thing that can be misconfigured to
+produce the same outcome, and the two are not distinguishable afterwards —
+"unassigned" and "assigned to something empty" look identical to a subscriber and
+different in the store. And an empty profile is one edit away from being a
+non-empty one that nobody decided to apply, which is precisely the accident worth
+designing out of a system that filters other people's DNS.
+
+`cgdnsctl policy show <address>` answers the support question directly, reporting
+what applies in the order the resolver consults it, including "matches no
+assignment: it resolves unfiltered".
+
+### 10.12 The bug this section should have caught earlier
+
+Policy was **entirely disabled on both production nodes** until 2026-08-19, and
+nothing said so. The packaged config ships without a `policy:` section, so
+`policy.enabled` defaulted false, `buildPolicy` returned no classifier and no
+registry, and §10.1's "conditionally constructed, not conditionally executed"
+property was working exactly as designed.
+
+The failure was that every layer above it reported success anyway. Profiles could
+be created, prefixes assigned, and `cgdnsctl policy assignments` would list them
+back — all writing control records that nothing was reading. Discovered only by
+querying the anycast address and noticing nothing was blocked.
+
+**This belongs in the risk register more than the design record**, because it is
+the fourth instance of the same pattern (§17): a component reporting success for
+work that never reached the wire. The correct generalisation is not "check
+`policy.enabled`" but that *any* subsystem which can be constructed conditionally
+should say which way it went, at startup, at info level. The daemon now logs
+`subscriber policy loaded` with its counts when policy is on. It still says
+nothing when policy is off, which is the remaining half of the fix.
+
 ---
 
 ## 11. Rate limiting

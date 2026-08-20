@@ -284,6 +284,10 @@ further draws traffic toward a node that may not be the nearest one.
 2. PE sessions and filter.
 3. gobgpd. Sessions establish; each node learns a default per family.
 4. cgdns. It announces the anycast prefixes once health checks pass.
+5. Subscriber policy, if the node is to filter — it is **off** unless the config
+   says otherwise, and nothing above depends on it. See
+   [policy.md](policy.md#turning-it-on). Enabling it filters nobody: every client
+   address stays unassigned until somebody assigns one.
 
 ## 6. Verify at the far end, not the near end
 
@@ -311,6 +315,24 @@ tcpdump -ni eth0 'udp port 53'
 systemctl stop cgdns                         # the PE should lose exactly
                                              # this node's two prefixes
 ```
+
+Filtering, where it is enabled, is verified the same way — from a client address,
+not from the node's own record of what it thinks it loaded:
+
+```bash
+# on the node: is the engine even constructed, and what is in force
+cgdnsctl status | grep -i policy
+cgdnsctl policy show <a subscriber address>
+
+# from that subscriber address: the only check that proves anything
+dig @<anycast address> <a name the profile blocks>     # expect NXDOMAIN + EDE 15
+dig @<anycast address> example.com                     # expect NOERROR
+```
+
+A node with `policy.enabled` unset accepts every profile and assignment written
+to it and reports them back unchanged, so `cgdnsctl policy assignments` looking
+correct proves nothing on its own.
+
 
 A packet capture is the only honest answer to "which path is it using". A `dig`
 against the anycast address proves an answer came back, not which family or

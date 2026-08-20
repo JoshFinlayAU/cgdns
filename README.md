@@ -423,11 +423,22 @@ the token on the wire in the clear the first time someone left the scheme off.
 
 ```sh
 cgdnsctl status                                  # health, pair link, store hash
-cgdnsctl subscriber set '{"prefix":"203.0.113.0/24","id":"acme","class":"filtered"}'
+cgdnsctl policy profile set family --category security --category adult
+cgdnsctl policy assign 203.0.113.0/24 family --id acme
+cgdnsctl policy show 203.0.113.45                # what applies here, and why
 cgdnsctl allow acme example.com                  # per-subscriber whitelist
 cgdnsctl token create provisioning write         # shown once, never recoverable
 cgdnsctl drift ns1.pop:8443 ns2.pop:8443         # do the two nodes agree?
 ```
+
+`cgdnsctl policy help` covers the rest: the feed catalog with its measured
+memory, profiles, CIDR assignment, and the hand-maintained compliance lists. Full
+detail in [docs/policy.md](docs/policy.md).
+
+`drift` is the one command that still needs a real token even on the node itself,
+because it reaches the *sibling* over the network and the local socket only
+authorises the local node. Comparing `cgdnsctl status` store hashes over each
+node's own socket is the token-free equivalent.
 
 Write to either node; the sibling converges. `drift` exits non-zero when the
 nodes disagree, so it drives monitoring directly - and it refuses to report "in

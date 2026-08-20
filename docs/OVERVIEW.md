@@ -27,6 +27,7 @@ both.*
 · [Resolution engine](#the-resolution-engine)
 · [DNSSEC](#dnssec)
 · [Caching](#caching)
+· [Subscriber policy](#subscriber-policy)
 · [The pair](#the-pair)
 · [Anycast and routing](#anycast-and-routing)
 · [Management](#management)
@@ -151,7 +152,11 @@ product supportable: every curated feed eventually false-positives on some
 customer's supplier or payment gateway, and without a per-customer unblock the
 only remedies are editing a feed you do not own or refunding the customer.
 
-The same mechanism is what a blocking obligation lands on when one arrives.
+A blocking obligation, when one arrives, does *not* land on that mechanism —
+deliberately. An obligation a subscriber can lift by allow-listing the name has
+not been met, and neither has one that only covers customers who bought
+filtering. It lands on a separate mandatory tier consulted before everything
+else, described under [Subscriber policy](#subscriber-policy).
 
 ### 7. It is operable at carrier scale, by machines
 
@@ -440,6 +445,56 @@ they prove absent. Only validated denials are stored, an NSEC is only used insid
 the zone its own SOA names, and NSEC3 proof is stricter — closest encloser, next
 closer name, and the wildcard — with opt-out spans never used, since such a span
 may contain unsigned delegations and would let us deny names that exist.
+
+## Subscriber policy
+
+**Nothing is filtered unless somebody says so.** A client address with no
+assignment resolves everything, which is the state every subscriber is in by
+default. There is no empty default profile — unassigned and assigned-to-nothing
+would be indistinguishable to a subscriber and different in the store, and the
+second is one edit away from filtering people nobody decided to filter.
+
+**Filtering is composed from categories, not feed names.** An operator names what
+to filter — `security`, `ads`, `tracking`, `gambling`, `adult`, `compliance` —
+and a built-in catalog resolves each to a specific list, at its most conservative
+tier. Nobody defining a product tier has to read a blocklist project's README and
+choose between `pro` and `pro.plus`, and replacing the list behind a category
+later changes nothing that was configured.
+
+```sh
+cgdnsctl policy catalog security                  # what is available, and what it costs in RAM
+cgdnsctl policy profile set family --category security --category adult
+cgdnsctl policy assign 2001:db8:1234::/48 family --id cust-10241
+cgdnsctl policy show 203.0.113.45                 # what applies here, and why
+```
+
+Policy is applied **by CIDR** — one address or a /48 — with longest match
+winning, so an exception inside an assigned range is simply a more specific
+assignment.
+
+**Compliance filtering is a separate tier**, because it is imposed rather than
+chosen. A list created `--mandatory` is consulted *first*: above every profile
+and above the subscriber's own allow list, and applying to clients with no
+assignment at all. That last property is the point — an obligation that only
+covers customers who bought filtering has not been met. Entries are maintained
+through `cgdnsctl`, replicate to the sibling, and each carries a note recording
+the authority it was added under, because the question asked months later is
+never "is this blocked" but "on whose".
+
+**Fetched lists are guarded on the way in.** The lists worth having are rebuilt
+daily, so a pinned digest is a ritual rather than a control. Instead a refresh is
+refused if it moves the rule count more than 30%, or arrives near-empty — a
+successful fetch of nothing switches filtering off without failing. Rules naming
+a protected domain are stripped and counted while the rest of the list is kept.
+A refusal leaves the previous copy serving: filtering goes stale, which is
+recoverable and visible, rather than wrong, which is not.
+
+**It costs memory, not latency.** Measured against 1,130,040 real rules on a
+cache-warm mix: 70,401 qps without policy, 70,065 with, p50 200 µs either way and
+zero loss in both — the load generator was the limit, not the resolver. The
+lookup is 7.6 ns for a name that is not filtered, 23 ns worst case, and allocates
+nothing. Budget roughly 200 bytes per rule, doubled for the moment a refresh
+swaps one list for the next. Full detail in **[policy.md](policy.md)**.
 
 ## The pair
 
@@ -1042,11 +1097,30 @@ serving cache fetches between the nodes. A household resolves through it.
 The external probe is verified **by drill, not by assertion**: stopping cgdns on
 one node turned all three of its sibling's checks red within twelve seconds.
 
+**Filtering is live on one subscriber address**, deliberately: a single /32,
+423,876 rules, with every other subscriber verified unfiltered. It was rolled out
+one node at a time with the external probe run between each, which is also how
+the upgrade before it was done. The finding worth recording is that policy had
+been **entirely disabled on both nodes** until then — the packaged config ships
+without a `policy:` section, so the engine was never constructed, while the CLI
+happily accepted and replayed profiles and assignments that nothing was reading.
+Both halves of that now announce themselves: the daemon logs which way it went at
+startup, and `cgdnsctl` warns before writing policy a node will not apply.
+
 ### Where the testing does not reach
 
 Said plainly: no second POP, so inter-POP failover is undemonstrated; no
 withdrawal drill against the live PE; and no load beyond a household. Those are
 the three gaps, and they are the first three items in the list above.
+
+Two smaller ones, since they are easy to overlook. **Filtering has one subscriber
+behind it**, so the false-positive rate of a curated list against real household
+traffic is a claim rather than a measurement — that only comes from volume.
+And **the v6 anycast addresses are unreachable from outside AS135559** while
+working correctly inside it: both `/128`s are advertised to the PE and not
+filtered, and the sibling queries them fine, so this is upstream propagation
+rather than a node fault. It needs resolving before any subscriber is handed a v6
+resolver address.
 
 ---
 ---
