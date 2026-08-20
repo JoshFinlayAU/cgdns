@@ -70,7 +70,7 @@ groups:
             configured max_size and raise it in step with the node's RAM.
 
       - alert: CgdnsCacheHitRatioUnreadable
-        expr: cgdns_cache_hits_total == 0 and cgdns_queries_total > 1000
+        expr: cgdns_cache_lookup_hits_total == 0 and cgdns_queries_total > 1000
         for: 30m
         labels:
           severity: warning

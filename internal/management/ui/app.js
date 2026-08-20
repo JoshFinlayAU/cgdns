@@ -176,11 +176,11 @@ async function refresh() {
   const n = (k) => Math.round(m[k] || 0);
   $("resolve-grid").replaceChildren(
     tile("queries", n("cgdns_queries_total")),
-    tile("cache hits", n("cgdns_cache_hits_total")),
+    tile("cache hits", n("cgdns_cache_lookup_hits_total")),
     tile("cache entries", n("cgdns_cache_entries")),
     tile("dnssec secure", n("cgdns_dnssec_secure_total"), "ok"),
     tile("dnssec bogus", n("cgdns_dnssec_bogus_total"), n("cgdns_dnssec_bogus_total") ? "bad" : ""),
-    tile("outbound queries", n("cgdns_recursion_outbound_queries_total")),
+    tile("outbound queries", n("cgdns_recursion_outbound_total")),
     tile("served stale", n("cgdns_serve_stale_served_total"), n("cgdns_serve_stale_served_total") ? "warn" : ""),
     tile("prefetched", n("cgdns_prefetch_completed_total")),
   );
