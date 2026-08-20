@@ -586,6 +586,10 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 					s.Healthy = monitor.State() == health.StateHealthy
 					s.Advertised = s.Healthy
 				}
+				if registry != nil {
+					s.PolicyEnabled = true
+					s.PolicyRules = registry.TotalRules()
+				}
 				return s
 			},
 		})
@@ -791,6 +795,12 @@ func run(configPath, logLevelOverride string, checkOnly bool) error {
 // filtering, never resolution.
 func buildPolicy(cfg config.Config, log *slog.Logger) (*subscriber.Classifier, *policy.Registry, error) {
 	if !cfg.Policy.Enabled {
+		// Said out loud, because the alternative is a node that accepts every
+		// profile and assignment an operator writes, reports them back
+		// faithfully, and filters nothing — the records are stored either way,
+		// and only the query path knows the difference.
+		log.Info("subscriber policy is disabled; every client resolves unfiltered",
+			slog.String("enable_with", "policy.enabled: true"))
 		return nil, nil, nil
 	}
 

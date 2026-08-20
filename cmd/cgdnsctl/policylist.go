@@ -54,6 +54,7 @@ func policyListCreate(g globals, args []string) error {
 	if err != nil {
 		return err
 	}
+	warnIfPolicyOff(c)
 	if _, err := c.Get(control.KindFeed, name); err == nil {
 		return fmt.Errorf("a list named %q already exists", name)
 	} else {

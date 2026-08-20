@@ -33,6 +33,15 @@ type Status struct {
 
 	Advertised bool `json:"anycast_advertised"`
 	Healthy    bool `json:"healthy"`
+
+	// PolicyEnabled reports whether the query path has a policy engine at all.
+	// It is here so an operator writing profiles and assignments can be told
+	// that none of it is being read: the control store accepts and replays those
+	// records either way, so nothing else they can see distinguishes a node that
+	// is filtering from one that never will.
+	PolicyEnabled bool `json:"policy_enabled"`
+	// PolicyRules is how many rules are in force across every profile.
+	PolicyRules int `json:"policy_rules"`
 }
 
 // StatusFunc reports live node status.

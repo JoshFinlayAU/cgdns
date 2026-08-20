@@ -233,6 +233,14 @@ func cmdStatus(g globals, args []string) error {
 	fmt.Printf("pair link   out=%s in=%s\n", upDown(s.PeerOutboundUp), upDown(s.PeerInboundUp))
 	fmt.Printf("records     %d\n", s.Records)
 	fmt.Printf("store hash  %s\n", s.StoreHash)
+	// Reported even when off, and especially then: the store holds profiles and
+	// assignments either way, so this is the only thing that distinguishes a
+	// node that is filtering from one that is only recording the intent to.
+	if s.PolicyEnabled {
+		fmt.Printf("policy      enabled, %d rules in force\n", s.PolicyRules)
+	} else {
+		fmt.Printf("policy      disabled — every client resolves unfiltered\n")
+	}
 	return nil
 }
 

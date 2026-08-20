@@ -253,6 +253,7 @@ func policyProfileSet(g globals, args []string) error {
 	if err != nil {
 		return err
 	}
+	warnIfPolicyOff(c)
 
 	// Creating the feed records here is the point of the command: naming a
 	// category should be enough, without the operator having to know the URL
@@ -415,6 +416,7 @@ func policyProfiles(g globals) error {
 	if err != nil {
 		return err
 	}
+	warnIfPolicyOff(c)
 	classes, err := loadClasses(c)
 	if err != nil {
 		return err
@@ -551,6 +553,7 @@ func policyAssignments(g globals) error {
 	if err != nil {
 		return err
 	}
+	warnIfPolicyOff(c)
 	subs, err := loadSubscribers(c)
 	if err != nil {
 		return err
@@ -588,6 +591,7 @@ func policyShow(g globals, args []string) error {
 	if err != nil {
 		return err
 	}
+	warnIfPolicyOff(c)
 	subs, err := loadSubscribers(c)
 	if err != nil {
 		return err
@@ -728,4 +732,30 @@ func parseFlags(fs *flag.FlagSet, args []string) ([]string, error) {
 		return nil, err
 	}
 	return positional, nil
+}
+
+// warnIfPolicyOff tells an operator when nothing will read what they are about
+// to write.
+//
+// The control store accepts profiles and assignments whether or not the query
+// path has a policy engine, and replays them back faithfully, so a node with
+// `policy.enabled` unset looks identical through this CLI to one that is
+// filtering. Both production nodes ran that way for weeks. The write still
+// proceeds — provisioning a node before enabling it is legitimate — but it says
+// so rather than letting the operator find out by querying.
+func warnIfPolicyOff(c *management.Client) {
+	st, err := c.Status()
+	if err != nil || st.PolicyEnabled {
+		return
+	}
+	// Over the local socket the client's address is a synthetic "localhost",
+	// which would read as though some other machine were meant.
+	where := c.Addr()
+	if strings.Contains(where, "localhost") {
+		where = "this node"
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: %s has policy disabled, so nothing here is in the query path yet.\n"+
+			"         set `policy.enabled: true` in its config and restart to apply it.\n",
+		where)
 }
