@@ -2,6 +2,10 @@
 
 Two resolver nodes, their addressing, and their BGP sessions, from nothing.
 
+> This is the model to build **to**. For what is actually deployed and running
+> right now — read off the live nodes, including where the estate differs from
+> this document — see [as-built-pop-bne.md](as-built-pop-bne.md).
+
 ## The deployment model
 
 Four interfaces per node, one job each.

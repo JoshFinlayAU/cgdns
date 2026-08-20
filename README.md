@@ -25,6 +25,11 @@ up with its alternatives and its trade-offs in `docs/LOUIS.md`, and
 are referenced from the overview at the points where they are relevant — you
 should not need to go looking.
 
+For what is actually deployed right now, rather than how it should be built,
+[docs/as-built-pop-bne.md](docs/as-built-pop-bne.md) records the running estate
+as read off the live nodes — addressing, BGP, transports, memory bounds, what
+filtering is applied to whom, and where the estate differs from the model.
+
 ## Deployment model
 
 Two resolvers per POP. Each owns **its own** anycast address, and that address is announced from every POP.
@@ -64,6 +69,7 @@ any single link.
 
 Setting all of this up from scratch - addressing, gobgpd, the router side, and
 what to check where - is written up in [docs/provisioning.md](docs/provisioning.md).
+What is deployed today is in [docs/as-built-pop-bne.md](docs/as-built-pop-bne.md).
 
 The anycast0 dummy interface was a trial by fire decision that was settled on to work in basically the same way and reason that "nameserver 127.0.0.53" does in most Linux distros these days. We just need somewhere to bind to that never goes down (and that is not attached to anything and is never gonna ARP), then we let the kernel do the routing from there on.
 

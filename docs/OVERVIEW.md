@@ -41,6 +41,8 @@ both.*
 · [What is outstanding](#what-is-outstanding)
 · [How this has been tested and hardened](#how-this-has-been-tested-and-hardened)
 
+**Alongside this** · [as-built: what POP-BNE actually runs today](as-built-pop-bne.md) · [provisioning: how to build one](provisioning.md) · [policy: how filtering is configured](policy.md)
+
 **→ [What I need next: a second POP in S1](#what-i-need-next-a-second-pop-in-s1)** — *the ask, if you read nothing else*
 · [Addressing](#addressing) · [BGP peering](#bgp-peering) · [The test plan, already written](#the-test-plan-is-already-written)
 
@@ -1113,14 +1115,9 @@ Said plainly: no second POP, so inter-POP failover is undemonstrated; no
 withdrawal drill against the live PE; and no load beyond a household. Those are
 the three gaps, and they are the first three items in the list above.
 
-Two smaller ones, since they are easy to overlook. **Filtering has one subscriber
+One smaller one, since it is easy to overlook: **filtering has one subscriber
 behind it**, so the false-positive rate of a curated list against real household
 traffic is a claim rather than a measurement — that only comes from volume.
-And **the v6 anycast addresses are unreachable from outside AS135559** while
-working correctly inside it: both `/128`s are advertised to the PE and not
-filtered, and the sibling queries them fine, so this is upstream propagation
-rather than a node fault. It needs resolving before any subscriber is handed a v6
-resolver address.
 
 ---
 ---
