@@ -71,6 +71,12 @@ func ProveNoDS(denial []dns.RR, name string) error {
 	}
 
 	for _, rr := range denial {
+		if nsec, ok := rr.(*dns.NSEC); ok && provesEmptyNonTerminal(nsec, name) {
+			return nil
+		}
+	}
+
+	for _, rr := range denial {
 		nsec3, ok := rr.(*dns.NSEC3)
 		if !ok {
 			continue
@@ -343,6 +349,9 @@ func ZoneCutFromDenial(denial []dns.RR, name string) (isCut bool, known bool) {
 	for _, rr := range denial {
 		switch v := rr.(type) {
 		case *dns.NSEC:
+			if provesEmptyNonTerminal(v, name) {
+				return false, true
+			}
 			if dns.CanonicalName(v.Hdr.Name) != name {
 				continue
 			}
@@ -365,6 +374,23 @@ func ZoneCutFromDenial(denial []dns.RR, name string) (isCut bool, known bool) {
 		}
 	}
 	return false, false
+}
+
+// provesEmptyNonTerminal reports whether an NSEC proves name exists only as
+// an empty non-terminal: it covers name and its next name is a descendant of
+// it (RFC 4035 §3.1.3.2). Such a name holds no records at all, so it has no DS
+// and no NS and is not a zone cut. Reverse zones are full of them —
+// 30.160.in-addr.arpa between 160.in-addr.arpa and 37.30.160.in-addr.arpa.
+//
+// A wrapping NSEC is excluded: its next name is the apex, which can only sit
+// below name if name is outside the zone that signed the record.
+func provesEmptyNonTerminal(n *dns.NSEC, name string) bool {
+	owner := dns.CanonicalName(n.Hdr.Name)
+	next := dns.CanonicalName(n.NextDomain)
+	if CanonicalCompare(owner, next) >= 0 {
+		return false
+	}
+	return NSECCovers(n, name) && dns.IsSubDomain(name, next)
 }
 
 // minimalCovering reports whether an NSEC was synthesised to deny exactly the

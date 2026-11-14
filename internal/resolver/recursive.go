@@ -136,6 +136,10 @@ func withState(ctx context.Context, st *queryState) context.Context {
 	return context.WithValue(ctx, stateKey{}, st)
 }
 
+// dsProbeKey marks a context whose walk is the validator's DS lookup for the
+// name it holds.
+type dsProbeKey struct{}
+
 func stateFrom(ctx context.Context, fallback int) *queryState {
 	if st, ok := ctx.Value(stateKey{}).(*queryState); ok && st != nil {
 		return st
@@ -434,6 +438,9 @@ func (r *Recursive) FetchSigned(ctx context.Context, name string, qtype uint16) 
 	if qtype == dns.TypeDS && name != "." {
 		_, startAt = splitFirstLabel(name)
 	}
+	if qtype == dns.TypeDS {
+		ctx = context.WithValue(ctx, dsProbeKey{}, name)
+	}
 	res, err := r.walkFrom(ctx, name, qtype, st, startAt)
 	if err != nil {
 		return nil, nil, nil, err
@@ -637,6 +644,12 @@ func (r *Recursive) finishAnswer(ctx context.Context, qname string, qtype uint16
 			terminal = true
 			break
 		}
+	}
+	if qtype == dns.TypeDS && ctx.Value(dsProbeKey{}) == qname && !terminal {
+		// The validator asks for DS to learn whether qname is a zone cut, and
+		// only the parent's own answer speaks to that. Chasing the alias would
+		// hand back another zone's records to be verified with this one's keys.
+		return &result{rcode: dns.RcodeSuccess, answer: answer, sigs: sigsCovering(resp.Answer, answer)}, nil
 	}
 	if terminal || qtype == dns.TypeCNAME {
 		r.cacheAdditional(qname, resp)

@@ -316,6 +316,15 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 	}
 
 	if len(dsSet) == 0 {
+		if cname := rrsOfTypeAt(rrs, zone, dns.TypeCNAME); len(cname) > 0 {
+			// A CNAME cannot share its owner with NS or DS (RFC 2181 §10.1),
+			// so a signed one proves the name is not a zone cut.
+			if _, err := v.VerifyRRset(cname, sigs, parentKeys); err != nil {
+				return nil, nil, StatusBogus, fmt.Errorf("verifying CNAME at %s: %w", zone, err)
+			}
+			return nil, parentKeys, StatusSecure, errNotAZoneCut
+		}
+
 		// No DS. The parent must prove it, otherwise an attacker who strips
 		// the DS looks exactly like an unsigned delegation.
 		if err := v.verifyDenial(denial, parentKeys, zone); err != nil {
@@ -348,6 +357,17 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 		return nil, nil, StatusBogus, fmt.Errorf("%w: DS for %s names no supported algorithm", ErrUnsupportedAlg, zone)
 	}
 	return dsSet, nil, StatusSecure, nil
+}
+
+func rrsOfTypeAt(rrs []dns.RR, owner string, rrtype uint16) []dns.RR {
+	var out []dns.RR
+	for _, rr := range rrs {
+		h := rr.Header()
+		if h.Rrtype == rrtype && dns.CanonicalName(h.Name) == owner {
+			out = append(out, rr)
+		}
+	}
+	return out
 }
 
 // verifyDenial checks that denial records prove name/qtype does not exist, and
