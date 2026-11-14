@@ -97,6 +97,7 @@ fuzz:
 	for spec in \
 	  "./internal/dnssec/:FuzzDenialProofs" \
 	  "./internal/dnssec/:FuzzParseAnchors" \
+	  "./internal/dnssec/:FuzzWideRSA" \
 	  "./internal/aggressive/:FuzzStore" \
 	  "./internal/transport/:FuzzQueryAcceptance" \
 	  "./internal/transport/:FuzzDoHReadQuery" \

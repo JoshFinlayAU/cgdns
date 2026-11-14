@@ -1,6 +1,7 @@
 package dnssec
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -136,6 +137,47 @@ func FuzzParseAnchors(f *testing.F) {
 			if a.Digest == "" {
 				t.Fatalf("accepted an anchor for %s with no digest", a.Zone)
 			}
+		}
+	})
+}
+
+// A DNSKEY and its signature arrive off the wire. Whatever the bytes, verifying
+// with a wide RSA exponent must fail cleanly rather than panic, and a key that
+// parses must stay inside the bounds that keep verification cheap.
+func FuzzWideRSA(f *testing.F) {
+	f.Add([]byte{5, 1, 0, 0, 0, 1, 0xc1, 0x02}, []byte{0x01, 0x02, 0x03})
+	f.Add([]byte{0, 0, 9, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{})
+	f.Add([]byte{}, []byte{0xff})
+
+	f.Fuzz(func(t *testing.T, keyBytes, sigBytes []byte) {
+		key := &dns.DNSKEY{
+			Hdr:       dns.RR_Header{Name: "example.", Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 300},
+			Flags:     257,
+			Protocol:  3,
+			Algorithm: dns.RSASHA256,
+			PublicKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if k, ok := parseWideRSAKey(key); ok {
+			if len(k.e.Bytes()) > maxRSAExponentBytes || k.size < 64 || k.size > 512 {
+				t.Fatalf("accepted a key outside the bounds: exponent %d bytes, modulus %d bytes", len(k.e.Bytes()), k.size)
+			}
+		}
+		rrset := []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: "www.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{192, 0, 2, 1},
+		}}
+		sig := &dns.RRSIG{
+			Hdr:         dns.RR_Header{Name: "www.example.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 300},
+			TypeCovered: dns.TypeA,
+			Algorithm:   dns.RSASHA256,
+			Labels:      2,
+			OrigTtl:     300,
+			KeyTag:      key.KeyTag(),
+			SignerName:  "example.",
+			Signature:   base64.StdEncoding.EncodeToString(sigBytes),
+		}
+		if err := verifyWideRSA(sig, key, rrset); err == nil {
+			t.Fatal("verified a signature that was never made")
 		}
 	})
 }

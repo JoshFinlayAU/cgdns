@@ -182,7 +182,13 @@ func (v *Validator) VerifyRRset(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.D
 			if key.Flags&dns.ZONE == 0 {
 				continue
 			}
-			if err := sig.Verify(key, rrset); err != nil {
+			err := sig.Verify(key, rrset)
+			if errors.Is(err, dns.ErrKey) {
+				if _, wide := parseWideRSAKey(key); wide {
+					err = verifyWideRSA(sig, key, rrset)
+				}
+			}
+			if err != nil {
 				lastErr = fmt.Errorf("%w: %v", ErrSignatureFailed, err)
 				continue
 			}
