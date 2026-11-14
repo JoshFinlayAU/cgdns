@@ -621,6 +621,14 @@ func (r *Recursive) walkFrom(ctx context.Context, qname string, qtype uint16, st
 			return r.finishNegative(qname, qtype, resp), nil
 
 		default:
+			if probe != qname {
+				// RFC 9156 §4 again: a server that hosts only zones further
+				// down refuses or fails the names between them and its
+				// delegation, while answering the full name correctly.
+				r.opts.Metrics.MinimiseFallback.Add(1)
+				minimise = false
+				continue
+			}
 			return &result{rcode: resp.Rcode}, nil
 		}
 	}
