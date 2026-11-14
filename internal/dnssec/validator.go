@@ -220,28 +220,35 @@ func (v *Validator) TrustedKeys(ctx context.Context, zone string) ([]*dns.DNSKEY
 	if v.fetch == nil {
 		return nil, StatusIndeterminate, errors.New("dnssec: no fetcher configured")
 	}
-	return v.trustedKeys(ctx, dns.CanonicalName(zone), 0)
+	keys, status, _, err := v.trustedKeys(ctx, dns.CanonicalName(zone))
+	return keys, status, err
 }
 
-func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]*dns.DNSKEY, Status, error) {
-	if depth > v.maxDep {
-		return nil, StatusBogus, ErrChainTooDeep
-	}
-
-	dsSet, parentKeys, status, err := v.delegationSigners(ctx, zone, depth)
+// trustedKeys also reports how many zone cuts the chain crossed to reach zone.
+// Only cuts count toward MaxDepth: names that sit inside their parent zone are
+// free, and a reverse name under ip6.arpa has one label per nibble — a single
+// /48 is fourteen labels deep with three cuts. The walk itself cannot loop, as
+// every step drops a label until it reaches the root.
+func (v *Validator) trustedKeys(ctx context.Context, zone string) ([]*dns.DNSKEY, Status, int, error) {
+	var cuts int
+	dsSet, parentKeys, status, err := v.delegationSigners(ctx, zone, &cuts)
 	if errors.Is(err, errNotAZoneCut) {
 		// Not cut from its parent, so it has no keys of its own: the records
 		// sitting at this name are signed by the parent zone.
 		v.markInherited(zone)
-		return parentKeys, StatusSecure, nil
+		return parentKeys, StatusSecure, cuts, nil
 	}
 	if err != nil || status != StatusSecure {
-		return nil, status, err
+		return nil, status, cuts, err
+	}
+	cuts++
+	if cuts > v.maxDep {
+		return nil, StatusBogus, cuts, ErrChainTooDeep
 	}
 
 	keys, sigs, _, err := v.fetch.FetchSigned(ctx, zone, dns.TypeDNSKEY)
 	if err != nil {
-		return nil, StatusIndeterminate, fmt.Errorf("%w: fetching DNSKEY for %s: %w", ErrEvidenceUnavailable, zone, err)
+		return nil, StatusIndeterminate, cuts, fmt.Errorf("%w: fetching DNSKEY for %s: %w", ErrEvidenceUnavailable, zone, err)
 	}
 	dnskeys := make([]*dns.DNSKEY, 0, len(keys))
 	for _, rr := range keys {
@@ -250,7 +257,7 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 		}
 	}
 	if len(dnskeys) == 0 {
-		return nil, StatusBogus, fmt.Errorf("%w: %s", ErrNoDNSKEY, zone)
+		return nil, StatusBogus, cuts, fmt.Errorf("%w: %s", ErrNoDNSKEY, zone)
 	}
 
 	// At least one key must hash to a DS we already trust. That key is the
@@ -266,7 +273,7 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 		}
 	}
 	if len(entry) == 0 {
-		return nil, StatusBogus, fmt.Errorf("%w: %s", ErrDSMismatch, zone)
+		return nil, StatusBogus, cuts, fmt.Errorf("%w: %s", ErrDSMismatch, zone)
 	}
 
 	rrset := make([]dns.RR, 0, len(dnskeys))
@@ -274,18 +281,16 @@ func (v *Validator) trustedKeys(ctx context.Context, zone string, depth int) ([]
 		rrset = append(rrset, k)
 	}
 	if _, err := v.VerifyRRset(rrset, sigs, entry); err != nil {
-		return nil, StatusBogus, fmt.Errorf("verifying DNSKEY for %s: %w", zone, err)
+		return nil, StatusBogus, cuts, fmt.Errorf("verifying DNSKEY for %s: %w", zone, err)
 	}
-	return dnskeys, StatusSecure, nil
+	return dnskeys, StatusSecure, cuts, nil
 }
 
-// delegationSigners returns the DS set securing zone, either from a trust
-// anchor or from the validated parent zone.
 // delegationSigners returns the DS set securing zone. When the name turns out
 // not to be a zone cut it returns the parent's keys instead, since those are
 // what sign records sitting at that name — refetching them would spend outbound
 // queries the client's budget has to pay for.
-func (v *Validator) delegationSigners(ctx context.Context, zone string, depth int) ([]*dns.DS, []*dns.DNSKEY, Status, error) {
+func (v *Validator) delegationSigners(ctx context.Context, zone string, cuts *int) ([]*dns.DS, []*dns.DNSKEY, Status, error) {
 	if anchors := v.AnchorsFor(zone); len(anchors) > 0 {
 		out := make([]*dns.DS, 0, len(anchors))
 		for _, a := range anchors {
@@ -298,7 +303,8 @@ func (v *Validator) delegationSigners(ctx context.Context, zone string, depth in
 	}
 
 	parent := parentZone(zone)
-	parentKeys, status, err := v.trustedKeys(ctx, parent, depth+1)
+	parentKeys, status, parentCuts, err := v.trustedKeys(ctx, parent)
+	*cuts = parentCuts
 	if err != nil || status != StatusSecure {
 		return nil, nil, status, err
 	}

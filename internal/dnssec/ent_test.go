@@ -2,6 +2,8 @@ package dnssec
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -190,4 +192,55 @@ func TestTrustedKeys_SignedCNAMEIsNotAZoneCut(t *testing.T) {
 			t.Errorf("status = %s, want bogus: an unverifiable CNAME proves nothing", status)
 		}
 	})
+}
+
+// MaxDepth bounds zone cuts, not labels. A reverse name under ip6.arpa is one
+// label per nibble, so counting labels failed every IPv6 PTR lookup as "chain
+// of trust too deep" on a chain with three cuts.
+func TestTrustedKeys_DepthCountsZoneCutsNotLabels(t *testing.T) {
+	t.Parallel()
+
+	const labels = 10
+	setup := func(t *testing.T) (*signedZone, *fakeFetcher, string) {
+		t.Helper()
+		root, child, f := signedChildOfRoot(t)
+		name := "example."
+		for i := 0; i < labels; i++ {
+			parent := name
+			name = "a." + parent
+			proof := &dns.NSEC{
+				Hdr:        dns.RR_Header{Name: "0." + parent, Rrtype: dns.TypeNSEC, Class: dns.ClassINET, Ttl: 300},
+				NextDomain: "x." + name,
+				TypeBitMap: []uint16{dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC},
+			}
+			f.setDenial(name, dns.TypeDS, []dns.RR{proof, child.sign(t, []dns.RR{proof})})
+		}
+		return root, f, name
+	}
+
+	tests := []struct {
+		maxDepth int
+		want     Status
+	}{
+		{maxDepth: 2, want: StatusSecure},
+		{maxDepth: 1, want: StatusBogus},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("max depth %d", tc.maxDepth), func(t *testing.T) {
+			t.Parallel()
+			root, f, name := setup(t)
+			v, err := New(Options{Anchors: []Anchor{root.anchor(t)}, Fetcher: f, Now: nowFunc, MaxDepth: tc.maxDepth})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, status, err := v.TrustedKeys(context.Background(), name)
+			if status != tc.want {
+				t.Errorf("TrustedKeys(%s) = (%s, %v), want %s: the root and example. are the only cuts",
+					name, status, err, tc.want)
+			}
+			if tc.want == StatusBogus && !errors.Is(err, ErrChainTooDeep) {
+				t.Errorf("error = %v, want ErrChainTooDeep", err)
+			}
+		})
+	}
 }
